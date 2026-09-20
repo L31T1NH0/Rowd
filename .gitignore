@@ -1,0 +1,11 @@
+/target/
+/.toolchain/
+/.demo/
+/.impeccable/
+**/.gradle/
+**/build/
+**/local.properties
+**/jniLibs/
+*.apk
+.DS_Store
+

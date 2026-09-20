@@ -1,0 +1,8 @@
+<resources>
+    <color name="rowd_primary">#A2D4B4</color>
+    <color name="rowd_on_primary">#0A3820</color>
+    <color name="rowd_surface">#101612</color>
+    <color name="rowd_on_surface">#E0E8DF</color>
+    <color name="rowd_secondary">#BACABD</color>
+    <bool name="light_bars">false</bool>
+</resources>

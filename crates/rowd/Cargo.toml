@@ -1,0 +1,19 @@
+[package]
+name = "rowd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rowd-core = { path = "../rowd-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rustls.workspace = true
+rcgen = "0.13"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

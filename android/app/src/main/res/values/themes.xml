@@ -1,0 +1,19 @@
+<resources>
+    <style name="Theme.Rowd" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/rowd_primary</item>
+        <item name="colorOnPrimary">@color/rowd_on_primary</item>
+        <item name="colorSurface">@color/rowd_surface</item>
+        <item name="android:colorBackground">@color/rowd_surface</item>
+        <item name="colorOnSurface">@color/rowd_on_surface</item>
+        <item name="colorOnSurfaceVariant">@color/rowd_secondary</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">@bool/light_bars</item>
+        <item name="android:navigationBarColor">@color/rowd_surface</item>
+    </style>
+    <color name="rowd_primary">#286347</color>
+    <color name="rowd_on_primary">#FFFFFF</color>
+    <color name="rowd_surface">#F8FAF6</color>
+    <color name="rowd_on_surface">#18221C</color>
+    <color name="rowd_secondary">#4B5A50</color>
+    <bool name="light_bars">true</bool>
+</resources>
