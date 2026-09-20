@@ -1,5 +1,5 @@
 use crate::{
-    model::{Entry, Manifest, MAX_FILE, VERSION},
+    model::{Entry, Manifest, MAX_FILE},
     random_id,
 };
 use anyhow::{ensure, Context, Result};
@@ -9,10 +9,37 @@ use sha2::Sha256;
 use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
+    Scoped {
+        share_id: String,
+        message: Box<Message>,
+    },
+    Shares {
+        shares: Vec<crate::config::ShareConfig>,
+        removed: Vec<String>,
+    },
+    Capabilities {
+        root_id: String,
+        polling: bool,
+        managed_shares: bool,
+        share_requests: Vec<crate::config::ShareRequest>,
+    },
+    ShareRequestStatus {
+        accepted: Vec<String>,
+        pending: Vec<String>,
+    },
+    SelectShare {
+        share_id: String,
+    },
+    SessionDone,
+    Ack {
+        path: String,
+        entry: Entry,
+    },
     Hello {
         version: u32,
         pair_id: String,
@@ -75,6 +102,30 @@ pub fn receive(io: &mut impl Read) -> Result<Message> {
     Ok(message)
 }
 
+pub fn send_for(io: &mut impl Write, share_id: &str, message: Message) -> Result<()> {
+    send(
+        io,
+        &Message::Scoped {
+            share_id: share_id.into(),
+            message: Box::new(message),
+        },
+    )
+}
+pub fn receive_for(io: &mut impl Read, share_id: &str) -> Result<Message> {
+    let Message::Scoped {
+        share_id: actual,
+        message,
+    } = receive(io)?
+    else {
+        anyhow::bail!("missing Share context")
+    };
+    ensure!(actual == share_id, "wrong Share context");
+    if let Message::Error { message } = *message {
+        anyhow::bail!("peer: {message}");
+    }
+    Ok(*message)
+}
+
 pub fn copy_exact(reader: &mut impl Read, writer: &mut impl Write, size: u64) -> Result<()> {
     ensure!(size <= MAX_FILE, "file too large");
     let n = std::io::copy(&mut reader.take(size), writer)?;
@@ -118,9 +169,20 @@ pub fn server_auth(
         anyhow::bail!("expected hello")
     };
     ensure!(
-        version == VERSION && peer == pair_id && folder == folder_id,
+        peer == pair_id && folder == folder_id,
         "wrong pair or folder"
     );
+    if version != PROTOCOL_VERSION {
+        let message =
+            format!("incompatible protocol: expected {PROTOCOL_VERSION}, received {version}");
+        send(
+            io,
+            &Message::Error {
+                message: message.clone(),
+            },
+        )?;
+        anyhow::bail!(message);
+    }
     let nonce = random_id()?;
     send(
         io,
@@ -148,7 +210,7 @@ pub fn client_auth(
     send(
         io,
         &Message::Hello {
-            version: VERSION,
+            version: PROTOCOL_VERSION,
             pair_id: pair_id.into(),
             folder_id: folder_id.into(),
             root_id: root_id.into(),
@@ -197,5 +259,57 @@ mod tests {
             .unwrap()
             .verify_slice(&proof)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+    #[test]
+    fn rejects_incompatible_protocol_and_cross_share_messages() {
+        struct Buffer {
+            input: std::io::Cursor<Vec<u8>>,
+            output: Vec<u8>,
+        }
+        impl Read for Buffer {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.input.read(b)
+            }
+        }
+        impl Write for Buffer {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.output.write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let h = "a".repeat(64);
+        let mut input = Vec::new();
+        send(
+            &mut input,
+            &Message::Hello {
+                version: 1,
+                pair_id: h.clone(),
+                folder_id: h.clone(),
+                root_id: h.clone(),
+            },
+        )
+        .unwrap();
+        let mut io = Buffer {
+            input: std::io::Cursor::new(input),
+            output: vec![],
+        };
+        assert!(server_auth(&mut io, &h, &h, &h)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible protocol"));
+        assert!(receive(&mut std::io::Cursor::new(io.output))
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible protocol"));
+        let mut data = Vec::new();
+        send_for(&mut data, "first", Message::Scan).unwrap();
+        assert!(receive_for(&mut std::io::Cursor::new(data), "second").is_err());
     }
 }

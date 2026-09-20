@@ -14,6 +14,7 @@ use std::path::Path;
 struct AndroidStore<'a, 'b, 'c> {
     env: &'a mut JNIEnv<'b>,
     access: &'c JObject<'b>,
+    ignore: rowd_core::ignore::Ignore,
 }
 impl AndroidStore<'_, '_, '_> {
     fn call(&mut self, name: &str, arguments: &[&str]) -> Result<String> {
@@ -45,6 +46,9 @@ impl AndroidStore<'_, '_, '_> {
     }
 }
 impl Store for AndroidStore<'_, '_, '_> {
+    fn excluded(&self, path: &str) -> bool {
+        self.ignore.matches(path, false)
+    }
     fn scan(&mut self) -> Result<Manifest> {
         Ok(serde_json::from_str(&self.call("scanJson", &[])?)?)
     }
@@ -74,6 +78,43 @@ impl Store for AndroidStore<'_, '_, '_> {
     }
 }
 
+impl rowd_core::managed::ManagedStore for AndroidStore<'_, '_, '_> {
+    fn configure(
+        &mut self,
+        shares: &[rowd_core::config::ShareConfig],
+        removed: &[String],
+    ) -> Result<()> {
+        self.call(
+            "configureShares",
+            &[
+                &serde_json::to_string(shares)?,
+                &serde_json::to_string(removed)?,
+            ],
+        )?;
+        Ok(())
+    }
+    fn select(&mut self, id: &str) -> Result<std::path::PathBuf> {
+        let path = self.call("selectShare", &[id])?;
+        self.ignore = rowd_core::ignore::Ignore::parse(&self.call("ignoreText", &[])?);
+        Ok(path.into())
+    }
+    fn known_shares(&mut self) -> Result<Vec<rowd_core::config::ShareConfig>> {
+        Ok(serde_json::from_str(&self.call("knownShares", &[])?)?)
+    }
+    fn pending_share_requests(&mut self) -> Result<Vec<rowd_core::config::ShareRequest>> {
+        Ok(serde_json::from_str(
+            &self.call("pendingShareRequests", &[])?,
+        )?)
+    }
+    fn acknowledge_share_requests(&mut self, accepted: &[String]) -> Result<()> {
+        self.call(
+            "acknowledgeShareRequests",
+            &[&serde_json::to_string(accepted)?],
+        )?;
+        Ok(())
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
     mut env: JNIEnv<'local>,
@@ -89,10 +130,11 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
         let mut store = AndroidStore {
             env: &mut env,
             access: &access,
+            ignore: rowd_core::ignore::Ignore::default(),
         };
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
-        let report = rowd_core::sync::client_round(&invite, &root, &mut store)?;
+        let report = rowd_core::managed::client_round(&invite, &root, &mut store)?;
         Ok(serde_json::to_string(&report)?)
     }));
     let output = match result {

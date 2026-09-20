@@ -1,3 +1,7 @@
+pub mod config;
+pub mod ignore;
+pub mod journal;
+pub mod managed;
 pub mod model;
 pub mod protocol;
 pub mod storage;

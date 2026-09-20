@@ -1,4 +1,5 @@
 /target/
+/prompts/
 /.toolchain/
 /.demo/
 /.impeccable/
@@ -8,4 +9,3 @@
 **/jniLibs/
 *.apk
 .DS_Store
-

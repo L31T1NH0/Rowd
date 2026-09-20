@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+rowd_repo="$(cd "$(dirname "$0")" && pwd)"
+exec "${CARGO:-$HOME/.cargo/bin/cargo}" run --quiet --manifest-path "$rowd_repo/Cargo.toml" -p rowd -- "$@"

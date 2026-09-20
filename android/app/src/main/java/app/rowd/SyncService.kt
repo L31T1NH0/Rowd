@@ -17,6 +17,11 @@ class SyncService : Service() {
     }
     private val active = AtomicBoolean(false)
     private var worker: Thread? = null
+    private val changes = Object()
+    private var dirty = false
+    private val observer = object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) { synchronized(changes) { dirty = true; changes.notifyAll() } }
+    }
     private fun notifyStatus(text: String) {
         if (android.os.Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
@@ -41,13 +46,19 @@ class SyncService : Service() {
             worker?.interrupt()
             return START_NOT_STICKY
         }
+        if (!busy.compareAndSet(false, true)) {
+            if (!active.get()) stopSelf()
+            return START_NOT_STICKY
+        }
         startForeground(1, notification("Conectando ao PC"))
-        if (!busy.compareAndSet(false, true)) return START_NOT_STICKY
         active.set(true)
         automatic = intent?.getBooleanExtra("automatic", false) == true
         worker = Thread({
             val prefs = getSharedPreferences("rowd", MODE_PRIVATE)
             var failures = 0
+            prefs.getString("tree",null)?.let { tree ->
+                try { contentResolver.registerContentObserver(Uri.parse(tree),true,observer) } catch (_: Exception) { /* SAF polling is a supported capability. */ }
+            }
             try {
                 do {
                     status = "Sincronizando"
@@ -73,11 +84,16 @@ class SyncService : Service() {
                     notifyStatus(status)
                     prefs.edit().putString("lastStatus", status).putString("lastDetail", detail).apply()
                     if (!automatic || !active.get()) break
-                    Thread.sleep(if (failures == 0) 10_000L else minOf(60_000L, 5_000L * failures))
+                    synchronized(changes) {
+                        if (!dirty) changes.wait(if (failures == 0) 5_000L else minOf(60_000L, 5_000L * failures))
+                        dirty = false
+                    }
+                    Thread.sleep(350) // Debounce provider bursts; hashes still confirm every SAF scan.
                 } while (active.get())
             } catch (_: InterruptedException) {
                 status = "Sincronização automática pausada"
             } finally {
+                contentResolver.unregisterContentObserver(observer)
                 active.set(false); automatic = false; busy.set(false)
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
             }

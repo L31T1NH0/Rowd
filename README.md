@@ -1,175 +1,158 @@
 # Rowd
 
-Sincronização bidirecional de uma pasta entre um PC Linux e um dispositivo Android pela rede local.
+Sincronização de vários diretórios entre **um PC Linux e um Android**, pela rede local. Rust no núcleo, Ratatui no terminal e Kotlin/SAF no Android. Sem servidor intermediário.
 
-O Rowd usa Rust no núcleo e Kotlin no aplicativo Android. A conexão usa TLS com certificado fixado no convite e autenticação HMAC. Os arquivos ficam nos seus dispositivos: não há servidor intermediário nem serviço de nuvem.
+**V2 · 0.2.0:** configuração persistente, Shares, solicitações de Share iniciadas no Android, pareamento por QR/JSON, pendências com ACK, watcher Linux, modos por Share, recuperação acessível e ícone mobile próprio. A validação em aparelho real de SAF, câmera e bateria ainda está pendente; veja [Validação V2](docs/V2_VALIDATION.md).
 
-> **Status:** versão 0.1.0. O fluxo Rust/PC foi validado; a compilação do Android foi validada, mas testes de uso em aparelho real ainda são necessários. Use uma pasta descartável antes de sincronizar dados importantes.
+## Começar
 
-## Recursos
+Com Rust instalado, abra no PC:
 
-- Sincronização nos dois sentidos por rodadas, sem conexão permanente.
-- Verificação de SHA-256 e tamanho antes de cada transferência e escrita.
-- Conflitos preservados em cópias separadas, sem escolher uma versão por data.
-- Convite privado com identidade da pasta, certificado TLS e credencial de acesso.
-- Backups locais e recuperação após interrupções durante a escrita.
-- Modo manual e sincronização automática no Android.
-- CLI para operar o PC e simular o celular com outra pasta.
-
-## Como funciona
-
-```text
-PC Linux                         Android
-rowd serve  <── TLS + HMAC ──  aplicativo Rowd
-     pasta compartilhada          pasta escolhida pelo usuário
+```bash
+./rowd
 ```
 
-O PC coordena cada rodada e mantém o estado-base do pareamento. O Android inicia a conexão. A cada rodada, o Rowd lê os dois manifestos, compara hashes e transfere apenas o necessário.
-
-O pareamento vincula uma raiz Android a uma pasta do PC. Para usar outra pasta, gere um novo convite.
-
-## Requisitos
-
-### PC
-
-- Linux com Rust estável.
-- PC e Android na mesma rede local.
-- Porta TCP `43821` liberada no firewall do PC.
-
-### Android
-
-- Android 8 ou superior, API 26+.
-- Arquitetura ARM64 (`arm64-v8a`).
-- Acesso à pasta concedido pelo seletor de documentos do Android.
-
-## Início rápido
-
-### 1. Prepare o PC
-
-Compile a CLI:
+O script compila e abre a TUI. Para um binário independente:
 
 ```bash
 cargo build --release -p rowd
+./target/release/rowd
 ```
 
-Escolha uma pasta dedicada e gere um convite. Troque `192.168.1.20` pelo endereço do PC na rede local; `hostname -I` ajuda a encontrá-lo.
+1. Pressione **p** e informe o endereço do PC, por exemplo `192.168.1.20:43821`.
+2. No Android, escolha ou crie a raiz `Rowd` pelo seletor de documentos, uma única vez.
+3. Toque em **Parear por QR**. Compare o fingerprint com o PC antes de conectar. O JSON continua disponível como alternativa.
+4. No PC, pressione **a** e preencha `Projetos | /home/voce/Projects | bidirectional`.
+5. Ative a sincronização automática no Android. O PC cria a definição e o Android cria `Rowd/Projetos` na próxima conexão. Repita **a** para outros Shares.
+6. Para iniciar um Share pelo Android, toque em **Solicitar Share**, informe o nome e o modo. Na TUI do PC, pressione **c**, informe a pasta local escolhida com `pwd` e confirme. O Share será criado no PC e enviado ao Android na próxima rodada.
+
+O QR completo pode exigir um terminal maior. A tela informa o tamanho necessário; **o** abre sua imagem SVG privada. Feche a imagem depois de parear: ela contém a mesma credencial do convite.
+
+A TUI inicia o servidor automaticamente. Mantenha o Rowd aberto nos dois dispositivos. PC e Android precisam estar na mesma rede, com TCP `43821` acessível no PC.
+
+| Tecla | Ação |
+| --- | --- |
+| ↑ / ↓ | Selecionar Share |
+| p | Parear / atualizar endereço do convite |
+| a | Adicionar Share |
+| n / c | Alternar solicitação Android / aceitar a pasta escolhida |
+| e | Editar nome, raiz PC e modo |
+| d | Desvincular após digitar `REMOVER`; conserva arquivos e recovery |
+| s | Atualizar pendências para a próxima conexão do Android |
+| v | Verificar conteúdo com scan completo |
+| r | Listar versões e manter, restaurar ou exportar recovery |
+| q | Sair |
+
+O painel mostra pendências, caminhos com conflito, último sincronismo e progresso por caminhos na rodada. Um arquivo grande ainda é transferido inteiro, sem retomada.
+
+## Configuração e CLI
+
+A configuração fica em `~/.local/share/rowd/.rowd/`. Use `--home DIRETORIO` ou `ROWD_HOME` para escolher outro lugar. Guarde esse diretório: contém certificado, chave privada, credencial e vínculo com o Android.
 
 ```bash
-./target/release/rowd init \
-  --folder "$HOME/Rowd" \
-  --address 192.168.1.20:43821 \
-  --invite "$HOME/rowd-convite.json"
+./rowd pair --address 192.168.1.20:43821 --invite /tmp/rowd-convite.json
+./rowd share add --name Projetos --folder "$HOME/Projects"
+./rowd share add --name Fotos --folder "$HOME/Pictures" --mode to_pc
+./rowd shares
+./rowd run
 ```
 
-Inicie o servidor e mantenha o processo aberto durante o uso:
+`share add` imprime o ID permanente. Renomear conserva esse ID e o destino Android:
 
 ```bash
-./target/release/rowd serve --folder "$HOME/Rowd"
+./rowd share edit ID --name Trabalho --mode to_android
+./rowd share remove ID --confirm
+./rowd scan
 ```
 
-O endereço passado a `init` precisa apontar para o PC. O servidor escuta em `0.0.0.0:43821` por padrão. Não encaminhe essa porta no roteador.
+`--android caminho/relativo` em `share add` permite outro destino **dentro da raiz Android autorizada**. O nome visual pode mudar; o destino Android existente permanece fixo. Raízes PC iguais, ancestrais ou descendentes, inclusive por symlink, são recusadas. Diretórios internos `.rowd` não podem virar Shares.
 
-### 2. Transfira o convite
+`./rowd run --listen 0.0.0.0:43821` mantém todos os Shares e o watcher em um processo. Para simular o Android sem aparelho, use uma raiz de teste exclusiva:
 
-Leve `rowd-convite.json` ao celular por USB ou outro canal confiável. O convite dá acesso à pasta pareada.
+```bash
+./rowd device-sync --folder /tmp/rowd-android --invite /tmp/rowd-convite.json --watch
+```
 
-Não coloque o arquivo dentro da pasta sincronizada nem o publique no Git. Ao importar, compare o SHA-256 do certificado mostrado no terminal com o fingerprint exibido pelo Android.
+A primeira identidade Android autenticada fica vinculada ao PC. Outro cliente com raiz/identidade diferente é recusado.
 
-### 3. Compile e configure o Android
+### Solicitar um Share pelo Android
 
-Os scripts baixam JDK 17, SDK 35, NDK 27.2 e Gradle 8.9 para `.toolchain/`:
+O Android não escolhe a pasta do PC diretamente. Toque em **Solicitar Share**, informe o nome e escolha o modo; a solicitação fica salva no telefone até ser entregue.
+
+Na TUI do PC, `n` alterna entre solicitações pendentes e `c` aceita a selecionada. Informe o caminho absoluto da pasta do PC, de preferência copiando o resultado de `pwd`, e confirme. O PC valida a pasta e cria o Share; na próxima rodada, o Android recebe a configuração e usa `Rowd/<nome-do-Share>` como destino.
+
+Se o PC estiver offline, a solicitação permanece pendente no Android. O envio é repetido com o mesmo ID até o PC aceitar, evitando Shares duplicados.
+
+### Migrar V1
+
+Pare os processos antigos e atualize PC e APK juntos. O protocolo de rede V2 rejeita a V1 explicitamente; o formato do convite continua na versão 1, independente da versão do protocolo e dos pacotes.
+
+```bash
+./rowd migrate --folder /caminho/da/pasta-v1 --address 192.168.1.20:43821
+./rowd
+```
+
+A migração reutiliza credenciais, identidade do Android, ID da pasta e estado-base. Os backups continuam na raiz original. O convite JSON já importado permanece válido.
+
+O primeiro Share migrado mantém a raiz Android original. Novos Shares usam subpastas exclusivas dessa raiz e são excluídos do Share legado. Um destino que já contenha arquivos do Share legado é recusado. A exclusão dessas subpastas permanece após desvinculá-las, para não misturar os estados.
+
+Os comandos `init`, `serve --folder`, `sync --folder` e `status --folder` continuam disponíveis para operar uma pasta, com o protocolo atualizado. O APK V2 usa a administração multi-Share; use `migrate` e `run` para conectar uma instalação antiga.
+
+## Pendências, cache e eventos
+
+Cada Share possui manifesto, base conhecida e journal JSON atômico próprios. Enquanto o outro dispositivo está offline, novas versões substituem a pendência anterior do mesmo caminho. A fila só confirma a versão cujo hash foi entregue e reconhecido. Uma queda antes do ACK mantém a pendência; repetir uma instalação é idempotente.
+
+No Linux, inotify marca alterações e um debounce de 350 ms agrupa eventos. A varredura consulta metadados e reutiliza hashes quando dispositivo, inode, tamanho, mtime e ctime com nanossegundos permanecem iguais. Snapshots e instalações sempre conferem SHA-256. Há verificação periódica por metadados a cada minuto, scan completo periódico a cada 15 minutos e reconstrução após overflow; `scan`/tecla **v** força a leitura de conteúdo.
+
+No Android, avisos do DocumentsProvider antecipam a próxima rodada, com fallback de 5 segundos no modo automático. SAF não fornece metadados ou eventos universalmente confiáveis: o fallback recalcula hashes. A fila local é atualizada antes de tentar a conexão, inclusive quando o PC está offline. O Android inicia cada sessão; alterações no PC são entregues na próxima conexão do telefone.
+
+### `.rowdignore`
+
+Crie por Share:
+
+```text
+# Comentários e linhas vazias são aceitos
+node_modules/
+target/
+.git/
+*.tmp
+docs/private/
+```
+
+Padrões sem `/` correspondem a nomes em qualquer nível. Padrões com `/` são relativos à raiz. `*` é o único curinga; não há negação nem implementação completa de `.gitignore`. A configuração de ignore do PC é enviada ao Android; regras locais Android também são respeitadas. Ignorados ficam fora do hash e das pendências. `.rowd/` e `.rowdignore` não são transferidos.
+
+## Modos e preservação
+
+- `bidirectional`: mudanças seguem nos dois sentidos. Se os dois lados editaram, o original PC fica no caminho e a versão Android é preservada em `Rowd Conflicts/<hash-do-caminho>/<hash-do-conteúdo>/<nome>`, nos dois lados.
+- `to_android`: só PC → Android. Uma alteração Android que exigiria envio reverso ou sobrescrita conflitante permanece no lugar e aparece como conflito.
+- `to_pc`: só Android → PC, com a mesma preservação para alterações PC.
+
+Exclusões **não são propagadas**. Um arquivo removido pode voltar na próxima rodada. Renomear um arquivo equivale a remover um caminho e criar outro. Nenhuma dessas operações apaga a última versão remota.
+
+## Recovery
+
+Na TUI, **r** lista os registros do Share. As ações são `keep`, `restore` e `export`. Restaurar também conserva a versão deslocada; exportar nunca substitui um arquivo existente.
+
+```bash
+./rowd recovery --folder /pasta/do/share
+./rowd recovery --folder /pasta/do/share --id ID --action restore
+./rowd recovery --folder /pasta/do/share --id ID --action export --output /tmp/versao-recuperada
+```
+
+No Android, **Revisar versões recuperáveis** permite manter a atual ou restaurar a anterior; **Exportar cópias de recuperação** conserva os registros e arquivos `.old`/`.new` fora do armazenamento privado. Um resultado de escrita ambíguo bloqueia novas rodadas até a escolha. Não limpe os dados do aplicativo antes de exportar.
+
+SAF não oferece compare-and-swap universal. Precondições e backups preservam versões, mas uma edição externa durante a gravação ainda pode exigir recuperação manual.
+
+## Android e desenvolvimento
+
+Android 8/API 26+, ARM64. Os scripts utilizam JDK 17, SDK 35, NDK 27.2 e Gradle 8.9:
 
 ```bash
 bash scripts/android-tools.sh
 bash scripts/build-android.sh
 ```
 
-O APK fica em:
-
-```text
-android/app/build/outputs/apk/debug/app-debug.apk
-```
-
-Instale o APK no Android ARM64 e abra o Rowd:
-
-1. Escolha a pasta que será sincronizada.
-2. Importe `rowd-convite.json`.
-3. Confirme o endereço e o fingerprint do PC.
-4. Toque em **Sincronizar agora**.
-5. Ative **Iniciar sincronização automática** se quiser repetir as rodadas.
-
-O modo automático inicia uma nova rodada após 10 segundos quando a anterior termina. Se a rede falhar, o intervalo aumenta até 60 segundos. O Android pode interromper o serviço para economizar bateria; abra o app para retomar.
-
-## CLI
-
-Use `rowd --help` para a ajuda completa.
-
-| Comando | Uso |
-| --- | --- |
-| `init` | Inicializa a pasta do PC e cria um convite privado. Requer `--folder`, `--address` e `--invite`. |
-| `serve` | Aguarda conexões do Android. Aceita `--listen` e `--once`; a porta padrão é `43821`. |
-| `sync` | Executa uma rodada como cliente usando um convite. Serve para testes com outra pasta; `--watch` repete as tentativas. |
-| `status` | Calcula e exibe em JSON o manifesto atual da pasta. |
-
-Exemplo de teste sem aparelho:
-
-```bash
-./target/release/rowd sync \
-  --folder /tmp/rowd-celular-teste \
-  --invite "$HOME/rowd-convite.json"
-```
-
-Use um pareamento dedicado para esse teste. A primeira raiz cliente autenticada fica vinculada ao PC.
-
-## Regras de sincronização
-
-- Arquivos novos e alterações seguem nos dois sentidos.
-- O Rowd recalcula SHA-256 em cada varredura; não usa data de modificação como atalho.
-- O tamanho e o hash são conferidos antes de aplicar cada arquivo recebido.
-- O remetente lê uma cópia temporária validada, para não enviar conteúdo diferente do manifesto.
-- Se o destino mudar durante a escrita, a rodada retorna `STALE_TARGET` e tenta de novo na próxima rodada.
-- Se os dois lados alterarem o mesmo arquivo, o conteúdo do PC permanece no caminho original. A versão do Android é preservada em `Rowd Conflicts/<hash-do-caminho>/<hash-do-conteúdo>/<nome-original>` nos dois dispositivos.
-- A repetição do mesmo conflito é inofensiva; hashes completos evitam colisões de nomes.
-- Exclusões não são propagadas. Um arquivo apagado de um lado pode voltar na próxima rodada.
-- Renomear equivale a criar um caminho novo; o caminho antigo pode reaparecer.
-- Pastas vazias, permissões POSIX, datas originais e links simbólicos não são sincronizados.
-- Nomes incompatíveis, colisões entre maiúsculas e minúsculas, colisões entre arquivo e diretório e caminhos fora da raiz interrompem a rodada.
-
-## Segurança e recuperação
-
-O convite contém:
-
-- o endereço do PC;
-- os identificadores do pareamento e da pasta;
-- o certificado TLS exato que o Android deve confiar;
-- um segredo aleatório de 256 bits para o desafio HMAC.
-
-O PC não abre um endpoint de cadastro. A conexão usa TLS e o protocolo autentica a raiz Android antes de sincronizar. Qualquer pessoa com o convite pode tentar acessar a pasta; trate o arquivo como uma credencial.
-
-No PC, `.rowd/` guarda identidade, estado, trava de processo e backups. No Android, os registros e arquivos de recuperação ficam no armazenamento privado do app. Os backups não são apagados automaticamente.
-
-Se uma escrita no Android ficar ambígua, o Rowd interrompe a sincronização e conserva as cópias `.old`, `.new` e o JSON que identifica o caminho original. Use **Exportar cópias de recuperação**, escolha a versão desejada e deixe a próxima varredura liberar a rodada.
-
-Não desinstale o app nem limpe os dados antes de exportar esses arquivos.
-
-O Storage Access Framework do Android não oferece compare-and-swap universal. As precondições, cópias e verificações reduzem o risco, mas não detectam toda edição externa feita entre a última leitura e a escrita. Evite editar o mesmo arquivo durante o recebimento, sobretudo em provedores de nuvem.
-
-## Limites conhecidos
-
-- 8 GiB por arquivo.
-- 50 mil arquivos por pasta.
-- 16 MiB por mensagem de controle.
-- Uma transferência de arquivo por vez em cada sessão.
-- Apenas Android ARM64 nesta versão.
-- Sem propagação de exclusões.
-- Sem garantia de atomicidade para edições externas concorrentes via SAF.
-- O serviço em primeiro plano `dataSync` possui limites de execução no Android 15 ou superior.
-
-Comece com uma pasta pequena de teste. O registro de validação separa os cenários executados dos testes que ainda dependem de um aparelho real.
-
-## Desenvolvimento
-
-Verifique o workspace Rust com:
+APK: `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 ```bash
 cargo fmt --all -- --check
@@ -177,26 +160,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Os testes de integração usam TCP/TLS real em portas de loopback temporárias e cobrem reconciliação, conflitos, hashes, recuperação, caminhos inválidos e transferências entre os processos CLI.
+Os testes usam sockets locais TCP/TLS e Unix; precisam de um ambiente que permita esses sockets. Consulte [Validação V2](docs/V2_VALIDATION.md) para os cenários executados e os que ainda exigem aparelho.
 
-Para compilar o Android, os scripts usam JDK 17, Gradle 8.9, SDK 35 e NDK 27.2. O instalador solicita a aceitação das licenças do SDK.
+Limites: 8 GiB por arquivo, 50 mil arquivos por Share, 16 MiB por mensagem, até 256 Shares no protocolo, uma transferência por vez. Symlinks, pastas vazias, permissões e timestamps originais não são sincronizados. Não há daemon, mDNS, conexão persistente, múltiplos dispositivos, blocos ou retomada nesta versão.
 
-### Estrutura
+## Estrutura
 
-```text
-crates/rowd-core/     hashes, reconciliação, protocolo, TLS e armazenamento
-crates/rowd/          CLI: init, serve, sync e status
-crates/rowd-android/  ponte JNI entre Rust e Android
-android/              interface, serviço e acesso SAF
-scripts/              preparação da toolchain e build Android
-docs/                 arquitetura e validação
-```
+- `crates/rowd-core`: configuração, estado, reconciliação, TLS/HMAC, protocolo e armazenamento.
+- `crates/rowd`: CLI, TUI e servidor com watcher.
+- `crates/rowd-android`: ponte JNI, utilizando o mesmo serviço cliente Rust.
+- `android`: interface, serviço e acesso SAF.
 
-## Documentação
-
-- [Arquitetura](docs/ARCHITECTURE.md): responsabilidades, protocolo, convergência e recuperação.
-- [Validação](docs/VALIDATION.md): comandos executados, artefatos gerados e lacunas de teste.
-
-## Licença
-
-Este projeto usa a licença MIT, declarada no [Cargo.toml do workspace](Cargo.toml).
+Licença MIT, declarada no [Cargo.toml](Cargo.toml).
