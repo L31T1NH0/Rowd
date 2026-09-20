@@ -17,12 +17,19 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
     private val recovery = File(context.filesDir, "recovery").apply { mkdirs() }
     private val definitions = File(context.filesDir, "shares.json")
     private val requests = File(context.filesDir, "share-requests.json")
+    private val shareTrees = File(context.filesDir, "share-trees.json")
     private var active: JSONObject? = null
-    private val base get() = DocumentFile.fromTreeUri(context, treeUri)
+    private fun trees(): JSONObject = if (shareTrees.exists()) JSONObject(shareTrees.readText()) else JSONObject()
+    private fun dedicatedTree(): Uri? {
+        val id = active?.optString("share_id") ?: return null
+        return trees().optString(id).takeIf { it.isNotEmpty() }?.let(Uri::parse)
+    }
+    private val activeTree get() = dedicatedTree() ?: treeUri
+    private val base get() = DocumentFile.fromTreeUri(context, activeTree)
         ?: error("A raiz Rowd não está disponível. Confira a permissão de acesso.")
     private val root: DocumentFile get() {
         var doc = base
-        val path = active?.optString("android_path") ?: ""
+        val path = if (dedicatedTree() == null) active?.optString("android_path") ?: "" else ""
         for (part in path.split('/').filter { it.isNotEmpty() }) {
             doc = doc.findFile(part) ?: doc.createDirectory(part) ?: error("Não foi possível criar $part")
             check(doc.isDirectory && doc.name == part) { "Destino Android inválido: $path" }
@@ -33,7 +40,7 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
     fun pendingShareRequests(): String =
         if (requests.exists()) requests.readText() else "[]"
 
-    fun queueShareRequest(name: String, mode: String): String {
+    fun queueShareRequest(name: String, mode: String, tree: String): String {
         val cleanName = name.trim()
         check(cleanName.isNotEmpty() && cleanName.length <= 120 && cleanName.none { it.isISOControl() }) {
             "Informe um nome válido para o Share."
@@ -50,7 +57,7 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
         val requestId = MessageDigest.getInstance("SHA-256")
             .digest(UUID.randomUUID().toString().toByteArray())
             .joinToString("") { "%02x".format(it.toInt() and 255) }
-        pending.put(JSONObject().put("request_id", requestId).put("name", cleanName).put("mode", mode))
+        pending.put(JSONObject().put("request_id", requestId).put("name", cleanName).put("mode", mode).put("tree", tree))
         persistText(requests, pending.toString())
         return requestId
     }
@@ -72,6 +79,25 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
     fun configureShares(json: String, removed: String): String {
         val previous = JSONArray(knownShares())
         val shares = JSONArray(json)
+        val pending = JSONArray(pendingShareRequests())
+        val selectedTrees = trees()
+        for (i in 0 until shares.length()) {
+            val share = shares.getJSONObject(i)
+            val requestId = share.optString("request_id")
+            val request = (0 until pending.length()).map { pending.getJSONObject(it) }
+                .firstOrNull { it.getString("request_id") == requestId }
+            val tree = request?.optString("tree")?.takeIf { it.isNotEmpty() } ?: continue
+            if (!selectedTrees.has(share.getString("share_id"))) {
+                val keys = selectedTrees.names() ?: JSONArray()
+                check((0 until keys.length()).none { selectedTrees.getString(keys.getString(it)) == tree }) {
+                    "Esta pasta já pertence a outro Share."
+                }
+                val directory = DocumentFile.fromTreeUri(context, Uri.parse(tree))
+                    ?: error("Pasta do Share não está disponível.")
+                check(directory.canRead() && directory.canWrite()) { "Sem acesso à pasta escolhida para o Share." }
+                selectedTrees.put(share.getString("share_id"), tree)
+            }
+        }
         for (i in 0 until shares.length()) {
             val share = shares.getJSONObject(i)
             for (j in 0 until previous.length()) {
@@ -86,7 +112,7 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
             val share = shares.getJSONObject(i)
             val path = share.getString("android_path")
             val known = (0 until previous.length()).any { previous.getJSONObject(it).getString("share_id") == share.getString("share_id") }
-            if (path.isNotEmpty() && !known) {
+            if (path.isNotEmpty() && !known && !selectedTrees.has(share.getString("share_id"))) {
                 var existing: DocumentFile? = base
                 for (part in path.split('/')) existing = existing?.findFile(part)
                 check(existing == null) { "Destino coincide com conteúdo legado: $path. Escolha outro destino pelo PC." }
@@ -94,6 +120,7 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
         }
         // Removal only unlinks the definition; files and recovery stay available.
         JSONArray(removed)
+        persistText(shareTrees, selectedTrees.toString())
         persistText(definitions, shares.toString())
         for (i in 0 until shares.length()) { active = shares.getJSONObject(i); check(root.canWrite()) { "Sem acesso ao Share" } }
         active = null
@@ -128,7 +155,7 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
     private fun ignoreRules(): List<String> {
         val local = root.findFile(".rowdignore")?.let { d -> resolver.openInputStream(d.uri)?.bufferedReader()?.use { it.readText() } } ?: ""
         val shares = JSONArray(knownShares())
-        val managed = if (active?.optString("android_path") == "") (0 until shares.length()).map { shares.getJSONObject(it).getString("android_path") }.filter { it.isNotEmpty() }.joinToString("\n") { "$it/" } else ""
+        val managed = if (dedicatedTree() == null && active?.optString("android_path") == "") (0 until shares.length()).map { shares.getJSONObject(it).getString("android_path") }.filter { it.isNotEmpty() }.joinToString("\n") { "$it/" } else ""
         return (local + "\n" + managed + "\n" + (active?.optString("ignore") ?: "")).lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith('#') }
     }
 
@@ -202,7 +229,7 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
     private fun recoverPending() {
         recovery.listFiles { f -> f.extension == "json" }?.forEach { file ->
             val journal = JSONObject(file.readText())
-            if (journal.optString("tree") != treeUri.toString() || journal.optBoolean("finished")) return@forEach
+            if (journal.optString("tree") != activeTree.toString() || journal.optBoolean("finished")) return@forEach
             val id = active?.optString("share_id") ?: ""
             if (journal.optString("share_id") != id && !(journal.optString("share_id").isEmpty() && active?.optString("android_path").isNullOrEmpty())) return@forEach
             val target = find(journal.getString("path"))
@@ -271,7 +298,7 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
             copyToPrivate(old, backup)
             check(digest(backup.inputStream()).first == expectedHash) { "STALE_TARGET: $path" }
         }
-        val journal = JSONObject().put("path", path).put("tree", treeUri.toString())
+        val journal = JSONObject().put("path", path).put("tree", activeTree.toString())
             .put("share_id", active?.optString("share_id") ?: "").put("android_path", active?.optString("android_path") ?: "").put("oldHash", expectedHash).put("newHash", newHash).put("finished", false)
         persist(journalFile, journal)
         // SAF lacks atomic compare-and-replace. Recheck immediately and retain both snapshots.
@@ -306,7 +333,7 @@ class FolderAccess(private val context: Context, private val treeUri: Uri) {
                 active = JSONObject().put("share_id",shareId).put("android_path",journal.getString("android_path"))
             }
         } else active = null
-        check(journal.getString("tree") == treeUri.toString()) { "Outra raiz Android" }
+        check(journal.getString("tree") == activeTree.toString()) { "Outra raiz Android" }
         val path = journal.getString("path")
         if (restore) {
             val backup = File(recovery,"$id.old")

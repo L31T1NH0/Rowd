@@ -41,6 +41,13 @@ class MainActivity : AppCompatActivity() {
             refresh()
         }
     }
+    private val shareFolderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) safely {
+            check(!SyncService.busy.get()) { "Aguarde a operação terminar." }
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            requestShare(uri)
+        }
+    }
     private val invitePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) safely {
             check(!SyncService.busy.get()) { "Aguarde a sincronização terminar." }
@@ -95,7 +102,7 @@ class MainActivity : AppCompatActivity() {
         ui.chooseFolder.setOnClickListener { folderPicker.launch(null) }
         ui.scanQr.setOnClickListener { qrScanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Escaneie o QR no PC").setBeepEnabled(false).setOrientationLocked(false)) }
         ui.importInvite.setOnClickListener { invitePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) }
-        ui.requestShare.setOnClickListener { requestShare() }
+        ui.requestShare.setOnClickListener { shareFolderPicker.launch(null) }
         ui.syncNow.setOnClickListener { startSync(false) }
         ui.automatic.setOnClickListener {
             if (SyncService.busy.get()) startService(Intent(this, SyncService::class.java).setAction(SyncService.STOP)) else startSync(true)
@@ -153,7 +160,7 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         startForegroundService(Intent(this, SyncService::class.java).putExtra("automatic", automatic))
     }
-    private fun requestShare() = safely {
+    private fun requestShare(folder: Uri) = safely {
         val tree = prefs.getString("tree", null) ?: error("Escolha a raiz Rowd primeiro.")
         check(prefs.contains("invitation")) { "Pareie o PC primeiro." }
         val name = EditText(this).apply {
@@ -183,13 +190,13 @@ class MainActivity : AppCompatActivity() {
         }
         MaterialAlertDialogBuilder(this)
             .setTitle("Solicitar Share")
-            .setMessage("O PC escolherá a pasta local e confirmará a solicitação.")
+            .setMessage("Esta pasta será usada no Android. O PC escolherá a pasta local e confirmará a solicitação.")
             .setView(form)
             .setNegativeButton("Cancelar", null)
             .setPositiveButton("Enviar") { _, _ -> safely {
                 val selected = group.checkedRadioButtonId
                 val index = group.indexOfChild(group.findViewById(selected)).coerceIn(0, modes.lastIndex)
-                FolderAccess(this, Uri.parse(tree)).queueShareRequest(name.text.toString(), modes[index].first)
+                FolderAccess(this, Uri.parse(tree)).queueShareRequest(name.text.toString(), modes[index].first, folder.toString())
                 SyncService.status = "Solicitação de Share salva"
                 SyncService.detail = "Sincronize para enviá-la ao PC."
                 refresh()

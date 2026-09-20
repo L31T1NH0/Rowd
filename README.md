@@ -24,7 +24,7 @@ cargo build --release -p rowd
 3. Toque em **Parear por QR**. Compare o fingerprint com o PC antes de conectar. O JSON continua disponível como alternativa.
 4. No PC, pressione **a** e preencha `Projetos | /home/voce/Projects | bidirectional`.
 5. Ative a sincronização automática no Android. O PC cria a definição e o Android cria `Rowd/Projetos` na próxima conexão. Repita **a** para outros Shares.
-6. Para iniciar um Share pelo Android, toque em **Solicitar Share**, informe o nome e o modo. Na TUI do PC, pressione **c**, informe a pasta local escolhida com `pwd` e confirme. O Share será criado no PC e enviado ao Android na próxima rodada.
+6. Para iniciar um Share pelo Android, toque em **Solicitar Share**, escolha a pasta do celular (por exemplo, `DCIM`), informe o nome e o modo. Na TUI do PC, pressione **c**, informe a pasta local escolhida com `pwd` (por exemplo, `Pictures`) e confirme. O Share será criado no PC e enviado ao Android na próxima rodada.
 
 O QR completo pode exigir um terminal maior. A tela informa o tamanho necessário; **o** abre sua imagem SVG privada. Feche a imagem depois de parear: ela contém a mesma credencial do convite.
 
@@ -77,9 +77,9 @@ A primeira identidade Android autenticada fica vinculada ao PC. Outro cliente co
 
 ### Solicitar um Share pelo Android
 
-O Android não escolhe a pasta do PC diretamente. Toque em **Solicitar Share**, informe o nome e escolha o modo; a solicitação fica salva no telefone até ser entregue.
+O Android não escolhe a pasta do PC diretamente. Toque em **Solicitar Share**, escolha a pasta local do celular, informe o nome e escolha o modo; a solicitação fica salva no telefone até ser entregue. Essa pasta pode estar fora da raiz Rowd vinculada.
 
-Na TUI do PC, `n` alterna entre solicitações pendentes e `c` aceita a selecionada. Informe o caminho absoluto da pasta do PC, de preferência copiando o resultado de `pwd`, e confirme. O PC valida a pasta e cria o Share; na próxima rodada, o Android recebe a configuração e usa `Rowd/<nome-do-Share>` como destino.
+Na TUI do PC, `n` alterna entre solicitações pendentes e `c` aceita a selecionada. Informe o caminho absoluto da pasta do PC, de preferência copiando o resultado de `pwd`, e confirme. O PC valida a pasta e cria o Share; na próxima rodada, o Android recebe a configuração e vincula o Share à pasta escolhida no celular.
 
 Se o PC estiver offline, a solicitação permanece pendente no Android. O envio é repetido com o mesmo ID até o PC aceitar, evitando Shares duplicados.
 
