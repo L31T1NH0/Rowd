@@ -2,7 +2,7 @@
 
 Sincronização de vários diretórios entre **um PC Linux e um Android**, pela rede local. Rust no núcleo, Ratatui no terminal e Kotlin/SAF no Android. Sem servidor intermediário.
 
-**V2 · 0.2.0:** configuração persistente, Shares, solicitações de Share iniciadas no Android, pareamento por QR/JSON, pendências com ACK, watcher Linux, modos por Share, recuperação acessível e ícone mobile próprio. A validação em aparelho real de SAF, câmera e bateria ainda está pendente; veja [Validação V2](docs/V2_VALIDATION.md).
+**V2 · 0.2.1:** configuração persistente, Shares, solicitações de Share iniciadas no Android, pareamento por QR/JSON, pendências com ACK, watcher Linux, modos por Share, recuperação acessível e ícone mobile próprio. A validação em aparelho real de SAF, câmera e bateria ainda está pendente; veja [Validação V2](docs/V2_VALIDATION.md).
 
 ## Começar
 
