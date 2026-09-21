@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
-    <!-- A restored credential/root identity must not silently pair a second phone. -->
+    <!-- Restored credentials/device identity must not silently pair a second phone. -->
     <cloud-backup>
         <exclude domain="root" path="." />
         <exclude domain="file" path="." />

@@ -22,6 +22,13 @@ pub trait ManagedStore: Store {
     fn acknowledge_share_requests(&mut self, _accepted: &[String]) -> Result<()> {
         Ok(())
     }
+    fn available_shares(&mut self) -> Result<Vec<String>> {
+        Ok(self
+            .known_shares()?
+            .into_iter()
+            .map(|share| share.share_id)
+            .collect())
+    }
 }
 impl<S: Store> Store for &mut S {
     fn excluded(&self, p: &str) -> bool {
@@ -68,7 +75,12 @@ pub fn validate_shares(shares: &[ShareConfig]) -> Result<()> {
     Ok(())
 }
 pub fn observe_offline(store: &mut impl ManagedStore) -> Result<()> {
-    for share in store.known_shares()? {
+    let available: std::collections::BTreeSet<_> = store.available_shares()?.into_iter().collect();
+    for share in store
+        .known_shares()?
+        .into_iter()
+        .filter(|share| available.contains(&share.share_id))
+    {
         let path = store.select(&share.share_id)?;
         TrackedStore::new(&mut *store, path, &share.share_id)?.scan()?;
     }
@@ -94,13 +106,22 @@ pub fn client_round(
     };
     validate_shares(&shares)?;
     store.configure(&shares, &removed)?;
+    let available_shares = store.available_shares()?;
+    for id in &available_shares {
+        crate::model::validate_hash(id)?;
+        ensure!(
+            shares.iter().any(|share| &share.share_id == id),
+            "available unknown Share"
+        );
+    }
     protocol::send(
         &mut io,
         &Message::Capabilities {
-            root_id: root.into(),
+            device_id: root.into(),
             polling: true,
             managed_shares: true,
             share_requests: store.pending_share_requests()?,
+            available_shares,
         },
     )?;
     let Message::ShareRequestStatus { accepted, .. } = protocol::receive(&mut io)? else {
@@ -254,5 +275,67 @@ impl Store for LocalDevice {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("no active Share"))?
             .install(p, x, e, s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::SyncMode, model::Manifest, storage::Snapshot};
+
+    struct Unassigned {
+        share: ShareConfig,
+    }
+
+    impl Store for Unassigned {
+        fn excluded(&self, _: &str) -> bool {
+            false
+        }
+        fn scan(&mut self) -> Result<Manifest> {
+            panic!("an unassigned Share must not be scanned")
+        }
+        fn snapshot(&mut self, _: &str, _: &crate::model::Entry) -> Result<Snapshot> {
+            unreachable!()
+        }
+        fn install(
+            &mut self,
+            _: &str,
+            _: Option<&str>,
+            _: &crate::model::Entry,
+            _: &Path,
+        ) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    impl ManagedStore for Unassigned {
+        fn configure(&mut self, _: &[ShareConfig], _: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn select(&mut self, _: &str) -> Result<PathBuf> {
+            panic!("an unassigned Share must not be selected")
+        }
+        fn known_shares(&mut self) -> Result<Vec<ShareConfig>> {
+            Ok(vec![self.share.clone()])
+        }
+        fn available_shares(&mut self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn offline_observation_skips_shares_without_an_android_folder() {
+        let mut store = Unassigned {
+            share: ShareConfig {
+                share_id: "a".repeat(64),
+                name: "pendente".into(),
+                root: PathBuf::new(),
+                android_path: "legacy-hint".into(),
+                mode: SyncMode::Bidirectional,
+                ignore: String::new(),
+                request_id: None,
+            },
+        };
+        observe_offline(&mut store).unwrap();
     }
 }

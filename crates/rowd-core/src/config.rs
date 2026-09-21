@@ -20,6 +20,8 @@ pub struct ShareConfig {
     pub share_id: String,
     pub name: String,
     pub root: PathBuf,
+    // Compatibility hint for the local device simulator. Android binds each
+    // share_id to its own private SAF URI and never derives a folder from this.
     pub android_path: String,
     pub mode: SyncMode,
     #[serde(default)]
@@ -46,7 +48,8 @@ pub struct DeviceConfig {
     pub cert: String,
     pub key: String,
     pub secret: String,
-    pub peer_root: Option<String>,
+    #[serde(default, alias = "peer_root")]
+    pub peer_device: Option<String>,
     pub shares: Vec<ShareConfig>,
     pub removed: Vec<String>,
     #[serde(default)]
@@ -198,7 +201,7 @@ mod tests {
             cert: String::new(),
             key: String::new(),
             secret: String::new(),
-            peer_root: None,
+            peer_device: None,
             shares: vec![],
             removed: vec![],
             share_requests: vec![],
@@ -225,5 +228,30 @@ mod tests {
         assert_eq!(reloaded.shares.len(), 2);
         assert_eq!(reloaded.shares[0].share_id, id);
         assert_eq!(reloaded.shares[0].android_path, "Fotos");
+    }
+
+    #[test]
+    fn device_identity_migrates_from_the_old_root_field() {
+        let id = random_id().unwrap();
+        let mut value = serde_json::json!({
+            "version": 2,
+            "address": "",
+            "listen": "",
+            "pair_id": random_id().unwrap(),
+            "folder_id": random_id().unwrap(),
+            "cert": "",
+            "key": "",
+            "secret": random_id().unwrap(),
+            "peer_root": id,
+            "shares": [],
+            "removed": [],
+            "share_requests": []
+        });
+        let config: DeviceConfig = serde_json::from_value(value.take()).unwrap();
+        assert_eq!(config.peer_device.as_deref(), Some(id.as_str()));
+        assert!(serde_json::to_value(config)
+            .unwrap()
+            .get("peer_root")
+            .is_none());
     }
 }

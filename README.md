@@ -2,7 +2,7 @@
 
 Sincronização de vários diretórios entre **um PC Linux e um Android**, pela rede local. Rust no núcleo, Ratatui no terminal e Kotlin/SAF no Android. Sem servidor intermediário.
 
-**V2 · 0.2.1:** configuração persistente, Shares, solicitações de Share iniciadas no Android, pareamento por QR/JSON, pendências com ACK, watcher Linux, modos por Share, recuperação acessível e ícone mobile próprio. A validação em aparelho real de SAF, câmera e bateria ainda está pendente; veja [Validação V2](docs/V2_VALIDATION.md).
+**V3 · 0.3.0:** cada Share liga explicitamente uma pasta do PC a uma pasta SAF do Android. Não existe uma raiz Android global ou destino inferido. Configuração persistente, solicitações mobile, pareamento por QR/JSON, pendências com ACK, watcher, modos e recovery continuam isolados por `share_id`.
 
 ## Começar
 
@@ -20,11 +20,11 @@ cargo build --release -p rowd
 ```
 
 1. Pressione **p** e informe o endereço do PC, por exemplo `192.168.1.20:43821`.
-2. No Android, escolha ou crie a raiz `Rowd` pelo seletor de documentos, uma única vez.
-3. Toque em **Parear por QR**. Compare o fingerprint com o PC antes de conectar. O JSON continua disponível como alternativa.
-4. No PC, pressione **a** e preencha `Projetos | /home/voce/Projects | bidirectional`.
-5. Ative a sincronização automática no Android. O PC cria a definição e o Android cria `Rowd/Projetos` na próxima conexão. Repita **a** para outros Shares.
-6. Para iniciar um Share pelo Android, toque em **Solicitar Share**, escolha a pasta do celular (por exemplo, `DCIM`), informe o nome e o modo. Na TUI do PC, pressione **c**, informe a pasta local escolhida com `pwd` (por exemplo, `Pictures`) e confirme. O Share será criado no PC e enviado ao Android na próxima rodada.
+2. No Android, toque em **Parear por QR** e compare o fingerprint com o PC. O JSON continua disponível como alternativa.
+3. Toque em **Escolher pasta para novo Share**, selecione a pasta Android, informe o nome e o modo.
+4. Na TUI do PC, pressione **c**, escolha a solicitação e informe a pasta correspondente no PC com seu caminho absoluto.
+5. Sincronize novamente. O mesmo fluxo vale para `/home/leite/Documents/Rowd ↔ Android/Rowd`, `/home/leite/wiki ↔ Android/Documents/blog` ou qualquer outro par de pastas sem sobreposição.
+6. Um Share também pode começar no PC com **a**; depois da primeira conexão, use **Vincular pasta a Share pendente** no Android para escolher seu outro extremo.
 
 O QR completo pode exigir um terminal maior. A tela informa o tamanho necessário; **o** abre sua imagem SVG privada. Feche a imagem depois de parear: ela contém a mesma credencial do convite.
 
@@ -65,7 +65,7 @@ A configuração fica em `~/.local/share/rowd/.rowd/`. Use `--home DIRETORIO` ou
 ./rowd scan
 ```
 
-`--android caminho/relativo` em `share add` permite outro destino **dentro da raiz Android autorizada**. O nome visual pode mudar; o destino Android existente permanece fixo. Raízes PC iguais, ancestrais ou descendentes, inclusive por symlink, são recusadas. Diretórios internos `.rowd` não podem virar Shares.
+No Android real, a pasta é sempre escolhida explicitamente pelo seletor SAF. `--android caminho/relativo` permanece apenas para o cliente local `device-sync`. O nome visual pode mudar; trocar a pasta exige desvincular e vincular novamente. Raízes PC iguais, ancestrais ou descendentes, inclusive por symlink, são recusadas. Pastas Android iguais, ancestrais ou descendentes também são recusadas.
 
 `./rowd run --listen 0.0.0.0:43821` mantém todos os Shares e o watcher em um processo. Para simular o Android sem aparelho, use uma raiz de teste exclusiva:
 
@@ -73,11 +73,11 @@ A configuração fica em `~/.local/share/rowd/.rowd/`. Use `--home DIRETORIO` ou
 ./rowd device-sync --folder /tmp/rowd-android --invite /tmp/rowd-convite.json --watch
 ```
 
-A primeira identidade Android autenticada fica vinculada ao PC. Outro cliente com raiz/identidade diferente é recusado.
+A primeira identidade Android autenticada fica vinculada ao PC. Essa identidade pertence ao aparelho, não a uma pasta. Outro cliente é recusado.
 
 ### Solicitar um Share pelo Android
 
-O Android não escolhe a pasta do PC diretamente. Toque em **Solicitar Share**, escolha a pasta local do celular, informe o nome e escolha o modo; a solicitação fica salva no telefone até ser entregue. Essa pasta pode estar fora da raiz Rowd vinculada.
+O Android não escolhe a pasta do PC diretamente. Toque em **Escolher pasta para novo Share**, escolha qualquer pasta local, informe o nome e o modo; a solicitação fica salva no telefone até ser entregue.
 
 Na TUI do PC, `n` alterna entre solicitações pendentes e `c` aceita a selecionada. Informe o caminho absoluto da pasta do PC, de preferência copiando o resultado de `pwd`, e confirme. O PC valida a pasta e cria o Share; na próxima rodada, o Android recebe a configuração e vincula o Share à pasta escolhida no celular.
 
@@ -85,7 +85,7 @@ Se o PC estiver offline, a solicitação permanece pendente no Android. O envio 
 
 ### Migrar V1
 
-Pare os processos antigos e atualize PC e APK juntos. O protocolo de rede V2 rejeita a V1 explicitamente; o formato do convite continua na versão 1, independente da versão do protocolo e dos pacotes.
+Pare os processos antigos e atualize PC e APK juntos. O protocolo de rede V3 rejeita versões anteriores explicitamente; o formato do convite continua na versão 1, independente da versão do protocolo e dos pacotes.
 
 ```bash
 ./rowd migrate --folder /caminho/da/pasta-v1 --address 192.168.1.20:43821
@@ -94,9 +94,9 @@ Pare os processos antigos e atualize PC e APK juntos. O protocolo de rede V2 rej
 
 A migração reutiliza credenciais, identidade do Android, ID da pasta e estado-base. Os backups continuam na raiz original. O convite JSON já importado permanece válido.
 
-O primeiro Share migrado mantém a raiz Android original. Novos Shares usam subpastas exclusivas dessa raiz e são excluídos do Share legado. Um destino que já contenha arquivos do Share legado é recusado. A exclusão dessas subpastas permanece após desvinculá-las, para não misturar os estados.
+O primeiro Share migrado conserva a antiga pasta Android como seu extremo explícito. Shares antigos que ainda dependiam de subpastas inferidas ficam pausados até que o usuário escolha sua pasta pelo botão **Vincular pasta a Share pendente**; nenhum caminho é adivinhado durante a atualização.
 
-Os comandos `init`, `serve --folder`, `sync --folder` e `status --folder` continuam disponíveis para operar uma pasta, com o protocolo atualizado. O APK V2 usa a administração multi-Share; use `migrate` e `run` para conectar uma instalação antiga.
+Os comandos `init`, `serve --folder`, `sync --folder` e `status --folder` continuam disponíveis para operar uma pasta, com o protocolo atualizado. O APK V3 usa a administração multi-Share; use `migrate` e `run` para conectar uma instalação antiga.
 
 ## Pendências, cache e eventos
 
@@ -160,7 +160,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Os testes usam sockets locais TCP/TLS e Unix; precisam de um ambiente que permita esses sockets. Consulte [Validação V2](docs/V2_VALIDATION.md) para os cenários executados e os que ainda exigem aparelho.
+Os testes usam sockets locais TCP/TLS e Unix; precisam de um ambiente que permita esses sockets. Consulte [Validação V3](docs/V3_VALIDATION.md) para os cenários executados e os que ainda exigem aparelho.
 
 Limites: 8 GiB por arquivo, 50 mil arquivos por Share, 16 MiB por mensagem, até 256 Shares no protocolo, uma transferência por vez. Symlinks, pastas vazias, permissões e timestamps originais não são sincronizados. Não há daemon, mDNS, conexão persistente, múltiplos dispositivos, blocos ou retomada nesta versão.
 

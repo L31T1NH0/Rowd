@@ -77,7 +77,7 @@ pub fn pair(home: &Path, address: &str) -> Result<DeviceConfig> {
         cert: hex::encode(cert.cert.der()),
         key: hex::encode(cert.key_pair.serialize_der()),
         secret: random_id()?,
-        peer_root: None,
+        peer_device: None,
         shares: vec![],
         removed: vec![],
         share_requests: vec![],
@@ -108,7 +108,7 @@ pub fn migrate(home: &Path, folder: &Path, address: &str) -> Result<()> {
         cert: old.cert,
         key: old.key,
         secret: old.secret,
-        peer_root: state.peer_root.clone(),
+        peer_device: state.peer_root.clone(),
         shares: vec![],
         removed: vec![],
         share_requests: vec![],
@@ -271,11 +271,11 @@ fn session(home: &Path, socket: TcpStream, event: &impl Fn(String)) -> Result<()
     let mut cfg = DeviceConfig::load(home)?;
     let mut io = tls::accept(socket, tls::server_config(&cfg.cert, &cfg.key)?)?;
     let result = (|| -> Result<()> {
-        let root = protocol::server_auth(&mut io, &cfg.pair_id, &cfg.folder_id, &cfg.secret)?;
-        if let Some(peer) = &cfg.peer_root {
-            ensure!(peer == &root, "another Android/root is already paired");
+        let device = protocol::server_auth(&mut io, &cfg.pair_id, &cfg.folder_id, &cfg.secret)?;
+        if let Some(peer) = &cfg.peer_device {
+            ensure!(peer == &device, "another Android device is already paired");
         } else {
-            cfg.peer_root = Some(root.clone());
+            cfg.peer_device = Some(device.clone());
             cfg.save(home)?;
         }
         event("Android conectado".into());
@@ -294,18 +294,27 @@ fn session(home: &Path, socket: TcpStream, event: &impl Fn(String)) -> Result<()
             },
         )?;
         let Message::Capabilities {
-            root_id,
+            device_id,
             managed_shares,
             share_requests,
+            available_shares,
             ..
         } = protocol::receive(&mut io)?
         else {
             anyhow::bail!("expected Android capabilities")
         };
         ensure!(
-            root_id == root && managed_shares,
-            "Android root/capabilities mismatch"
+            device_id == device && managed_shares,
+            "Android device/capabilities mismatch"
         );
+        let available_shares: BTreeSet<_> = available_shares.into_iter().collect();
+        for id in &available_shares {
+            rowd_core::model::validate_hash(id)?;
+            ensure!(
+                cfg.shares.iter().any(|share| &share.share_id == id),
+                "Android advertised an unknown Share"
+            );
+        }
         let mut accepted_requests = Vec::new();
         let mut pending_requests = Vec::new();
         let mut requests_changed = false;
@@ -345,12 +354,29 @@ fn session(home: &Path, socket: TcpStream, event: &impl Fn(String)) -> Result<()
                 pending: pending_requests,
             },
         )?;
-        for (index, share) in cfg.shares.iter().enumerate() {
+        let ready: Vec<_> = cfg
+            .shares
+            .iter()
+            .filter(|share| available_shares.contains(&share.share_id))
+            .collect();
+        let waiting: Vec<_> = cfg
+            .shares
+            .iter()
+            .filter(|share| !available_shares.contains(&share.share_id))
+            .map(|share| share.name.as_str())
+            .collect();
+        if !waiting.is_empty() {
+            event(format!(
+                "Aguardando pasta Android para: {}",
+                waiting.join(", ")
+            ));
+        }
+        for (index, share) in ready.iter().enumerate() {
             event(format!(
                 "Sincronizando {} ({}/{})",
                 share.name,
                 index + 1,
-                cfg.shares.len()
+                ready.len()
             ));
             let result = (|| -> Result<_> {
                 let mut store = LocalStore::open(&share.root)?;

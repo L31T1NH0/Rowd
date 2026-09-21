@@ -31,21 +31,21 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable { override fun run() { refresh(); handler.postDelayed(this, 1000) } }
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
-    private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        if (uri != null) safely {
-            check(!SyncService.busy.get()) { "Aguarde a operação terminar." }
-            if (prefs.contains("invitation")) check(uri.toString() == prefs.getString("tree",null)) { "Selecione a mesma raiz vinculada ao PC para renovar a permissão." }
-            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            val root = prefs.getString("rootId",null) ?: MessageDigest.getInstance("SHA-256").digest(UUID.randomUUID().toString().toByteArray()).joinToString("") { "%02x".format(it.toInt() and 255) }
-            prefs.edit().putString("tree", uri.toString()).putString("rootId", root).apply()
-            refresh()
-        }
-    }
     private val shareFolderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) safely {
             check(!SyncService.busy.get()) { "Aguarde a operação terminar." }
-            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
             requestShare(uri)
+        }
+    }
+    private val bindFolderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val id = prefs.getString("bindingShare", null)
+        prefs.edit().remove("bindingShare").apply()
+        if (uri != null && id != null) safely {
+            check(!SyncService.busy.get()) { "Aguarde a operação terminar." }
+            FolderAccess(this).bindShare(id, uri.toString())
+            SyncService.status = "Pasta Android vinculada"
+            SyncService.detail = "Sincronize para concluir a configuração do Share."
+            refresh()
         }
     }
     private val invitePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -83,13 +83,18 @@ class MainActivity : AppCompatActivity() {
     }
     private val recoveryPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null && !SyncService.busy.get()) {
-            val tree = prefs.getString("tree", null) ?: return@registerForActivityResult
-            runRecovery("Exportando cópias") { FolderAccess(this, Uri.parse(tree)).exportRecovery(uri) }
+            runRecovery("Exportando cópias") { FolderAccess(this).exportRecovery(uri) }
 
         }
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (!prefs.contains("deviceId")) {
+            val id = prefs.getString("rootId", null) ?: MessageDigest.getInstance("SHA-256")
+                .digest(UUID.randomUUID().toString().toByteArray())
+                .joinToString("") { "%02x".format(it.toInt() and 255) }
+            prefs.edit().putString("deviceId", id).remove("rootId").apply()
+        }
         ui = ActivityMainBinding.inflate(layoutInflater); setContentView(ui.root)
         ViewCompat.setOnApplyWindowInsetsListener(ui.page) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
@@ -99,18 +104,17 @@ class MainActivity : AppCompatActivity() {
             SyncService.status = prefs.getString("lastStatus", SyncService.status)!!
             SyncService.detail = prefs.getString("lastDetail", SyncService.detail)!!
         }
-        ui.chooseFolder.setOnClickListener { folderPicker.launch(null) }
         ui.scanQr.setOnClickListener { qrScanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Escaneie o QR no PC").setBeepEnabled(false).setOrientationLocked(false)) }
         ui.importInvite.setOnClickListener { invitePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) }
         ui.requestShare.setOnClickListener { shareFolderPicker.launch(null) }
+        ui.bindShare.setOnClickListener { chooseUnassignedShare() }
         ui.syncNow.setOnClickListener { startSync(false) }
         ui.automatic.setOnClickListener {
             if (SyncService.busy.get()) startService(Intent(this, SyncService::class.java).setAction(SyncService.STOP)) else startSync(true)
         }
         ui.manageRecovery.setOnClickListener {
-            val tree = prefs.getString("tree",null) ?: return@setOnClickListener
             safely {
-                val access = FolderAccess(this,Uri.parse(tree))
+                val access = FolderAccess(this)
                 val records = access.recoveryRecords()
                 if (records.isEmpty()) { message("Recuperação", "Nenhuma versão preservada."); return@safely }
                 val sharesFile = java.io.File(filesDir,"shares.json")
@@ -160,9 +164,17 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         startForegroundService(Intent(this, SyncService::class.java).putExtra("automatic", automatic))
     }
+    private fun chooseUnassignedShare() = safely {
+        val missing = JSONArray(FolderAccess(this).unassignedShares())
+        check(missing.length() > 0) { "Nenhum Share aguarda uma pasta Android." }
+        val labels = (0 until missing.length()).map { missing.getJSONObject(it).getString("name") }.toTypedArray()
+        MaterialAlertDialogBuilder(this).setTitle("Escolha o Share")
+            .setItems(labels) { _, index ->
+                prefs.edit().putString("bindingShare", missing.getJSONObject(index).getString("share_id")).apply()
+                bindFolderPicker.launch(null)
+            }.show()
+    }
     private fun requestShare(folder: Uri) = safely {
-        val tree = prefs.getString("tree", null) ?: error("Escolha a raiz Rowd primeiro.")
-        check(prefs.contains("invitation")) { "Pareie o PC primeiro." }
         val name = EditText(this).apply {
             hint = "Nome do Share"
             setSingleLine()
@@ -196,9 +208,9 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Enviar") { _, _ -> safely {
                 val selected = group.checkedRadioButtonId
                 val index = group.indexOfChild(group.findViewById(selected)).coerceIn(0, modes.lastIndex)
-                FolderAccess(this, Uri.parse(tree)).queueShareRequest(name.text.toString(), modes[index].first, folder.toString())
+                FolderAccess(this).queueShareRequest(name.text.toString(), modes[index].first, folder.toString())
                 SyncService.status = "Solicitação de Share salva"
-                SyncService.detail = "Sincronize para enviá-la ao PC."
+                SyncService.detail = if (prefs.contains("invitation")) "Sincronize para enviá-la ao PC." else "Pareie o PC e sincronize para enviá-la."
                 refresh()
             } }
             .show()
@@ -206,36 +218,35 @@ class MainActivity : AppCompatActivity() {
     private fun refresh() {
         val busy = SyncService.busy.get()
         val paired = prefs.contains("invitation")
-        val folder = prefs.getString("tree", null)
+        val access = FolderAccess(this)
         ui.status.text = SyncService.status; ui.detail.text = SyncService.detail
         ui.progress.visibility = if (busy) View.VISIBLE else View.GONE
-        ui.folderLabel.text = folder?.let { Uri.decode(Uri.parse(it).lastPathSegment ?: it) } ?: "Nenhuma pasta escolhida"
         ui.peerLabel.text = if (paired) JSONObject(prefs.getString("invitation", "{}")!!).optString("address") else "Ainda não pareado"
-        ui.chooseFolder.isEnabled = !busy
-        ui.chooseFolder.text = if (paired) "Reautorizar raiz vinculada" else "Escolher raiz Rowd"
-        ui.importInvite.isEnabled = !busy && folder != null
-        ui.scanQr.isEnabled = !busy && folder != null
-        ui.manageRecovery.isEnabled = !busy && folder != null
-        ui.requestShare.isEnabled = !busy && paired && folder != null
+        ui.importInvite.isEnabled = !busy
+        ui.scanQr.isEnabled = !busy
+        ui.manageRecovery.isEnabled = !busy
+        ui.requestShare.isEnabled = !busy
         val definitions = java.io.File(filesDir,"shares.json")
+        val unassigned = runCatching { JSONArray(access.unassignedShares()) }.getOrDefault(JSONArray())
+        val missingIds = (0 until unassigned.length()).map { unassigned.getJSONObject(it).getString("share_id") }.toSet()
         val sharesText = if (definitions.exists()) {
             val shares = JSONArray(definitions.readText())
             (0 until shares.length()).joinToString("\n") { i ->
                 val share = shares.getJSONObject(i)
                 val journal = java.io.File(filesDir,"shares/${share.getString("share_id")}/journal.json")
                 val pending = if (journal.exists()) JSONObject(journal.readText()).optJSONObject("pending")?.length() ?: 0 else 0
-                "${share.getString("name")} · $pending pendências · ${share.getString("mode")}"
+                val folderState = if (share.getString("share_id") in missingIds) " · escolha a pasta Android" else ""
+                "${share.getString("name")} · $pending pendências · ${share.getString("mode")}$folderState"
             }.ifEmpty { "Nenhum Share aceito ainda." }
         } else "Nenhum Share aceito ainda."
-        val requestCount = folder?.let {
-            runCatching { JSONArray(FolderAccess(this, Uri.parse(it)).pendingShareRequests()).length() }.getOrDefault(0)
-        } ?: 0
+        val requestCount = runCatching { JSONArray(access.pendingShareRequests()).length() }.getOrDefault(0)
         ui.sharesLabel.text = if (requestCount == 0) sharesText else "$sharesText\nSolicitações pendentes: $requestCount"
+        ui.bindShare.isEnabled = !busy && unassigned.length() > 0
         ui.changeAddress.isEnabled = !busy && paired
-        ui.syncNow.isEnabled = !busy && paired && folder != null
-        ui.automatic.isEnabled = paired && folder != null && (!busy || SyncService.automatic)
+        ui.syncNow.isEnabled = !busy && paired
+        ui.automatic.isEnabled = paired && (!busy || SyncService.automatic)
         ui.automatic.text = if (busy) "Parar após a rodada atual" else "Iniciar sincronização automática"
-        ui.exportRecovery.isEnabled = !busy && folder != null
+        ui.exportRecovery.isEnabled = !busy
     }
     private fun message(title: String, text: String) { MaterialAlertDialogBuilder(this).setTitle(title).setMessage(text).setPositiveButton("Entendi", null).show() }
     private fun safely(action: () -> Unit) { try { action() } catch (e: Exception) { message("Não foi possível continuar", e.message ?: "Tente novamente.") } }

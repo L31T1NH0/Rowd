@@ -1,4 +1,4 @@
-# Arquitetura implementada — Rowd 0.1
+# Arquitetura implementada — Rowd 0.3
 
 ## Responsabilidades
 
@@ -12,10 +12,11 @@ duplicar e reconciliar dois arquivos de estado acrescentaria estados de falha.
 Perder uma confirmação pode provocar uma cópia de conflito conservadora; nunca
 é motivo para escolher uma versão por data.
 
-Cada pasta PC tem `pair_id`, `folder_id`, certificado e segredo próprios. A raiz
-Android tem um identificador aleatório persistente. O PC o fixa após autenticar
-a primeira sessão; mudar a pasta cliente exige outro pareamento. No PC, um
-arquivo de trava impede dois processos Rowd de coordenar a mesma raiz.
+O dispositivo possui um identificador aleatório persistente, independente das
+pastas. O PC o fixa após autenticar a primeira sessão. Cada Share liga uma raiz
+PC a uma URI SAF escolhida explicitamente no Android e possui identidade e estado
+próprios. Não existe uma raiz Android global nem destino inferido. No PC, um
+arquivo de trava impede dois processos Rowd de coordenar a mesma raiz local.
 
 ## Conexão
 
@@ -29,7 +30,7 @@ ser configurado explicitamente; as cópias de recuperação são exportadas pelo
 
 ```text
 TLS com certificado confiado pelo convite
-→ Hello(version, pair_id, folder_id, root_id)
+→ Hello(version, pair_id, folder_id, device_id)
 → Challenge(nonce aleatório)
 → Proof(HMAC-SHA256)
 → Ready

@@ -2,7 +2,6 @@ package app.rowd
 
 import android.app.*
 import android.content.Intent
-import android.net.Uri
 import android.os.IBinder
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
@@ -12,8 +11,8 @@ class SyncService : Service() {
         const val STOP = "app.rowd.STOP"
         val busy = AtomicBoolean(false)
         @Volatile var automatic = false
-        @Volatile var status = "Vamos conectar sua pasta"
-        @Volatile var detail = "Escolha uma pasta e importe o convite gerado no PC."
+        @Volatile var status = "Vamos conectar seus Shares"
+        @Volatile var detail = "Pareie o PC e escolha uma pasta Android para cada Share."
     }
     private val active = AtomicBoolean(false)
     private var worker: Thread? = null
@@ -56,8 +55,9 @@ class SyncService : Service() {
         worker = Thread({
             val prefs = getSharedPreferences("rowd", MODE_PRIVATE)
             var failures = 0
-            prefs.getString("tree",null)?.let { tree ->
-                try { contentResolver.registerContentObserver(Uri.parse(tree),true,observer) } catch (_: Exception) { /* SAF polling is a supported capability. */ }
+            val access = FolderAccess(this)
+            access.treeUris().forEach { tree ->
+                try { contentResolver.registerContentObserver(tree,true,observer) } catch (_: Exception) { /* SAF polling is a supported capability. */ }
             }
             try {
                 do {
@@ -65,17 +65,22 @@ class SyncService : Service() {
                     detail = "Comparando arquivos e verificando SHA-256."
                     notifyStatus(status)
                     try {
-                        val tree = prefs.getString("tree", null) ?: error("Escolha uma pasta.")
                         val invitation = prefs.getString("invitation", null) ?: error("Importe o convite do PC.")
-                        val root = prefs.getString("rootId", null) ?: error("Escolha a pasta novamente.")
-                        val result = JSONObject(NativeBridge.sync(invitation, root, FolderAccess(this, Uri.parse(tree))))
+                        val device = prefs.getString("deviceId", null) ?: error("Abra o Rowd novamente para criar a identidade do aparelho.")
+                        val result = JSONObject(NativeBridge.sync(invitation, device, access))
                         if (result.has("error")) error(result.getString("error"))
                         failures = 0
                         val count = result.getInt("transferred")
                         val conflicts = result.getInt("conflicts")
-                        status = if (conflicts > 0) "Sincronizado com conflitos" else "Tudo sincronizado"
-                        detail = "$count transferências · $conflicts conflitos. Última sincronização: ${java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date())}"
-                        if (conflicts > 0) detail += " As versões estão em Rowd Conflicts."
+                        val missing = org.json.JSONArray(access.unassignedShares()).length()
+                        status = when {
+                            missing > 0 -> "Aguardando pasta Android"
+                            conflicts > 0 -> "Sincronizado com conflitos"
+                            else -> "Tudo sincronizado"
+                        }
+                        detail = if (missing > 0) "$missing Share(s) aguardam uma pasta escolhida no Android."
+                            else "$count transferências · $conflicts conflitos. Última sincronização: ${java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date())}"
+                        if (missing == 0 && conflicts > 0) detail += " As versões estão em Rowd Conflicts."
                     } catch (error: Exception) {
                         failures++
                         status = if (automatic) "Aguardando conexão ou correção" else "Não foi possível sincronizar"

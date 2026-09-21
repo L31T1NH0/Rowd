@@ -126,7 +126,7 @@ pub fn run(home: &Path) -> Result<()> {
                 return;
             }
             let layout = Layout::vertical([Constraint::Length(3),Constraint::Min(5),Constraint::Length(4),Constraint::Length(3),Constraint::Length(4)]).split(area);
-            let paired = DeviceConfig::load(home).ok().and_then(|c| c.peer_root).is_some();
+            let paired = DeviceConfig::load(home).ok().and_then(|c| c.peer_device).is_some();
             frame.render_widget(Paragraph::new(format!("ROWD  /  Seus arquivos, entre seus dispositivos\nAndroid: {}  ·  {} Shares",if paired {"pareado"} else {"aguardando pareamento"},entries.len())).style(Style::default().fg(Color::Green)),layout[0]);
             let rows = entries.iter().enumerate().map(|(i,s)| Row::new(vec![Cell::from(s.share.name.clone()),Cell::from(format!("{:?}",s.share.mode)),Cell::from(s.pending.to_string()),Cell::from(s.conflicts.len().to_string()),Cell::from(s.last_sync.map(|t| format!("há {}s",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().saturating_sub(t))).unwrap_or_else(|| "Ainda não".into()))]).style(if i == selected { Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD) } else {Style::default()}));
             table_state.select(Some(selected));
@@ -149,7 +149,7 @@ pub fn run(home: &Path) -> Result<()> {
                         .join(" · ")
                 )
             };
-            let detail = entries.get(selected).map(|s| format!("{} ↔ Android/{}\nPendentes: {}\nConflitos: {}\n{}{}",s.share.root.display(),s.share.android_path,s.pending_paths.iter().take(3).cloned().collect::<Vec<_>>().join(", "),s.conflicts.iter().take(3).cloned().collect::<Vec<_>>().join(", "),s.error.as_deref().unwrap_or(""),request_hint)).unwrap_or_else(|| format!("Nenhum Share cadastrado. Pressione a para adicionar uma pasta.\n{status}{request_hint}"));
+            let detail = entries.get(selected).map(|s| format!("{} ↔ pasta escolhida no Android\nPendentes: {}\nConflitos: {}\n{}{}",s.share.root.display(),s.pending_paths.iter().take(3).cloned().collect::<Vec<_>>().join(", "),s.conflicts.iter().take(3).cloned().collect::<Vec<_>>().join(", "),s.error.as_deref().unwrap_or(""),request_hint)).unwrap_or_else(|| format!("Nenhum Share cadastrado. Pressione a para adicionar uma pasta.\n{status}{request_hint}"));
             frame.render_widget(Paragraph::new(detail).wrap(Wrap{trim:false}),layout[2]);
             frame.render_widget(Paragraph::new(status.clone()).wrap(Wrap{trim:false}),layout[3]);
             let footer = if let Some(wizard) = &share_wizard {

@@ -1,4 +1,4 @@
-# Validação da implementação V2
+# Validação da implementação V3
 
 Referência: `prompts/output/AVALIACAO_IMPLEMENTACAO_V2.md`. Registro de 20/09/2026.
 
@@ -6,7 +6,9 @@ Referência: `prompts/output/AVALIACAO_IMPLEMENTACAO_V2.md`. Registro de 20/09/2
 
 - Configuração de dispositivo em JSON atômico e estado isolado por `share_id`.
 - Migração explícita da identidade/base V1; recovery permanece na pasta original.
-- Protocolo 2 independente do formato de convite 1 e do pacote 0.2.0.
+- Protocolo 3 independente do formato de convite 1 e do pacote 0.3.0.
+- Identidade do aparelho independente das pastas; cada Share possui uma URI SAF explícita.
+- Shares sem pasta Android ficam pausados e podem ser vinculados sem bloquear os demais.
 - Configuração e remoção de Shares pelo PC; remoção não apaga conteúdo.
 - Solicitações de Share iniciadas no Android ficam pendentes até o usuário escolher e confirmar a pasta no PC.
 - Mensagens de sincronização encapsuladas com `share_id`; IDs desconhecidos são recusados.
@@ -20,7 +22,7 @@ Referência: `prompts/output/AVALIACAO_IMPLEMENTACAO_V2.md`. Registro de 20/09/2
 
 A suíte original de 14 testes passou antes das alterações. A suíte ampliada verifica:
 
-- TLS, HMAC, segredo incorreto e identidade de raiz única;
+- TLS, HMAC, segredo incorreto e identidade única do aparelho;
 - SHA-256, truncamento, escrita condicional, `STALE_TARGET` e recovery;
 - convergência bidirecional e conflitos idempotentes;
 - dois Shares com o mesmo nome de arquivo e estados separados;
@@ -45,8 +47,8 @@ O cache persistente Linux evita rehash obrigatório ao reabrir; o SAF usa hashes
 
 ## Aceite em aparelho, ainda necessário
 
-1. Instalar o APK ARM64, escolher uma raiz Rowd e parear por QR. Repetir em uma instalação de teste por JSON.
-2. Cadastrar dois Shares no PC e verificar criação automática, conflito, rename visual e remoção sem apagar dados.
+1. Instalar o APK ARM64 e parear por QR sem escolher uma raiz global. Repetir em uma instalação de teste por JSON.
+2. Criar Shares nos dois sentidos, vincular uma pasta SAF distinta para cada um e verificar que Shares sem pasta ficam pausados sem bloquear os demais.
 3. Editar dos dois lados, desligar Wi-Fi por horas, reiniciar ambos e verificar pendências/retomada.
 4. Interromper processo/rede durante upload e download, inclusive após a instalação, antes do ACK.
 5. Usar um provider sem eventos e verificar o fallback; revogar permissão e verificar mensagem de correção.

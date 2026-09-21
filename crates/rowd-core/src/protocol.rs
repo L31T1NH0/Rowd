@@ -9,7 +9,7 @@ use sha2::Sha256;
 use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -23,10 +23,11 @@ pub enum Message {
         removed: Vec<String>,
     },
     Capabilities {
-        root_id: String,
+        device_id: String,
         polling: bool,
         managed_shares: bool,
         share_requests: Vec<crate::config::ShareRequest>,
+        available_shares: Vec<String>,
     },
     ShareRequestStatus {
         accepted: Vec<String>,
@@ -44,7 +45,7 @@ pub enum Message {
         version: u32,
         pair_id: String,
         folder_id: String,
-        root_id: String,
+        device_id: String,
     },
     Challenge {
         nonce: String,
@@ -139,14 +140,14 @@ fn auth_mac(
     nonce: &str,
     pair_id: &str,
     folder_id: &str,
-    root_id: &str,
+    device_id: &str,
 ) -> Result<Hmac<Sha256>> {
     let key = hex::decode(secret)?;
     ensure!(key.len() == 32, "invalid pairing secret");
     let mut mac = Hmac::<Sha256>::new_from_slice(&key)?;
     // Fixed-length identities and a domain label avoid ambiguous concatenations.
     mac.update(b"rowd-auth-v1\0");
-    for value in [nonce, pair_id, folder_id, root_id] {
+    for value in [nonce, pair_id, folder_id, device_id] {
         crate::model::validate_hash(value)?;
         mac.update(&hex::decode(value)?);
     }
@@ -163,7 +164,7 @@ pub fn server_auth(
         version,
         pair_id: peer,
         folder_id: folder,
-        root_id,
+        device_id,
     } = receive(io)?
     else {
         anyhow::bail!("expected hello")
@@ -193,11 +194,11 @@ pub fn server_auth(
     let Message::Proof { mac } = receive(io)? else {
         anyhow::bail!("expected auth proof")
     };
-    auth_mac(secret, &nonce, pair_id, folder_id, &root_id)?
+    auth_mac(secret, &nonce, pair_id, folder_id, &device_id)?
         .verify_slice(&hex::decode(mac)?)
         .context("authentication failed")?;
     send(io, &Message::Ready)?;
-    Ok(root_id)
+    Ok(device_id)
 }
 
 pub fn client_auth(
@@ -205,7 +206,7 @@ pub fn client_auth(
     pair_id: &str,
     folder_id: &str,
     secret: &str,
-    root_id: &str,
+    device_id: &str,
 ) -> Result<()> {
     send(
         io,
@@ -213,13 +214,13 @@ pub fn client_auth(
             version: PROTOCOL_VERSION,
             pair_id: pair_id.into(),
             folder_id: folder_id.into(),
-            root_id: root_id.into(),
+            device_id: device_id.into(),
         },
     )?;
     let Message::Challenge { nonce } = receive(io)? else {
         anyhow::bail!("expected challenge")
     };
-    let mac = auth_mac(secret, &nonce, pair_id, folder_id, root_id)?
+    let mac = auth_mac(secret, &nonce, pair_id, folder_id, device_id)?
         .finalize()
         .into_bytes();
     send(
@@ -244,7 +245,7 @@ mod tests {
         assert!(copy_exact(&mut &b"abc"[..], &mut Vec::new(), 4).is_err());
     }
     #[test]
-    fn proof_is_bound_to_nonce_and_root() {
+    fn proof_is_bound_to_nonce_and_device() {
         let h = "a".repeat(64);
         let other = "b".repeat(64);
         let proof = auth_mac(&h, &h, &h, &h, &h)
@@ -292,7 +293,7 @@ mod v2_tests {
                 version: 1,
                 pair_id: h.clone(),
                 folder_id: h.clone(),
-                root_id: h.clone(),
+                device_id: h.clone(),
             },
         )
         .unwrap();

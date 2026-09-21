@@ -113,6 +113,9 @@ impl rowd_core::managed::ManagedStore for AndroidStore<'_, '_, '_> {
         )?;
         Ok(())
     }
+    fn available_shares(&mut self) -> Result<Vec<String>> {
+        Ok(serde_json::from_str(&self.call("availableShares", &[])?)?)
+    }
 }
 
 #[no_mangle]
@@ -120,12 +123,12 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
     mut env: JNIEnv<'local>,
     _class: JObject<'local>,
     invitation: JString<'local>,
-    root_id: JString<'local>,
+    device_id: JString<'local>,
     access: JObject<'local>,
 ) -> jstring {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<String> {
         let json: String = env.get_string(&invitation)?.into();
-        let root: String = env.get_string(&root_id)?.into();
+        let device: String = env.get_string(&device_id)?.into();
         let invite: Invitation = serde_json::from_str(&json)?;
         let mut store = AndroidStore {
             env: &mut env,
@@ -134,7 +137,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
         };
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
-        let report = rowd_core::managed::client_round(&invite, &root, &mut store)?;
+        let report = rowd_core::managed::client_round(&invite, &device, &mut store)?;
         Ok(serde_json::to_string(&report)?)
     }));
     let output = match result {
