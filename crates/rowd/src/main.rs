@@ -1,29 +1,16 @@
-mod service;
 mod tui;
+
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
-use rowd_core::{
-    model::{Invitation, VERSION},
-    protocol, random_id,
-    storage::{atomic_json, LocalStore, Store},
-    sync::{self, State},
-    tls,
-};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::{
-    fs::{File, OpenOptions},
-    io::Write,
-    net::TcpListener,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use rowd_app::{App, ResetLevel};
+use rowd_core::config::{RemapPolicy, SyncMode};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
     name = "rowd",
     version,
-    about = "Uma pasta. Dois dispositivos. Sem nuvem intermediária."
+    about = "Seus arquivos, entre seus dispositivos, sem nuvem intermediária."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -31,35 +18,43 @@ struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 }
+
 #[derive(Subcommand)]
 enum Command {
-    /// Crie ou exiba o pareamento único e seu QR.
     Pair {
         #[arg(long)]
         address: String,
         #[arg(long)]
         invite: Option<PathBuf>,
     },
-    /// Migre explicitamente a V1 preservando identidade e recovery.
     Migrate {
         #[arg(long)]
         folder: PathBuf,
         #[arg(long)]
         address: String,
     },
-    /// Administre os Shares persistentes.
     Share {
         #[command(subcommand)]
         command: ShareCommand,
     },
-    /// Sirva todos os Shares com watcher e fallback periódico.
+    Request {
+        #[command(subcommand)]
+        command: RequestCommand,
+    },
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     Run {
         #[arg(long)]
         listen: Option<String>,
         #[arg(long)]
         once: bool,
     },
-    /// Simule o Android gerenciado em uma raiz local.
     DeviceSync {
         #[arg(long)]
         folder: PathBuf,
@@ -68,14 +63,13 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
-    /// Reconstrua os manifestos sem usar o cache.
     Scan,
-    /// Mostre pendências, conflitos e último sincronismo.
     Shares,
-    /// Liste, restaure ou exporte versões preservadas.
     Recovery {
         #[arg(long)]
-        folder: PathBuf,
+        folder: Option<PathBuf>,
+        #[arg(long)]
+        share: Option<String>,
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -83,7 +77,18 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Prepare uma pasta e exporte um convite privado para o Android.
+    Diagnostic {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Reset {
+        #[arg(long)]
+        level: String,
+        #[arg(long)]
+        share: Option<String>,
+        #[arg(long)]
+        confirm: bool,
+    },
     Init {
         #[arg(long)]
         folder: PathBuf,
@@ -92,7 +97,6 @@ enum Command {
         #[arg(long)]
         invite: PathBuf,
     },
-    /// Aguarde o celular na rede local (interrompa com Ctrl+C).
     Serve {
         #[arg(long)]
         folder: PathBuf,
@@ -101,7 +105,6 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
-    /// Cliente de teste para simular o celular em outro diretório.
     Sync {
         #[arg(long)]
         folder: PathBuf,
@@ -110,7 +113,6 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
-    /// Calcule e mostre os hashes atuais da pasta.
     Status {
         #[arg(long)]
         folder: PathBuf,
@@ -143,324 +145,273 @@ enum ShareCommand {
         #[arg(long)]
         confirm: bool,
     },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    Reindex {
+        id: String,
+    },
+    Remap {
+        id: String,
+        #[arg(long)]
+        android: String,
+        #[arg(long)]
+        policy: String,
+    },
+    Ignore {
+        id: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Sync {
+        id: String,
+    },
 }
-fn parse_mode(mode: &str) -> Result<rowd_core::config::SyncMode> {
+
+#[derive(Subcommand)]
+enum RequestCommand {
+    List,
+    Accept {
+        id: String,
+        #[arg(long)]
+        folder: PathBuf,
+    },
+    Reject {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCommand {
+    Test,
+    Pause,
+    Resume,
+    Unlink {
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    ExportProfile {
+        output: PathBuf,
+    },
+    ImportProfile {
+        input: PathBuf,
+    },
+    ExportBackup {
+        output: PathBuf,
+        #[arg(long, env = "ROWD_BACKUP_PASSPHRASE")]
+        passphrase: String,
+    },
+    ImportBackup {
+        input: PathBuf,
+        #[arg(long, env = "ROWD_BACKUP_PASSPHRASE")]
+        passphrase: String,
+    },
+}
+
+pub(crate) fn parse_mode(mode: &str) -> Result<SyncMode> {
     match mode {
-        "bidirectional" => Ok(rowd_core::config::SyncMode::Bidirectional),
-        "to_android" => Ok(rowd_core::config::SyncMode::ToAndroid),
-        "to_pc" => Ok(rowd_core::config::SyncMode::ToPc),
+        "bidirectional" => Ok(SyncMode::Bidirectional),
+        "to_android" => Ok(SyncMode::ToAndroid),
+        "to_pc" => Ok(SyncMode::ToPc),
         _ => anyhow::bail!("mode must be bidirectional, to_android or to_pc"),
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Config {
-    version: u32,
-    root: String,
-    pair_id: String,
-    folder_id: String,
-    cert: String,
-    key: String,
-    secret: String,
-}
-
-fn config(store: &LocalStore) -> Result<Config> {
-    let cfg: Config = serde_json::from_reader(
-        File::open(store.private().join("server.json")).context("execute rowd init first")?,
-    )?;
-    ensure!(
-        cfg.version == VERSION && cfg.root == store.root().to_string_lossy(),
-        "folder moved: configuration root mismatch"
-    );
-    Ok(cfg)
-}
-fn save_private(path: &Path, value: &impl Serialize) -> Result<()> {
-    // create_new prevents accidentally replacing another invitation or pairing.
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+fn parse_policy(policy: &str) -> Result<RemapPolicy> {
+    match policy {
+        "pc" => Ok(RemapPolicy::Pc),
+        "android" => Ok(RemapPolicy::Android),
+        "compare" => Ok(RemapPolicy::Compare),
+        _ => anyhow::bail!("policy must be pc, android or compare"),
     }
-    let mut file = opts.open(path)?;
-    serde_json::to_writer_pretty(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
 }
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let home = cli.home.unwrap_or_else(service::default_home);
+    let home = cli.home.unwrap_or_else(rowd_app::default_home);
+    let app = App::new(&home);
     let Some(command) = cli.command else {
         return tui::run(&home);
     };
     match command {
         Command::Pair { address, invite } => {
-            let cfg = service::pair(&home, &address)?;
+            app.pair(&address)?;
             if let Some(path) = invite {
-                save_private(&path, &service::invitation(&cfg))?;
+                app.export_invitation(&path)?;
             }
-            println!("{}", service::qr(&cfg)?);
-            println!("QR privado: {}", service::export_qr(&home, &cfg)?.display());
-            println!(
-                "Certificado SHA-256: {}",
-                hex::encode(Sha256::digest(hex::decode(&cfg.cert)?))
-            );
+            let info = app.pairing_info()?;
+            println!("{}", info.qr);
+            println!("QR privado: {}", info.qr_image.display());
+            println!("Certificado SHA-256: {}", info.fingerprint);
         }
-        Command::Migrate { folder, address } => service::migrate(&home, &folder, &address)?,
-        Command::Share { command } => service::update(&home, |cfg| {
-            match command {
-                ShareCommand::Add {
-                    name,
-                    folder,
-                    android,
-                    mode,
-                } => {
-                    println!(
-                        "{}",
-                        cfg.add_share(&home, name, folder, android, parse_mode(&mode)?)?
-                    );
-                }
-                ShareCommand::Edit {
-                    id,
-                    name,
-                    folder,
-                    mode,
-                } => {
-                    let mut share = cfg
-                        .shares
-                        .iter()
-                        .find(|s| s.share_id == id)
-                        .context("unknown Share")?
-                        .clone();
-                    if let Some(name) = name {
-                        share.name = name;
-                    }
-                    if let Some(folder) = folder {
-                        share.root = folder;
-                    }
-                    if let Some(mode) = mode {
-                        share.mode = parse_mode(&mode)?;
-                    }
-                    cfg.put_share(&home, share)?;
-                }
-                ShareCommand::Remove { id, confirm } => {
-                    ensure!(
-                        confirm,
-                        "use --confirm; files and recovery will be retained"
-                    );
-                    cfg.remove_share(&home, &id)?;
-                }
+        Command::Migrate { folder, address } => rowd_app::migrate(&home, &folder, &address)?,
+        Command::Share { command } => match command {
+            ShareCommand::Add {
+                name,
+                folder,
+                android,
+                mode,
+            } => println!(
+                "{}",
+                app.add_share(name, folder, android, parse_mode(&mode)?)?
+            ),
+            ShareCommand::Edit {
+                id,
+                name,
+                folder,
+                mode,
+            } => app.patch_share(
+                &id,
+                name,
+                folder,
+                mode.as_deref().map(parse_mode).transpose()?,
+            )?,
+            ShareCommand::Remove { id, confirm } => {
+                ensure!(
+                    confirm,
+                    "use --confirm; files and recovery will be retained"
+                );
+                app.remove_share(&id)?;
             }
-            Ok(())
-        })?,
-        Command::Run { listen, once } => service::serve(
+            ShareCommand::Pause { id } => app.set_share_enabled(&id, false)?,
+            ShareCommand::Resume { id } => app.set_share_enabled(&id, true)?,
+            ShareCommand::Reindex { id } => app.reindex_share(&id)?,
+            ShareCommand::Remap {
+                id,
+                android,
+                policy,
+            } => app.remap_share(&id, android, parse_policy(&policy)?)?,
+            ShareCommand::Ignore { id, file } => {
+                app.set_ignore_text(&id, &std::fs::read_to_string(file)?)?
+            }
+            ShareCommand::Sync { id } => app.request_share_sync(&id)?,
+        },
+        Command::Request { command } => match command {
+            RequestCommand::List => println!(
+                "{}",
+                serde_json::to_string_pretty(&rowd_app::share_requests(&home)?)?
+            ),
+            RequestCommand::Accept { id, folder } => app.accept_share_request(&id, &folder)?,
+            RequestCommand::Reject { id } => app.reject_share_request(&id)?,
+        },
+        Command::Device { command } => match command {
+            DeviceCommand::Test => {
+                println!("{}", serde_json::to_string_pretty(&app.connection_test()?)?)
+            }
+            DeviceCommand::Pause => app.set_sync_paused(true)?,
+            DeviceCommand::Resume => app.set_sync_paused(false)?,
+            DeviceCommand::Unlink { confirm } => {
+                ensure!(confirm, "use --confirm to revoke the current pairing");
+                app.unlink_device()?;
+            }
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::ExportProfile { output } => app.export_profile(&output)?,
+            ConfigCommand::ImportProfile { input } => app.import_profile(&input)?,
+            ConfigCommand::ExportBackup { output, passphrase } => {
+                app.export_backup(&output, &passphrase)?
+            }
+            ConfigCommand::ImportBackup { input, passphrase } => {
+                app.import_backup(&input, &passphrase)?
+            }
+        },
+        Command::Run { listen, once } => rowd_app::serve(
             &home,
             listen.as_deref(),
             once,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            |e| println!("{e}"),
+            |event| println!("{event}"),
         )?,
         Command::DeviceSync {
             folder,
             invite,
             watch,
-        } => {
-            std::fs::create_dir_all(folder.join(".rowd"))?;
-            let id_path = folder.join(".rowd/client-id.json");
-            let id: String = if id_path.exists() {
-                serde_json::from_reader(File::open(&id_path)?)?
-            } else {
-                let id = random_id()?;
-                atomic_json(&id_path, &id)?;
-                id
-            };
-            let invitation = serde_json::from_reader(File::open(invite)?)?;
-            let mut device = rowd_core::managed::LocalDevice::open(&folder)?;
-            loop {
-                match rowd_core::managed::client_round(&invitation, &id, &mut device) {
-                    Ok(r) => println!("{}", serde_json::to_string(&r)?),
-                    Err(e) if watch => eprintln!("{e:#}"),
-                    Err(e) => return Err(e),
-                }
-                if !watch {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        }
-        Command::Scan => service::scan(&home, true)?,
-        Command::Shares => println!(
-            "{}",
-            serde_json::to_string_pretty(&service::status(&home)?)?
-        ),
+        } => rowd_app::device_sync(&folder, &invite, watch)?,
+        Command::Scan => rowd_app::scan(&home, true)?,
+        Command::Shares => println!("{}", serde_json::to_string_pretty(&app.status()?)?),
         Command::Recovery {
             folder,
+            share,
             id,
             action,
             output,
         } => {
-            let mut store = LocalStore::open_recovery(&folder)?;
-            if let Some(id) = id {
-                store.resolve_recovery(
-                    &id,
-                    action
-                        .as_deref()
-                        .context("--action required: keep, restore, export")?,
+            if let Some(folder) = folder {
+                if let Some(entries) = rowd_app::legacy_recovery(
+                    &folder,
+                    id.as_deref(),
+                    action.as_deref(),
                     output.as_deref(),
-                )?;
+                )? {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                }
+            } else if let Some(id) = id {
+                let share = share.context("--share is required with --id")?;
+                match action.as_deref().context("--action is required")? {
+                    "keep" => app.keep_recovery(&share, &id)?,
+                    "restore" => app.restore_recovery(&share, &id)?,
+                    "export" => app.export_recovery(
+                        &share,
+                        &id,
+                        output.as_deref().context("--output is required")?,
+                    )?,
+                    "cleanup" => app.cleanup_recovery(&share, &id)?,
+                    _ => anyhow::bail!("action must be keep, restore, export or cleanup"),
+                }
             } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&store.recovery_entries()?)?
-                );
+                println!("{}", serde_json::to_string_pretty(&app.recovery()?)?);
             }
+        }
+        Command::Diagnostic { output } => app.export_diagnostic(&output)?,
+        Command::Reset {
+            level,
+            share,
+            confirm,
+        } => {
+            ensure!(confirm, "use --confirm for reset operations");
+            let level = match level.as_str() {
+                "interface" => ResetLevel::Interface,
+                "share" => ResetLevel::Share(share.context("--share is required")?),
+                "unlink" => ResetLevel::Unlink,
+                "initial" => ResetLevel::Initial,
+                "all" => ResetLevel::AllData,
+                _ => anyhow::bail!("level must be interface, share, unlink, initial or all"),
+            };
+            app.reset(level)?;
         }
         Command::Init {
             folder,
             address,
             invite,
-        } => {
-            let store = LocalStore::open(&folder)?;
-            ensure!(
-                !store.private().join("server.json").exists(),
-                "folder already paired; existing identity preserved"
-            );
-            ensure!(!invite.exists(), "invitation file already exists");
-            let invite_parent = invite
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."))
-                .canonicalize()?;
-            ensure!(
-                !invite_parent.starts_with(store.root()),
-                "save private invitation OUTSIDE the shared folder"
-            );
-            let cert = rcgen::generate_simple_self_signed(vec!["rowd.local".into()])?;
-            let cfg = Config {
-                version: VERSION,
-                root: store.root().to_string_lossy().into(),
-                pair_id: random_id()?,
-                folder_id: random_id()?,
-                secret: random_id()?,
-                cert: hex::encode(cert.cert.der()),
-                key: hex::encode(cert.key_pair.serialize_der()),
-            };
-            let invitation = Invitation {
-                version: VERSION,
-                address,
-                pair_id: cfg.pair_id.clone(),
-                folder_id: cfg.folder_id.clone(),
-                cert_der: cfg.cert.clone(),
-                secret: cfg.secret.clone(),
-            };
-            invitation.validate()?;
-            save_private(&invite, &invitation)?;
-            save_private(&store.private().join("server.json"), &cfg)?;
-            println!("Rowd pronto. Pasta: {}\nConvite privado: {}\nImporte esse arquivo no Android por USB ou outro canal confiável. Ele permite acesso à pasta.\nCertificado SHA-256: {}",store.root().display(),invite.display(),hex::encode(Sha256::digest(hex::decode(cfg.cert)?)));
-        }
+        } => rowd_app::legacy_init(&folder, &address, &invite)?,
         Command::Serve {
             folder,
             listen,
             once,
-        } => {
-            let mut store = LocalStore::open(&folder)?;
-            let cfg = config(&store)?;
-            let tls_config = tls::server_config(&cfg.cert, &cfg.key)?;
-            let state_path = store.private().join("sync-state.json");
-            let mut state = State::load(&state_path, &cfg.pair_id, &cfg.folder_id)?;
-            let listener = TcpListener::bind(&listen)?;
-            println!(
-                "Rowd ouvindo em {} • {}",
-                listener.local_addr()?,
-                store.root().display()
-            );
-            for socket in listener.incoming() {
-                let result = (|| -> Result<sync::Report> {
-                    let mut stream = tls::accept(socket?, tls_config.clone())?;
-                    let root = protocol::server_auth(
-                        &mut stream,
-                        &cfg.pair_id,
-                        &cfg.folder_id,
-                        &cfg.secret,
-                    )?;
-                    if let Some(expected) = &state.peer_root {
-                        ensure!(
-                            expected == &root,
-                            "Android folder changed; pairing belongs to a different root"
-                        );
-                    } else {
-                        state.peer_root = Some(root);
-                        atomic_json(&state_path, &state)?;
-                    }
-                    let result = sync::coordinate(&mut stream, &mut store, &mut state, &state_path);
-                    if let Err(ref e) = result {
-                        let _ = protocol::send(
-                            &mut stream,
-                            &protocol::Message::Error {
-                                message: e.to_string(),
-                            },
-                        );
-                    }
-                    result
-                })();
-                match result {
-                    Ok(report) => println!(
-                        "Sincronizado: {} transferências, {} conflitos",
-                        report.transferred, report.conflicts
-                    ),
-                    Err(e) => {
-                        eprintln!("Rodada interrompida: {e:#}");
-                        if once {
-                            return Err(e);
-                        }
-                    }
-                }
-                if once {
-                    break;
-                }
-            }
-        }
+        } => rowd_app::legacy_serve(&folder, &listen, once)?,
         Command::Sync {
             folder,
             invite,
             watch,
-        } => {
-            let invitation: Invitation = serde_json::from_reader(File::open(invite)?)?;
-            let mut store = LocalStore::open(&folder)?;
-            let id_path = store.private().join("client-id.json");
-            let id: String = if id_path.exists() {
-                serde_json::from_reader(File::open(id_path)?)?
-            } else {
-                let id = random_id()?;
-                atomic_json(&id_path, &id)?;
-                id
-            };
-            loop {
-                match sync::client_round(&invitation, &id, &mut store) {
-                    Ok(report) => println!("{}", serde_json::to_string(&report)?),
-                    Err(e) if watch => eprintln!("Aguardando próxima tentativa: {e:#}"),
-                    Err(e) => return Err(e),
-                }
-                if !watch {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(5));
-            }
-        }
-        Command::Status { folder } => {
-            let mut store = LocalStore::open(&folder)?;
-            store.invalidate();
-            println!("{}", serde_json::to_string_pretty(&store.scan()?)?);
-        }
+        } => rowd_app::legacy_sync(&folder, &invite, watch)?,
+        Command::Status { folder } => println!(
+            "{}",
+            serde_json::to_string_pretty(&rowd_app::legacy_status(&folder)?)?
+        ),
     }
     Ok(())
 }
+
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("Rowd: {e:#}");
+    if let Err(error) = run() {
+        eprintln!("Rowd: {error:#}");
         std::process::exit(1);
     }
 }

@@ -13,13 +13,18 @@ class SyncService : Service() {
         @Volatile var automatic = false
         @Volatile var status = "Vamos conectar seus Shares"
         @Volatile var detail = "Pareie o PC e escolha uma pasta Android para cada Share."
+        private val changes = Object()
+        private var dirty = false
+
+        fun wake() = synchronized(changes) {
+            dirty = true
+            changes.notifyAll()
+        }
     }
     private val active = AtomicBoolean(false)
     private var worker: Thread? = null
-    private val changes = Object()
-    private var dirty = false
     private val observer = object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
-        override fun onChange(selfChange: Boolean) { synchronized(changes) { dirty = true; changes.notifyAll() } }
+        override fun onChange(selfChange: Boolean) { wake() }
     }
     private fun notifyStatus(text: String) {
         if (android.os.Build.VERSION.SDK_INT >= 33 &&

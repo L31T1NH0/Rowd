@@ -239,6 +239,21 @@ impl LocalStore {
         Ok(())
     }
 
+    pub fn cleanup_recovery(&self, id: &str) -> Result<()> {
+        crate::model::validate_hash(id)?;
+        let directory = self.private.join("recovery");
+        let record = directory.join(format!("{id}.json"));
+        let journal: Journal = serde_json::from_reader(File::open(&record)?)?;
+        ensure!(journal.backup == id, "recovery identity mismatch");
+        ensure!(journal.finished, "pending recovery cannot be removed");
+        let backup = directory.join(id);
+        if backup.exists() {
+            fs::remove_file(backup)?;
+        }
+        fs::remove_file(record)?;
+        sync_dir(&directory)
+    }
+
     fn checked_path(&self, relative: &str, create_parents: bool) -> Result<PathBuf> {
         validate_path(relative)?;
         let parts: Vec<_> = relative.split('/').collect();

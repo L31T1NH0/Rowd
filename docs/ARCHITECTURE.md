@@ -1,4 +1,16 @@
-# Arquitetura implementada — Rowd 0.3
+# Arquitetura implementada — Rowd 0.4
+
+## Camadas
+
+```text
+rowd (CLI + Ratatui) ──→ rowd-app ──→ rowd-core
+                                      ↑
+rowd-android (JNI) ───────────────────┘
+```
+
+`rowd-core` contém protocolo, TLS/HMAC, reconciliação, journal, storage e modelos que também fazem sentido no Android. `rowd-app` contém configuração e casos de uso desktop: pareamento, Shares, solicitações, recovery, watcher/servidor, import/export, resets e diagnóstico. O binário `rowd` traduz argumentos e `UiAction`s para essa API; não abre storage, não edita `DeviceConfig` e não manipula material TLS.
+
+Uma futura GUI Slint deve ser outro frontend de `rowd-app`, sem depender do binário CLI nem de Ratatui.
 
 ## Responsabilidades
 
@@ -45,6 +57,16 @@ responsável pela proteção do transporte e pela identidade do servidor.
 
 Mensagens são JSON com prefixo de tamanho `u32` big-endian; blobs têm o tamanho
 anunciado no cabeçalho. O receptor valida limites antes de alocar ou copiar.
+
+O protocolo 4 acrescenta capacidades de desvinculação e estados explícitos de solicitação (`pending`, `accepted`, `rejected`, `cancelled`). O QR usa um envelope binário `rowd1:` codificado em Base64 URL-safe, mas conserva endereço, certificado, segredo e todas as identidades do convite JSON.
+
+## Administração e concorrência
+
+Mutações comuns de configuração são atômicas e podem ocorrer durante uma rodada; a rodada atual termina com o snapshot que iniciou e a próxima recarrega a configuração. Tombstones de remoção só são limpos depois de terem sido efetivamente anunciados ao Android.
+
+Operações que reconstroem ou substituem estado — reindex, remap, aceite/rejeição, import, reset, unlink e recovery — usam uma trava de sessão separada. Elas aguardam o ponto seguro entre rodadas sem bloquear edições comuns. Antes de mutações estruturais, o Rowd mantém até oito cópias privadas da configuração.
+
+Configuração de dispositivo é versionada; a versão 2 migra para 3 sem recriar vínculo ou Shares. Preferências da TUI vivem separadamente em `ui.json`. Backup completo é autenticado e criptografado com PBKDF2-HMAC-SHA256 + AES-256-GCM; perfil sem segredos e diagnóstico sanitizado são formatos distintos.
 
 ## Convergência
 

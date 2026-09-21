@@ -778,16 +778,43 @@ dependencies = [
 
 [[package]]
 name = "rowd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
  "crossterm",
  "hex",
- "notify",
- "qrcode",
  "ratatui",
  "rcgen",
+ "rowd-app",
+ "rowd-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "rowd-android"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "jni",
+ "rowd-core",
+ "serde_json",
+]
+
+[[package]]
+name = "rowd-app"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "fs2",
+ "hex",
+ "notify",
+ "qrcode",
+ "rcgen",
+ "ring",
  "rowd-core",
  "rustls",
  "serde",
@@ -797,18 +824,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rowd-android"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "jni",
- "rowd-core",
- "serde_json",
-]
-
-[[package]]
 name = "rowd-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "fs2",

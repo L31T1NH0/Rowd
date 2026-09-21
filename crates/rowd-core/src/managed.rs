@@ -19,7 +19,18 @@ pub trait ManagedStore: Store {
     fn pending_share_requests(&mut self) -> Result<Vec<ShareRequest>> {
         Ok(Vec::new())
     }
-    fn acknowledge_share_requests(&mut self, _accepted: &[String]) -> Result<()> {
+    fn acknowledge_share_requests(
+        &mut self,
+        _accepted: &[String],
+        _rejected: &[String],
+        _cancelled: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn unlink_requested(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+    fn confirm_unlinked(&mut self) -> Result<()> {
         Ok(())
     }
     fn available_shares(&mut self) -> Result<Vec<String>> {
@@ -122,12 +133,23 @@ pub fn client_round(
             managed_shares: true,
             share_requests: store.pending_share_requests()?,
             available_shares,
+            unlink_requested: store.unlink_requested()?,
         },
     )?;
-    let Message::ShareRequestStatus { accepted, .. } = protocol::receive(&mut io)? else {
-        anyhow::bail!("expected Share request status")
+    let (accepted, rejected, cancelled) = match protocol::receive(&mut io)? {
+        Message::ShareRequestStatus {
+            accepted,
+            rejected,
+            cancelled,
+            ..
+        } => (accepted, rejected, cancelled),
+        Message::DeviceUnlinked => {
+            store.confirm_unlinked()?;
+            return Ok(Report::default());
+        }
+        _ => anyhow::bail!("expected Share request status"),
     };
-    store.acknowledge_share_requests(&accepted)?;
+    store.acknowledge_share_requests(&accepted, &rejected, &cancelled)?;
     let mut report = Report::default();
     loop {
         match protocol::receive(&mut io)? {
@@ -182,25 +204,26 @@ impl ManagedStore for LocalDevice {
         }
         Ok(serde_json::from_reader(fs::File::open(path)?)?)
     }
-    fn acknowledge_share_requests(&mut self, accepted: &[String]) -> Result<()> {
-        if accepted.is_empty() {
+    fn acknowledge_share_requests(
+        &mut self,
+        accepted: &[String],
+        rejected: &[String],
+        cancelled: &[String],
+    ) -> Result<()> {
+        if accepted.is_empty() && rejected.is_empty() && cancelled.is_empty() {
             return Ok(());
         }
         let path = self.root.join(".rowd/share-requests.json");
         let mut pending = self.pending_share_requests()?;
-        pending.retain(|request| !accepted.contains(&request.request_id));
+        pending.retain(|request| {
+            !accepted.contains(&request.request_id)
+                && !rejected.contains(&request.request_id)
+                && !cancelled.contains(&request.request_id)
+        });
         atomic_json(&path, &pending)
     }
     fn configure(&mut self, shares: &[ShareConfig], _removed: &[String]) -> Result<()> {
         validate_shares(shares)?;
-        for s in shares {
-            if let Some(old) = self.shares.iter().find(|old| old.share_id == s.share_id) {
-                ensure!(
-                    old.android_path == s.android_path,
-                    "Share destination changed"
-                );
-            }
-        }
         if shares.iter().any(|s| s.android_path.is_empty()) {
             for s in shares.iter().filter(|s| !s.android_path.is_empty()) {
                 if !self.shares.iter().any(|old| old.share_id == s.share_id) {
@@ -283,6 +306,20 @@ mod tests {
     use super::*;
     use crate::{config::SyncMode, model::Manifest, storage::Snapshot};
 
+    fn share(path: &str) -> ShareConfig {
+        ShareConfig {
+            share_id: "a".repeat(64),
+            name: "Documentos".into(),
+            root: PathBuf::new(),
+            android_path: path.into(),
+            mode: SyncMode::Bidirectional,
+            enabled: true,
+            ignore: String::new(),
+            request_id: None,
+            remap_policy: None,
+        }
+    }
+
     struct Unassigned {
         share: ShareConfig,
     }
@@ -326,16 +363,25 @@ mod tests {
     #[test]
     fn offline_observation_skips_shares_without_an_android_folder() {
         let mut store = Unassigned {
-            share: ShareConfig {
-                share_id: "a".repeat(64),
-                name: "pendente".into(),
-                root: PathBuf::new(),
-                android_path: "legacy-hint".into(),
-                mode: SyncMode::Bidirectional,
-                ignore: String::new(),
-                request_id: None,
-            },
+            share: share("legacy-hint"),
         };
         observe_offline(&mut store).unwrap();
+    }
+
+    #[test]
+    fn local_device_accepts_remap_without_removing_old_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut device = LocalDevice::open(directory.path()).unwrap();
+        device.configure(&[share("old")], &[]).unwrap();
+        fs::create_dir_all(directory.path().join("old")).unwrap();
+        fs::write(directory.path().join("old/keep.txt"), b"keep").unwrap();
+
+        device.configure(&[share("new")], &[]).unwrap();
+
+        assert_eq!(device.known_shares().unwrap()[0].android_path, "new");
+        assert_eq!(
+            fs::read(directory.path().join("old/keep.txt")).unwrap(),
+            b"keep"
+        );
     }
 }

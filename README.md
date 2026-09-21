@@ -2,7 +2,7 @@
 
 Sincronização de vários diretórios entre **um PC Linux e um Android**, pela rede local. Rust no núcleo, Ratatui no terminal e Kotlin/SAF no Android. Sem servidor intermediário.
 
-**V3 · 0.3.0:** cada Share liga explicitamente uma pasta do PC a uma pasta SAF do Android. Não existe uma raiz Android global ou destino inferido. Configuração persistente, solicitações mobile, pareamento por QR/JSON, pendências com ACK, watcher, modos e recovery continuam isolados por `share_id`.
+**V4 · 0.4.0:** a lógica desktop compartilhada vive em `rowd-app`; CLI e TUI são frontends. A administração inclui pausa global/por Share, reindexação, remapeamento explícito, ciclo completo de solicitações, resets graduais, backups criptografados, diagnóstico e recovery.
 
 ## Começar
 
@@ -22,28 +22,24 @@ cargo build --release -p rowd
 1. Pressione **p** e informe o endereço do PC, por exemplo `192.168.1.20:43821`.
 2. No Android, toque em **Parear por QR** e compare o fingerprint com o PC. O JSON continua disponível como alternativa.
 3. Toque em **Escolher pasta para novo Share**, selecione a pasta Android, informe o nome e o modo.
-4. Na TUI do PC, pressione **c**, escolha a solicitação e informe a pasta correspondente no PC com seu caminho absoluto.
+4. Na TUI do PC, abra **2 Solicitações**, selecione a solicitação, pressione **a** e informe a pasta correspondente no PC com seu caminho absoluto.
 5. Sincronize novamente. O mesmo fluxo vale para `/home/leite/Documents/Rowd ↔ Android/Rowd`, `/home/leite/wiki ↔ Android/Documents/blog` ou qualquer outro par de pastas sem sobreposição.
 6. Um Share também pode começar no PC com **a**; depois da primeira conexão, use **Vincular pasta a Share pendente** no Android para escolher seu outro extremo.
 
-O QR completo pode exigir um terminal maior. A tela informa o tamanho necessário; **o** abre sua imagem SVG privada. Feche a imagem depois de parear: ela contém a mesma credencial do convite.
+O QR usa payload binário Base64 e blocos de meia altura. Pressione **o** na aba Dispositivo para exibi-lo dentro da TUI. O SVG privado continua disponível como fallback e contém a mesma credencial do convite.
 
 A TUI inicia o servidor automaticamente. Mantenha o Rowd aberto nos dois dispositivos. PC e Android precisam estar na mesma rede, com TCP `43821` acessível no PC.
 
-| Tecla | Ação |
+| Tecla | Ação global |
 | --- | --- |
-| ↑ / ↓ | Selecionar Share |
-| p | Parear / atualizar endereço do convite |
-| a | Adicionar Share |
-| n / c | Alternar solicitação Android / aceitar a pasta escolhida |
-| e | Editar nome, raiz PC e modo |
-| d | Desvincular após digitar `REMOVER`; conserva arquivos e recovery |
-| s | Atualizar pendências para a próxima conexão do Android |
-| v | Verificar conteúdo com scan completo |
-| r | Listar versões e manter, restaurar ou exportar recovery |
+| 1..5 | Abrir Shares, Solicitações, Recovery, Dispositivo ou Configuração |
+| Tab / Shift+Tab | Próxima aba / aba anterior |
+| ↑ / ↓ | Selecionar item |
+| ? | Abrir ajuda com todas as ações contextuais |
+| Esc | Fechar modal |
 | q | Sair |
 
-O painel mostra pendências, caminhos com conflito, último sincronismo e progresso por caminhos na rodada. Um arquivo grande ainda é transferido inteiro, sem retomada.
+O rodapé mostra somente ações da aba atual. Na aba Configuração, **Enter** altera o atalho selecionado; atalhos e densidade ficam em `.rowd/ui.json`, separados da configuração crítica. O painel mostra pendências, conflitos, último sincronismo, último erro persistente e progresso da rodada. Um arquivo grande ainda é transferido inteiro, sem retomada.
 
 ## Configuração e CLI
 
@@ -61,11 +57,33 @@ A configuração fica em `~/.local/share/rowd/.rowd/`. Use `--home DIRETORIO` ou
 
 ```bash
 ./rowd share edit ID --name Trabalho --mode to_android
+./rowd share pause ID
+./rowd share resume ID
+./rowd share reindex ID
+./rowd share remap ID --android NovoDestino --policy compare
+./rowd share sync ID
 ./rowd share remove ID --confirm
 ./rowd scan
 ```
 
-No Android real, a pasta é sempre escolhida explicitamente pelo seletor SAF. `--android caminho/relativo` permanece apenas para o cliente local `device-sync`. O nome visual pode mudar; trocar a pasta exige desvincular e vincular novamente. Raízes PC iguais, ancestrais ou descendentes, inclusive por symlink, são recusadas. Pastas Android iguais, ancestrais ou descendentes também são recusadas.
+No Android real, a pasta é sempre escolhida explicitamente pelo seletor SAF. `--android caminho/relativo` permanece apenas para o cliente local `device-sync`. Ao remapear, escolha `pc`, `android` ou `compare`; o Android exige uma nova seleção SAF antes da primeira rodada. Raízes PC iguais, ancestrais ou descendentes, inclusive por symlink, são recusadas. Pastas Android iguais, ancestrais ou descendentes também são recusadas.
+
+Administração também está disponível pela CLI:
+
+```bash
+./rowd request list
+./rowd request accept ID --folder /pasta/local
+./rowd request reject ID
+./rowd device test
+./rowd device pause
+./rowd device unlink --confirm
+./rowd config export-profile /tmp/rowd-profile.json
+./rowd config export-backup /tmp/rowd-backup.json --passphrase 'senha longa'
+./rowd diagnostic --output /tmp/rowd-diagnostico.json
+./rowd reset --level interface --confirm
+```
+
+Perfis não contêm credenciais. Backups completos usam PBKDF2-HMAC-SHA256 e AES-256-GCM, são criados com permissão privada e exigem senha de pelo menos oito caracteres. O relatório de diagnóstico não inclui segredo nem chave privada.
 
 `./rowd run --listen 0.0.0.0:43821` mantém todos os Shares e o watcher em um processo. Para simular o Android sem aparelho, use uma raiz de teste exclusiva:
 
@@ -79,13 +97,13 @@ A primeira identidade Android autenticada fica vinculada ao PC. Essa identidade 
 
 O Android não escolhe a pasta do PC diretamente. Toque em **Escolher pasta para novo Share**, escolha qualquer pasta local, informe o nome e o modo; a solicitação fica salva no telefone até ser entregue.
 
-Na TUI do PC, `n` alterna entre solicitações pendentes e `c` aceita a selecionada. Informe o caminho absoluto da pasta do PC, de preferência copiando o resultado de `pwd`, e confirme. O PC valida a pasta e cria o Share; na próxima rodada, o Android recebe a configuração e vincula o Share à pasta escolhida no celular.
+Na aba Solicitações da TUI, **a** aceita e **r** rejeita. Informe o caminho absoluto da pasta do PC ao aceitar. No Android, uma solicitação pendente pode ser cancelada e o histórico informa se ela foi aceita, rejeitada ou cancelada. Estados terminais convergem na próxima conexão e não reaparecem indefinidamente.
 
 Se o PC estiver offline, a solicitação permanece pendente no Android. O envio é repetido com o mesmo ID até o PC aceitar, evitando Shares duplicados.
 
 ### Migrar V1
 
-Pare os processos antigos e atualize PC e APK juntos. O protocolo de rede V3 rejeita versões anteriores explicitamente; o formato do convite continua na versão 1, independente da versão do protocolo e dos pacotes.
+Pare os processos antigos e atualize PC e APK juntos. O protocolo de rede V4 rejeita versões anteriores explicitamente; o formato lógico do convite continua na versão 1, independente da versão do protocolo e dos pacotes.
 
 ```bash
 ./rowd migrate --folder /caminho/da/pasta-v1 --address 192.168.1.20:43821
@@ -96,15 +114,15 @@ A migração reutiliza credenciais, identidade do Android, ID da pasta e estado-
 
 O primeiro Share migrado conserva a antiga pasta Android como seu extremo explícito. Shares antigos que ainda dependiam de subpastas inferidas ficam pausados até que o usuário escolha sua pasta pelo botão **Vincular pasta a Share pendente**; nenhum caminho é adivinhado durante a atualização.
 
-Os comandos `init`, `serve --folder`, `sync --folder` e `status --folder` continuam disponíveis para operar uma pasta, com o protocolo atualizado. O APK V3 usa a administração multi-Share; use `migrate` e `run` para conectar uma instalação antiga.
+Os comandos `init`, `serve --folder`, `sync --folder` e `status --folder` continuam disponíveis para operar uma pasta, com o protocolo atualizado. O APK V4 usa a administração multi-Share; use `migrate` e `run` para conectar uma instalação antiga.
 
 ## Pendências, cache e eventos
 
 Cada Share possui manifesto, base conhecida e journal JSON atômico próprios. Enquanto o outro dispositivo está offline, novas versões substituem a pendência anterior do mesmo caminho. A fila só confirma a versão cujo hash foi entregue e reconhecido. Uma queda antes do ACK mantém a pendência; repetir uma instalação é idempotente.
 
-No Linux, inotify marca alterações e um debounce de 350 ms agrupa eventos. A varredura consulta metadados e reutiliza hashes quando dispositivo, inode, tamanho, mtime e ctime com nanossegundos permanecem iguais. Snapshots e instalações sempre conferem SHA-256. Há verificação periódica por metadados a cada minuto, scan completo periódico a cada 15 minutos e reconstrução após overflow; `scan`/tecla **v** força a leitura de conteúdo.
+No Linux, inotify marca alterações e um debounce de 350 ms agrupa eventos. A varredura consulta metadados e reutiliza hashes quando dispositivo, inode, tamanho, mtime e ctime com nanossegundos permanecem iguais. Snapshots e instalações sempre conferem SHA-256. Há verificação periódica por metadados a cada minuto, scan completo periódico a cada 15 minutos e reconstrução após overflow; `scan` força todos os Shares e **x** reindexa o Share selecionado.
 
-No Android, avisos do DocumentsProvider antecipam a próxima rodada, com fallback de 5 segundos no modo automático. SAF não fornece metadados ou eventos universalmente confiáveis: o fallback recalcula hashes. A fila local é atualizada antes de tentar a conexão, inclusive quando o PC está offline. O Android inicia cada sessão; alterações no PC são entregues na próxima conexão do telefone.
+No Android, avisos do DocumentsProvider e mudanças administrativas acordam a próxima rodada, com fallback de 5 segundos no modo automático. A pasta SAF selecionada fica congelada durante uma rodada; um novo vínculo passa a valer na rodada seguinte. SAF não fornece metadados ou eventos universalmente confiáveis: o fallback recalcula hashes. A fila local é atualizada antes de tentar a conexão, inclusive quando o PC está offline. O Android inicia cada sessão; alterações no PC são entregues na próxima conexão do telefone.
 
 ### `.rowdignore`
 
@@ -131,7 +149,7 @@ Exclusões **não são propagadas**. Um arquivo removido pode voltar na próxima
 
 ## Recovery
 
-Na TUI, **r** lista os registros do Share. As ações são `keep`, `restore` e `export`. Restaurar também conserva a versão deslocada; exportar nunca substitui um arquivo existente.
+Na aba Recovery da TUI, **f** percorre os filtros por Share; o painel mostra contagem e espaço total e por Share. **Enter** restaura, **k** mantém a versão atual, **e** exporta e **d** limpa manualmente um registro já resolvido. Restaurar também conserva a versão deslocada; exportar nunca substitui um arquivo existente.
 
 ```bash
 ./rowd recovery --folder /pasta/do/share
@@ -160,14 +178,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Os testes usam sockets locais TCP/TLS e Unix; precisam de um ambiente que permita esses sockets. Consulte [Validação V3](docs/V3_VALIDATION.md) para os cenários executados e os que ainda exigem aparelho.
+Os testes usam sockets locais TCP/TLS e Unix; precisam de um ambiente que permita esses sockets. Consulte [Validação V4](docs/V4_VALIDATION.md) para o estado desta refatoração e os cenários que ainda exigem aparelho.
 
 Limites: 8 GiB por arquivo, 50 mil arquivos por Share, 16 MiB por mensagem, até 256 Shares no protocolo, uma transferência por vez. Symlinks, pastas vazias, permissões e timestamps originais não são sincronizados. Não há daemon, mDNS, conexão persistente, múltiplos dispositivos, blocos ou retomada nesta versão.
 
 ## Estrutura
 
-- `crates/rowd-core`: configuração, estado, reconciliação, TLS/HMAC, protocolo e armazenamento.
-- `crates/rowd`: CLI, TUI e servidor com watcher.
+- `crates/rowd-core`: protocolo, modelos compartilhados, reconciliação, TLS/HMAC, journal e armazenamento.
+- `crates/rowd-app`: casos de uso desktop, configuração, servidor/watcher e operações administrativas.
+- `crates/rowd`: argumentos CLI, apresentação textual e TUI Ratatui.
 - `crates/rowd-android`: ponte JNI, utilizando o mesmo serviço cliente Rust.
 - `android`: interface, serviço e acesso SAF.
 

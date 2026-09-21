@@ -210,7 +210,7 @@ fn migration_preserves_pair_base_and_recovery() {
             "127.0.0.1:43821",
         ],
     );
-    let cfg = rowd_core::config::DeviceConfig::load(&home).unwrap();
+    let cfg = rowd_app::DeviceConfig::load(&home).unwrap();
     assert_eq!(cfg.pair_id, old.pair_id);
     assert_eq!(cfg.secret, old.secret);
     assert_eq!(cfg.shares[0].share_id, old.folder_id);
@@ -325,6 +325,7 @@ fn android_share_request_waits_for_pc_folder_selection() {
         request_id: random_id().unwrap(),
         name: "Fotos".into(),
         mode: SyncMode::Bidirectional,
+        state: rowd_core::config::ShareRequestState::Pending,
     };
     fs::create_dir_all(phone.join(".rowd")).unwrap();
     atomic_json(
@@ -334,7 +335,7 @@ fn android_share_request_waits_for_pc_folder_selection() {
     .unwrap();
 
     round(&home, &phone, &invite);
-    let mut cfg = rowd_core::config::DeviceConfig::load(&home).unwrap();
+    let mut cfg = rowd_app::DeviceConfig::load(&home).unwrap();
     assert_eq!(cfg.share_requests, vec![request.clone()]);
     cfg.put_share(
         &home,
@@ -344,8 +345,10 @@ fn android_share_request_waits_for_pc_folder_selection() {
             root: pc.clone(),
             android_path: request.name.clone(),
             mode: request.mode,
+            enabled: true,
             ignore: String::new(),
             request_id: Some(request.request_id.clone()),
+            remap_policy: None,
         },
     )
     .unwrap();

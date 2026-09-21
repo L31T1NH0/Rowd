@@ -1,0 +1,23 @@
+[package]
+name = "rowd-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rowd-core = { path = "../rowd-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rustls.workspace = true
+rcgen = "0.13"
+notify = { version = "8", default-features = false }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+ring = "0.17"
+base64 = "0.22"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

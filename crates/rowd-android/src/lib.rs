@@ -106,11 +106,27 @@ impl rowd_core::managed::ManagedStore for AndroidStore<'_, '_, '_> {
             &self.call("pendingShareRequests", &[])?,
         )?)
     }
-    fn acknowledge_share_requests(&mut self, accepted: &[String]) -> Result<()> {
+    fn acknowledge_share_requests(
+        &mut self,
+        accepted: &[String],
+        rejected: &[String],
+        cancelled: &[String],
+    ) -> Result<()> {
         self.call(
             "acknowledgeShareRequests",
-            &[&serde_json::to_string(accepted)?],
+            &[
+                &serde_json::to_string(accepted)?,
+                &serde_json::to_string(rejected)?,
+                &serde_json::to_string(cancelled)?,
+            ],
         )?;
+        Ok(())
+    }
+    fn unlink_requested(&mut self) -> Result<bool> {
+        Ok(self.call("unlinkRequested", &[])? == "true")
+    }
+    fn confirm_unlinked(&mut self) -> Result<()> {
+        self.call("confirmUnlinked", &[])?;
         Ok(())
     }
     fn available_shares(&mut self) -> Result<Vec<String>> {

@@ -6,18 +6,15 @@ license.workspace = true
 
 [dependencies]
 rowd-core = { path = "../rowd-core" }
+rowd-app = { path = "../rowd-app" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-hex.workspace = true
-rustls.workspace = true
-rcgen = "0.13"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
-notify = { version = "8", default-features = false }
-qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 tempfile = "3"
+hex.workspace = true
+rcgen = "0.13"

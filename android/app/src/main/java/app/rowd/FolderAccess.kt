@@ -13,21 +13,23 @@ import java.io.InputStream
 import java.security.MessageDigest
 import java.util.UUID
 
-/** SAF boundary. All calls run on the single sync worker, never on the UI thread. */
+/** SAF boundary. Sync I/O uses one worker; administrative file updates share [stateLock]. */
 class FolderAccess(private val context: Context) {
+    companion object {
+        private val stateLock = Any()
+    }
+
     private val resolver = context.contentResolver
     private val recovery = File(context.filesDir, "recovery").apply { mkdirs() }
     private val definitions = File(context.filesDir, "shares.json")
     private val requests = File(context.filesDir, "share-requests.json")
+    private val requestResults = File(context.filesDir, "share-request-results.json")
     private val shareTrees = File(context.filesDir, "share-trees.json")
     private var active: JSONObject? = null
+    private var selectedTree: Uri? = null
     private var recoveryTree: Uri? = null
     private fun trees(): JSONObject = if (shareTrees.exists()) JSONObject(shareTrees.readText()) else JSONObject()
-    private fun dedicatedTree(): Uri? {
-        val id = active?.optString("share_id") ?: return null
-        return trees().optString(id).takeIf { it.isNotEmpty() }?.let(Uri::parse)
-    }
-    private val activeTree get() = dedicatedTree() ?: recoveryTree
+    private val activeTree get() = selectedTree ?: recoveryTree
         ?: error("Escolha a pasta Android deste Share.")
     private val base get() = DocumentFile.fromTreeUri(context, activeTree)
         ?: error("A pasta Android do Share não está disponível. Confira a permissão de acesso.")
@@ -35,6 +37,8 @@ class FolderAccess(private val context: Context) {
     fun knownShares(): String = if (definitions.exists()) definitions.readText() else "[]"
     fun pendingShareRequests(): String =
         if (requests.exists()) requests.readText() else "[]"
+    fun shareRequestResults(): String =
+        if (requestResults.exists()) requestResults.readText() else "[]"
 
     private fun treeParts(uri: Uri): Pair<String, List<String>>? = try {
         val id = DocumentsContract.getTreeDocumentId(uri)
@@ -66,7 +70,7 @@ class FolderAccess(private val context: Context) {
         }) { "A pasta escolhida coincide ou está dentro de outro Share." }
     }
 
-    fun queueShareRequest(name: String, mode: String, tree: String): String {
+    fun queueShareRequest(name: String, mode: String, tree: String): String = synchronized(stateLock) {
         val cleanName = name.trim()
         check(cleanName.isNotEmpty() && cleanName.length <= 120 && cleanName.none { it.isISOControl() }) {
             "Informe um nome válido para o Share."
@@ -92,26 +96,97 @@ class FolderAccess(private val context: Context) {
         val requestId = MessageDigest.getInstance("SHA-256")
             .digest(UUID.randomUUID().toString().toByteArray())
             .joinToString("") { "%02x".format(it.toInt() and 255) }
-        pending.put(JSONObject().put("request_id", requestId).put("name", cleanName).put("mode", mode).put("tree", tree))
+        pending.put(JSONObject().put("request_id", requestId).put("name", cleanName).put("mode", mode).put("state", "pending").put("tree", tree))
         persistText(requests, pending.toString())
-        return requestId
+        requestId
     }
 
-    fun acknowledgeShareRequests(acceptedJson: String): String {
-        val accepted = JSONArray(acceptedJson)
-        if (accepted.length() == 0) return "ok"
+    fun cancelShareRequest(id: String): String = synchronized(stateLock) {
+        check(id.matches(Regex("[0-9a-f]{64}"))) { "ID inválido" }
+        val pending = JSONArray(pendingShareRequests())
+        var found = false
+        for (i in 0 until pending.length()) {
+            val request = pending.getJSONObject(i)
+            if (request.getString("request_id") == id) {
+                request.put("state", "cancelled")
+                found = true
+            }
+        }
+        check(found) { "Solicitação não encontrada" }
+        persistText(requests, pending.toString())
+        "ok"
+    }
+
+    fun acknowledgeShareRequests(acceptedJson: String, rejectedJson: String, cancelledJson: String): String = synchronized(stateLock) {
+        fun ids(json: String) = JSONArray(json).let { array ->
+            (0 until array.length()).map { array.getString(it) }.toSet()
+        }
+        val accepted = ids(acceptedJson)
+        val rejected = ids(rejectedJson)
+        val cancelled = ids(cancelledJson)
+        val terminal = accepted + rejected + cancelled
+        if (terminal.isEmpty()) return@synchronized "ok"
         val pending = JSONArray(pendingShareRequests())
         val remaining = JSONArray()
+        val oldResults = JSONArray(shareRequestResults())
+        val newResults = mutableListOf<JSONObject>()
+        for (i in 0 until oldResults.length()) newResults.add(oldResults.getJSONObject(i))
         for (i in 0 until pending.length()) {
             val request = pending.getJSONObject(i)
             val id = request.getString("request_id")
-            if ((0 until accepted.length()).none { accepted.getString(it) == id }) remaining.put(request)
+            if (id !in terminal) {
+                remaining.put(request)
+            } else {
+                val state = when (id) {
+                    in accepted -> "accepted"
+                    in rejected -> "rejected"
+                    else -> "cancelled"
+                }
+                newResults.add(
+                    JSONObject()
+                        .put("request_id", id)
+                        .put("name", request.getString("name"))
+                        .put("state", state)
+                        .put("at", System.currentTimeMillis())
+                )
+            }
         }
         persistText(requests, remaining.toString())
+        val retained = JSONArray()
+        newResults.takeLast(50).forEach { retained.put(it) }
+        persistText(requestResults, retained.toString())
+        "ok"
+    }
+
+    fun requestUnlink(): String {
+        context.getSharedPreferences("rowd", Context.MODE_PRIVATE).edit().putBoolean("unlinkRequested", true).apply()
         return "ok"
     }
 
-    fun configureShares(json: String, removed: String): String {
+    fun unlinkRequested(): String = context.getSharedPreferences("rowd", Context.MODE_PRIVATE)
+        .getBoolean("unlinkRequested", false).toString()
+
+    fun confirmUnlinked(): String = synchronized(stateLock) {
+        context.getSharedPreferences("rowd", Context.MODE_PRIVATE).edit()
+            .remove("invitation").remove("unlinkRequested").apply()
+        val shareState = File(context.filesDir, "shares")
+        if (shareState.exists()) {
+            val archive = File(context.filesDir, "state-archives").apply { mkdirs() }
+            check(shareState.renameTo(File(archive, "shares-before-unlink-${System.currentTimeMillis()}"))) {
+                "Não foi possível preservar o estado anterior dos Shares."
+            }
+        }
+        definitions.delete()
+        shareTrees.delete()
+        requests.delete()
+        requestResults.delete()
+        active = null
+        selectedTree = null
+        recoveryTree = null
+        "ok"
+    }
+
+    fun configureShares(json: String, removed: String): String = synchronized(stateLock) {
         val previous = JSONArray(knownShares())
         val shares = JSONArray(json)
         val pending = JSONArray(pendingShareRequests())
@@ -138,7 +213,9 @@ class FolderAccess(private val context: Context) {
             for (j in 0 until previous.length()) {
                 val old = previous.getJSONObject(j)
                 if (old.getString("share_id") == share.getString("share_id")) {
-                    check(old.getString("android_path") == share.getString("android_path")) { "Destino do Share mudou." }
+                    if (old.getString("android_path") != share.getString("android_path")) {
+                        selectedTrees.remove(share.getString("share_id"))
+                    }
                 }
             }
         }
@@ -160,9 +237,11 @@ class FolderAccess(private val context: Context) {
         if (legacyTreeMapped) context.getSharedPreferences("rowd", Context.MODE_PRIVATE)
             .edit().remove("tree").apply()
         active = null
-        return "ok"
+        selectedTree = null
+        recoveryTree = null
+        "ok"
     }
-    fun bindShare(id: String, tree: String): String {
+    fun bindShare(id: String, tree: String): String = synchronized(stateLock) {
         check(id.matches(Regex("[0-9a-f]{64}"))) { "ID inválido" }
         val shares = JSONArray(knownShares())
         check((0 until shares.length()).any { shares.getJSONObject(it).getString("share_id") == id }) {
@@ -176,7 +255,7 @@ class FolderAccess(private val context: Context) {
         )
         selected.put(id, tree)
         persistText(shareTrees, selected.toString())
-        return "ok"
+        "ok"
     }
     fun availableShares(): String {
         val selected = trees()
@@ -216,10 +295,12 @@ class FolderAccess(private val context: Context) {
         return values.map(Uri::parse)
     }
     fun selectShare(id: String): String {
+        check(id.matches(Regex("[0-9a-f]{64}"))) { "ID inválido" }
         val shares = JSONArray(knownShares())
         active = (0 until shares.length()).map { shares.getJSONObject(it) }.firstOrNull { it.getString("share_id") == id }
             ?: error("Share desconhecido")
-        check(id.matches(Regex("[0-9a-f]{64}"))) { "ID inválido" }
+        selectedTree = trees().optString(id).takeIf { it.isNotEmpty() }?.let(Uri::parse)
+            ?: error("Escolha a pasta Android deste Share.")
         return File(context.filesDir,"shares/$id/journal.json").absolutePath
     }
     private fun persistText(file: File, text: String) {
@@ -415,6 +496,7 @@ class FolderAccess(private val context: Context) {
         check(id.matches(Regex("[a-zA-Z0-9-]+"))) { "ID inválido" }
         val file = File(recovery,"$id.json")
         val journal = JSONObject(file.readText())
+        selectedTree = null
         recoveryTree = Uri.parse(journal.getString("tree"))
         val shareId = journal.optString("share_id")
         if (shareId.isNotEmpty()) {

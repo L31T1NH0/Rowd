@@ -9,7 +9,7 @@ use sha2::Sha256;
 use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -28,11 +28,18 @@ pub enum Message {
         managed_shares: bool,
         share_requests: Vec<crate::config::ShareRequest>,
         available_shares: Vec<String>,
+        #[serde(default)]
+        unlink_requested: bool,
     },
     ShareRequestStatus {
         accepted: Vec<String>,
         pending: Vec<String>,
+        #[serde(default)]
+        rejected: Vec<String>,
+        #[serde(default)]
+        cancelled: Vec<String>,
     },
+    DeviceUnlinked,
     SelectShare {
         share_id: String,
     },

@@ -1,29 +1,47 @@
-use crate::service;
+// THESIS: Rowd is a route desk: every Share has a visible route, state, and next action.
+// OWN-WORLD: charcoal operations console, cyan route markers, amber maintenance signals.
+// STORY: global health -> category -> selected route -> safe contextual action.
+// FIRST VIEWPORT: device trust and sync health stay visible above five focused work areas.
+// FORM: responsive master/detail desk; concept candidate 3, seed a0e162b2.
+// FINISH: keyboard, empty/error/loading states, compact QR, and narrow layouts ship together.
+
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
-    Terminal,
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    Frame, Terminal,
 };
-use rowd_core::{config::DeviceConfig, storage::LocalStore};
+use rowd_app::{App, ConnectionTest, DeviceInfo, DeviceSummary, RecoveryItem, ResetLevel, Status};
+use rowd_core::config::{RemapPolicy, ShareRequest, ShareRequestState, SyncMode};
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc::{self, Sender},
+        Arc,
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+const ACCENT: Color = Color::Rgb(75, 207, 210);
+const ACCENT_DARK: Color = Color::Rgb(24, 67, 73);
+const MUTED: Color = Color::Rgb(148, 163, 170);
+const SUCCESS: Color = Color::Rgb(92, 205, 138);
+const WARNING: Color = Color::Rgb(239, 184, 85);
+
 struct Screen;
+
 impl Drop for Screen {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
@@ -31,33 +49,1546 @@ impl Drop for Screen {
     }
 }
 
-struct ShareWizard {
-    step: u8,
-    name: String,
-    folder: String,
-    mode: String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Tab {
+    Shares,
+    Requests,
+    Recovery,
+    Device,
+    Settings,
 }
 
-impl ShareWizard {
-    fn prompt(&self) -> &'static str {
-        match self.step {
-            0 => "Qual o nome desse Share?",
-            1 => "Qual o caminho da pasta? Use pwd para copiar o caminho.",
-            _ => "Qual modo você deseja? 1 bidirecional · 2 PC para Android · 3 Android para PC",
+impl Tab {
+    const ALL: [Self; 5] = [
+        Self::Shares,
+        Self::Requests,
+        Self::Recovery,
+        Self::Device,
+        Self::Settings,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Shares => "Shares",
+            Self::Requests => "Solicitações",
+            Self::Recovery => "Recovery",
+            Self::Device => "Dispositivo",
+            Self::Settings => "Configuração",
+        }
+    }
+
+    fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    fn previous(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiAction {
+    AddShare,
+    EditShare,
+    ToggleShare,
+    SyncShare,
+    ReindexShare,
+    RemapShare,
+    EditIgnore,
+    RemoveShare,
+    AcceptRequest,
+    RejectRequest,
+    RestoreRecovery,
+    KeepRecovery,
+    ExportRecovery,
+    CleanupRecovery,
+    FilterRecovery,
+    Pair,
+    ShowQr,
+    TestConnection,
+    ToggleGlobalPause,
+    Unlink,
+    ExportProfile,
+    ImportProfile,
+    ExportBackup,
+    ImportBackup,
+    ExportDiagnostic,
+    ResetInterface,
+    ResetInitial,
+    ResetAll,
+    ToggleDensity,
+}
+
+impl UiAction {
+    fn id(self) -> &'static str {
+        match self {
+            Self::AddShare => "add_share",
+            Self::EditShare => "edit_share",
+            Self::ToggleShare => "toggle_share",
+            Self::SyncShare => "sync_share",
+            Self::ReindexShare => "reindex_share",
+            Self::RemapShare => "remap_share",
+            Self::EditIgnore => "edit_ignore",
+            Self::RemoveShare => "remove_share",
+            Self::AcceptRequest => "accept_request",
+            Self::RejectRequest => "reject_request",
+            Self::RestoreRecovery => "restore_recovery",
+            Self::KeepRecovery => "keep_recovery",
+            Self::ExportRecovery => "export_recovery",
+            Self::CleanupRecovery => "cleanup_recovery",
+            Self::FilterRecovery => "filter_recovery",
+            Self::Pair => "pair",
+            Self::ShowQr => "show_qr",
+            Self::TestConnection => "test_connection",
+            Self::ToggleGlobalPause => "toggle_global_pause",
+            Self::Unlink => "unlink",
+            Self::ExportProfile => "export_profile",
+            Self::ImportProfile => "import_profile",
+            Self::ExportBackup => "export_backup",
+            Self::ImportBackup => "import_backup",
+            Self::ExportDiagnostic => "export_diagnostic",
+            Self::ResetInterface => "reset_interface",
+            Self::ResetInitial => "reset_initial",
+            Self::ResetAll => "reset_all",
+            Self::ToggleDensity => "toggle_density",
+        }
+    }
+
+    fn mutates(self) -> bool {
+        !matches!(
+            self,
+            Self::FilterRecovery | Self::ShowQr | Self::TestConnection
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BindingDef {
+    action: UiAction,
+    tab: Tab,
+    label: &'static str,
+    default: &'static str,
+}
+
+const BINDINGS: &[BindingDef] = &[
+    BindingDef {
+        action: UiAction::AddShare,
+        tab: Tab::Shares,
+        label: "Adicionar Share",
+        default: "a",
+    },
+    BindingDef {
+        action: UiAction::EditShare,
+        tab: Tab::Shares,
+        label: "Editar Share",
+        default: "e",
+    },
+    BindingDef {
+        action: UiAction::ToggleShare,
+        tab: Tab::Shares,
+        label: "Pausar/retomar Share",
+        default: "space",
+    },
+    BindingDef {
+        action: UiAction::SyncShare,
+        tab: Tab::Shares,
+        label: "Sincronizar Share",
+        default: "s",
+    },
+    BindingDef {
+        action: UiAction::ReindexShare,
+        tab: Tab::Shares,
+        label: "Reindexar Share",
+        default: "x",
+    },
+    BindingDef {
+        action: UiAction::RemapShare,
+        tab: Tab::Shares,
+        label: "Remapear Android",
+        default: "m",
+    },
+    BindingDef {
+        action: UiAction::EditIgnore,
+        tab: Tab::Shares,
+        label: "Editar .rowdignore",
+        default: "i",
+    },
+    BindingDef {
+        action: UiAction::RemoveShare,
+        tab: Tab::Shares,
+        label: "Remover Share",
+        default: "d",
+    },
+    BindingDef {
+        action: UiAction::AcceptRequest,
+        tab: Tab::Requests,
+        label: "Aceitar solicitação",
+        default: "a",
+    },
+    BindingDef {
+        action: UiAction::RejectRequest,
+        tab: Tab::Requests,
+        label: "Rejeitar solicitação",
+        default: "r",
+    },
+    BindingDef {
+        action: UiAction::RestoreRecovery,
+        tab: Tab::Recovery,
+        label: "Restaurar versão",
+        default: "enter",
+    },
+    BindingDef {
+        action: UiAction::KeepRecovery,
+        tab: Tab::Recovery,
+        label: "Manter versão atual",
+        default: "k",
+    },
+    BindingDef {
+        action: UiAction::ExportRecovery,
+        tab: Tab::Recovery,
+        label: "Exportar versão",
+        default: "e",
+    },
+    BindingDef {
+        action: UiAction::CleanupRecovery,
+        tab: Tab::Recovery,
+        label: "Limpar registro resolvido",
+        default: "d",
+    },
+    BindingDef {
+        action: UiAction::FilterRecovery,
+        tab: Tab::Recovery,
+        label: "Filtrar por Share",
+        default: "f",
+    },
+    BindingDef {
+        action: UiAction::Pair,
+        tab: Tab::Device,
+        label: "Configurar endereço",
+        default: "p",
+    },
+    BindingDef {
+        action: UiAction::ShowQr,
+        tab: Tab::Device,
+        label: "Exibir QR",
+        default: "o",
+    },
+    BindingDef {
+        action: UiAction::TestConnection,
+        tab: Tab::Device,
+        label: "Testar conexão",
+        default: "t",
+    },
+    BindingDef {
+        action: UiAction::ToggleGlobalPause,
+        tab: Tab::Device,
+        label: "Pausar/retomar tudo",
+        default: "space",
+    },
+    BindingDef {
+        action: UiAction::Unlink,
+        tab: Tab::Device,
+        label: "Desvincular",
+        default: "u",
+    },
+    BindingDef {
+        action: UiAction::ExportProfile,
+        tab: Tab::Device,
+        label: "Exportar perfil",
+        default: "x",
+    },
+    BindingDef {
+        action: UiAction::ImportProfile,
+        tab: Tab::Device,
+        label: "Importar perfil",
+        default: "i",
+    },
+    BindingDef {
+        action: UiAction::ExportBackup,
+        tab: Tab::Device,
+        label: "Exportar backup",
+        default: "b",
+    },
+    BindingDef {
+        action: UiAction::ImportBackup,
+        tab: Tab::Device,
+        label: "Importar backup",
+        default: "n",
+    },
+    BindingDef {
+        action: UiAction::ExportDiagnostic,
+        tab: Tab::Device,
+        label: "Exportar diagnóstico",
+        default: "d",
+    },
+    BindingDef {
+        action: UiAction::ResetInitial,
+        tab: Tab::Device,
+        label: "Configuração inicial",
+        default: "f",
+    },
+    BindingDef {
+        action: UiAction::ResetAll,
+        tab: Tab::Device,
+        label: "Apagar dados internos",
+        default: "X",
+    },
+    BindingDef {
+        action: UiAction::ResetInterface,
+        tab: Tab::Settings,
+        label: "Redefinir interface",
+        default: "z",
+    },
+    BindingDef {
+        action: UiAction::ToggleDensity,
+        tab: Tab::Settings,
+        label: "Alternar densidade",
+        default: "v",
+    },
+];
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct UiPreferences {
+    bindings: BTreeMap<String, String>,
+    dense: bool,
+}
+
+impl UiPreferences {
+    fn key(&self, action: UiAction) -> &str {
+        self.bindings
+            .get(action.id())
+            .map(String::as_str)
+            .unwrap_or_else(|| {
+                BINDINGS
+                    .iter()
+                    .find(|binding| binding.action == action)
+                    .map(|binding| binding.default)
+                    .unwrap_or("")
+            })
+    }
+
+    fn set_key(&mut self, action: UiAction, value: &str) -> Result<()> {
+        let value = value.trim();
+        anyhow::ensure!(
+            value == "space" || value == "enter" || value.chars().count() == 1,
+            "use uma letra, space ou enter"
+        );
+        anyhow::ensure!(
+            !matches!(value, "1" | "2" | "3" | "4" | "5" | "q" | "?"),
+            "atalho reservado pela navegação global"
+        );
+        let tab = binding(action).context("ação não configurável")?.tab;
+        anyhow::ensure!(
+            !BINDINGS.iter().any(|candidate| {
+                candidate.tab == tab
+                    && candidate.action != action
+                    && self.key(candidate.action) == value
+            }),
+            "atalho já usado nesta aba"
+        );
+        self.bindings.insert(action.id().into(), value.into());
+        Ok(())
+    }
+}
+
+fn binding(action: UiAction) -> Option<&'static BindingDef> {
+    BINDINGS.iter().find(|binding| binding.action == action)
+}
+
+struct KeyMap;
+
+impl KeyMap {
+    fn resolve(key: KeyEvent, tab: Tab, preferences: &UiPreferences) -> Option<KeyCommand> {
+        let fixed = match key.code {
+            KeyCode::Char('q') => Some(KeyCommand::Quit),
+            KeyCode::Char('?') => Some(KeyCommand::Help),
+            KeyCode::Char('1') => Some(KeyCommand::OpenTab(Tab::Shares)),
+            KeyCode::Char('2') => Some(KeyCommand::OpenTab(Tab::Requests)),
+            KeyCode::Char('3') => Some(KeyCommand::OpenTab(Tab::Recovery)),
+            KeyCode::Char('4') => Some(KeyCommand::OpenTab(Tab::Device)),
+            KeyCode::Char('5') => Some(KeyCommand::OpenTab(Tab::Settings)),
+            KeyCode::Tab => Some(KeyCommand::NextTab),
+            KeyCode::BackTab => Some(KeyCommand::PreviousTab),
+            KeyCode::Up => Some(KeyCommand::MoveUp),
+            KeyCode::Down => Some(KeyCommand::MoveDown),
+            KeyCode::Esc => Some(KeyCommand::Close),
+            KeyCode::Enter if tab == Tab::Settings => Some(KeyCommand::ConfigureBinding),
+            _ => None,
+        };
+        fixed.or_else(|| {
+            BINDINGS
+                .iter()
+                .filter(|binding| binding.tab == tab)
+                .find(|binding| key_matches(key.code, preferences.key(binding.action)))
+                .map(|binding| KeyCommand::Action(binding.action))
+        })
+    }
+}
+
+fn key_matches(code: KeyCode, configured: &str) -> bool {
+    match configured {
+        "space" => code == KeyCode::Char(' '),
+        "enter" => code == KeyCode::Enter,
+        value => {
+            let mut chars = value.chars();
+            matches!((chars.next(), chars.next(), code), (Some(expected), None, KeyCode::Char(actual)) if expected == actual)
         }
     }
 }
 
-fn pairing_view(home: &Path, cfg: &DeviceConfig) -> Result<(String, PathBuf, String)> {
-    use sha2::{Digest, Sha256};
+#[derive(Clone, Copy)]
+enum KeyCommand {
+    Quit,
+    Help,
+    OpenTab(Tab),
+    NextTab,
+    PreviousTab,
+    MoveUp,
+    MoveDown,
+    Close,
+    ConfigureBinding,
+    Action(UiAction),
+}
 
-    let image = service::export_qr(home, cfg)?;
-    let fingerprint = Sha256::digest(hex::decode(&cfg.cert)?)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(":");
-    Ok((service::qr(cfg)?, image, fingerprint))
+#[derive(Default)]
+struct Snapshot {
+    shares: Vec<Status>,
+    requests: Vec<ShareRequest>,
+    recovery: Vec<RecoveryItem>,
+    device: Option<DeviceSummary>,
+}
+
+enum Submit {
+    Pair,
+    AddShare,
+    EditShare(String),
+    RemoveShare(String),
+    AcceptRequest(String),
+    RejectRequest(String),
+    ReindexShare(String),
+    RemapShare(String),
+    Ignore(String),
+    RestoreRecovery(String, String),
+    KeepRecovery(String, String),
+    ExportRecovery(String, String),
+    CleanupRecovery(String, String),
+    Unlink,
+    ExportProfile,
+    ImportProfile,
+    ExportBackupPath,
+    ExportBackupPassphrase(PathBuf),
+    ImportBackupPath,
+    ImportBackupPassphrase(PathBuf),
+    ExportDiagnostic,
+    ResetInterface,
+    ResetInitial,
+    ResetAll,
+    Binding(UiAction),
+}
+
+struct InputDialog {
+    title: String,
+    hint: String,
+    value: String,
+    submit: Submit,
+    secret: bool,
+}
+
+enum Modal {
+    Help,
+    Qr(DeviceInfo),
+    Input(InputDialog),
+}
+
+enum UiEvent {
+    Notice(String),
+    JobDone(String),
+}
+
+struct Ui {
+    tab: Tab,
+    shares_index: usize,
+    requests_index: usize,
+    recovery_index: usize,
+    recovery_filter: Option<String>,
+    binding_index: usize,
+    preferences: UiPreferences,
+    snapshot: Snapshot,
+    modal: Option<Modal>,
+    notice: String,
+    connection: Option<ConnectionTest>,
+    job: Option<String>,
+    dirty: bool,
+    last_refresh: Instant,
+}
+
+impl Ui {
+    fn new(app: &App) -> Self {
+        let mut ui = Self {
+            tab: Tab::Shares,
+            shares_index: 0,
+            requests_index: 0,
+            recovery_index: 0,
+            recovery_filter: None,
+            binding_index: 0,
+            preferences: app.load_ui_preferences().ok().flatten().unwrap_or_default(),
+            snapshot: Snapshot::default(),
+            modal: None,
+            notice: "Pronto. Use ? para consultar todas as ações.".into(),
+            connection: None,
+            job: None,
+            dirty: true,
+            last_refresh: Instant::now() - Duration::from_secs(2),
+        };
+        ui.refresh(app);
+        ui
+    }
+
+    fn refresh(&mut self, app: &App) {
+        if !self.dirty && self.last_refresh.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.snapshot.device = app.device_summary().ok();
+        let configured = self
+            .snapshot
+            .device
+            .as_ref()
+            .is_some_and(|device| device.configured);
+        if configured {
+            if let Ok(shares) = app.status() {
+                self.snapshot.shares = shares;
+            }
+            if let Ok(requests) = app.share_requests() {
+                self.snapshot.requests = requests;
+            }
+            if let Ok(recovery) = app.recovery() {
+                self.snapshot.recovery = recovery;
+            }
+        } else {
+            self.snapshot.shares.clear();
+            self.snapshot.requests.clear();
+            self.snapshot.recovery.clear();
+        }
+        self.shares_index = clamp_index(self.shares_index, self.snapshot.shares.len());
+        self.requests_index = clamp_index(self.requests_index, self.snapshot.requests.len());
+        if self.recovery_filter.as_ref().is_some_and(|share_id| {
+            !self
+                .snapshot
+                .recovery
+                .iter()
+                .any(|item| &item.share_id == share_id)
+        }) {
+            self.recovery_filter = None;
+        }
+        self.recovery_index = clamp_index(self.recovery_index, self.recovery_len());
+        self.binding_index = clamp_index(self.binding_index, BINDINGS.len());
+        self.last_refresh = Instant::now();
+        self.dirty = false;
+    }
+
+    fn selected_share(&self) -> Option<&Status> {
+        self.snapshot.shares.get(self.shares_index)
+    }
+
+    fn selected_request(&self) -> Option<&ShareRequest> {
+        self.snapshot.requests.get(self.requests_index)
+    }
+
+    fn selected_recovery(&self) -> Option<&RecoveryItem> {
+        self.snapshot
+            .recovery
+            .iter()
+            .filter(|item| {
+                self.recovery_filter
+                    .as_ref()
+                    .is_none_or(|share_id| &item.share_id == share_id)
+            })
+            .nth(self.recovery_index)
+    }
+
+    fn recovery_len(&self) -> usize {
+        self.snapshot
+            .recovery
+            .iter()
+            .filter(|item| {
+                self.recovery_filter
+                    .as_ref()
+                    .is_none_or(|share_id| &item.share_id == share_id)
+            })
+            .count()
+    }
+
+    fn move_selection(&mut self, down: bool) {
+        let recovery_len = self.recovery_len();
+        let (index, len) = match self.tab {
+            Tab::Shares => (&mut self.shares_index, self.snapshot.shares.len()),
+            Tab::Requests => (&mut self.requests_index, self.snapshot.requests.len()),
+            Tab::Recovery => (&mut self.recovery_index, recovery_len),
+            Tab::Device => return,
+            Tab::Settings => (&mut self.binding_index, BINDINGS.len()),
+        };
+        *index = if down {
+            (*index + 1).min(len.saturating_sub(1))
+        } else {
+            index.saturating_sub(1)
+        };
+    }
+
+    fn open_input(
+        &mut self,
+        title: impl Into<String>,
+        hint: impl Into<String>,
+        value: impl Into<String>,
+        submit: Submit,
+    ) {
+        self.modal = Some(Modal::Input(InputDialog {
+            title: title.into(),
+            hint: hint.into(),
+            value: value.into(),
+            submit,
+            secret: false,
+        }));
+    }
+
+    fn open_secret(&mut self, title: impl Into<String>, hint: impl Into<String>, submit: Submit) {
+        self.modal = Some(Modal::Input(InputDialog {
+            title: title.into(),
+            hint: hint.into(),
+            value: String::new(),
+            submit,
+            secret: true,
+        }));
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, app: &App, tx: &Sender<UiEvent>) -> Result<bool> {
+        if self.modal.is_some() {
+            return self.handle_modal_key(key, app, tx).map(|()| false);
+        }
+        let Some(command) = KeyMap::resolve(key, self.tab, &self.preferences) else {
+            return Ok(false);
+        };
+        let blocked_by_job = match command {
+            KeyCommand::Action(action) => action.mutates(),
+            KeyCommand::ConfigureBinding => true,
+            _ => false,
+        };
+        if self.job.is_some() && blocked_by_job {
+            self.notice =
+                "Aguarde a operação em andamento; navegação e ajuda continuam disponíveis.".into();
+            return Ok(false);
+        }
+        match command {
+            KeyCommand::Quit => return Ok(true),
+            KeyCommand::Help => self.modal = Some(Modal::Help),
+            KeyCommand::OpenTab(tab) => self.tab = tab,
+            KeyCommand::NextTab => self.tab = self.tab.next(),
+            KeyCommand::PreviousTab => self.tab = self.tab.previous(),
+            KeyCommand::MoveUp => self.move_selection(false),
+            KeyCommand::MoveDown => self.move_selection(true),
+            KeyCommand::Close => {}
+            KeyCommand::ConfigureBinding => {
+                if let Some(binding) = BINDINGS.get(self.binding_index).copied() {
+                    let current = self.preferences.key(binding.action).to_owned();
+                    self.open_input(
+                        format!("Atalho · {}", binding.label),
+                        "Uma letra, space ou enter. 1..5, q e ? são reservados.",
+                        current,
+                        Submit::Binding(binding.action),
+                    );
+                }
+            }
+            KeyCommand::Action(action) => self.begin_action(action, app, tx)?,
+        }
+        Ok(false)
+    }
+
+    fn handle_modal_key(&mut self, key: KeyEvent, app: &App, tx: &Sender<UiEvent>) -> Result<()> {
+        if key.code == KeyCode::Esc {
+            self.modal = None;
+            return Ok(());
+        }
+        match self.modal.as_mut() {
+            Some(Modal::Input(input)) => match key.code {
+                KeyCode::Backspace => {
+                    input.value.pop();
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    input.value.push('\n');
+                }
+                KeyCode::Enter => {
+                    let Modal::Input(input) = self.modal.take().unwrap() else {
+                        unreachable!()
+                    };
+                    if let Err(error) = self.submit(input.submit, input.value, app, tx) {
+                        self.notice = format!("Ação não concluída: {error:#}");
+                    }
+                    self.dirty = true;
+                }
+                KeyCode::Char(character) => input.value.push(character),
+                _ => {}
+            },
+            Some(Modal::Help | Modal::Qr(_)) | None => {}
+        }
+        Ok(())
+    }
+
+    fn begin_action(&mut self, action: UiAction, app: &App, tx: &Sender<UiEvent>) -> Result<()> {
+        match action {
+            UiAction::AddShare => self.open_input(
+                "Novo Share",
+                "nome | pasta absoluta no PC | bidirectional/to_android/to_pc",
+                "",
+                Submit::AddShare,
+            ),
+            UiAction::EditShare => {
+                if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
+                    self.open_input(
+                        format!("Editar · {}", share.name),
+                        "nome | pasta absoluta no PC | bidirectional/to_android/to_pc",
+                        format!(
+                            "{} | {} | {}",
+                            share.name,
+                            share.root.display(),
+                            mode_value(share.mode)
+                        ),
+                        Submit::EditShare(share.share_id.clone()),
+                    );
+                }
+            }
+            UiAction::ToggleShare => {
+                if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
+                    app.set_share_enabled(&share.share_id, !share.enabled)?;
+                    self.notice = if share.enabled {
+                        "Share pausado; arquivos e estado foram preservados.".into()
+                    } else {
+                        "Share retomado; a próxima rodada usará a configuração atual.".into()
+                    };
+                    self.dirty = true;
+                }
+            }
+            UiAction::SyncShare => {
+                if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
+                    app.request_share_sync(&share.share_id)?;
+                    self.notice = format!("{} foi priorizado para a próxima conexão.", share.name);
+                }
+            }
+            UiAction::ReindexShare => {
+                if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
+                    self.open_input(
+                        format!("Reindexar · {}", share.name),
+                        "Reconstrói estado derivado e preserva arquivos/recovery. Digite REINDEXAR.",
+                        "",
+                        Submit::ReindexShare(share.share_id),
+                    );
+                }
+            }
+            UiAction::RemapShare => {
+                if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
+                    self.open_input(
+                        format!("Remapear Android · {}", share.name),
+                        "novo caminho Android | pc/android/compare",
+                        format!("{} | compare", share.android_path),
+                        Submit::RemapShare(share.share_id),
+                    );
+                }
+            }
+            UiAction::EditIgnore => {
+                if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
+                    let id = share.share_id;
+                    let text = app.ignore_text(&id)?;
+                    self.open_input(
+                        format!(".rowdignore · {}", share.name),
+                        "Enter aplica; Shift+Enter cria linha. Regras inválidas são recusadas.",
+                        text,
+                        Submit::Ignore(id),
+                    );
+                }
+            }
+            UiAction::RemoveShare => {
+                if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
+                    self.open_input(
+                        format!("Remover · {}", share.name),
+                        "Remove a rota, preservando os arquivos. Digite REMOVER.",
+                        "",
+                        Submit::RemoveShare(share.share_id),
+                    );
+                }
+            }
+            UiAction::AcceptRequest => {
+                if let Some(request) = self.selected_request().cloned() {
+                    anyhow::ensure!(
+                        request.state == ShareRequestState::Pending,
+                        "solicitação não está pendente"
+                    );
+                    self.open_input(
+                        format!("Aceitar · {}", request.name),
+                        "Pasta absoluta no PC que receberá este Share.",
+                        "",
+                        Submit::AcceptRequest(request.request_id.clone()),
+                    );
+                }
+            }
+            UiAction::RejectRequest => {
+                if let Some(request) = self.selected_request().cloned() {
+                    anyhow::ensure!(
+                        request.state == ShareRequestState::Pending,
+                        "solicitação não está pendente"
+                    );
+                    self.open_input(
+                        format!("Rejeitar · {}", request.name),
+                        "A decisão será enviada ao Android. Digite REJEITAR.",
+                        "",
+                        Submit::RejectRequest(request.request_id.clone()),
+                    );
+                }
+            }
+            UiAction::RestoreRecovery => self.begin_recovery("RESTAURAR", Submit::RestoreRecovery),
+            UiAction::KeepRecovery => self.begin_recovery("MANTER", Submit::KeepRecovery),
+            UiAction::ExportRecovery => {
+                if let Some(item) = self.selected_recovery().cloned() {
+                    self.open_input(
+                        format!("Exportar recovery · {}", item.path),
+                        "Destino novo para a versão recuperada.",
+                        "",
+                        Submit::ExportRecovery(item.share_id.clone(), item.id.clone()),
+                    );
+                }
+            }
+            UiAction::CleanupRecovery => self.begin_recovery("LIMPAR", Submit::CleanupRecovery),
+            UiAction::FilterRecovery => {
+                let shares = self
+                    .snapshot
+                    .recovery
+                    .iter()
+                    .map(|item| (item.share_id.clone(), item.share_name.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let ids = shares.keys().cloned().collect::<Vec<_>>();
+                self.recovery_filter = match &self.recovery_filter {
+                    None => ids.first().cloned(),
+                    Some(current) => ids
+                        .iter()
+                        .position(|id| id == current)
+                        .and_then(|index| ids.get(index + 1))
+                        .cloned(),
+                };
+                self.recovery_index = 0;
+                self.notice = match &self.recovery_filter {
+                    Some(id) => format!(
+                        "Recovery filtrado por {}.",
+                        shares.get(id).map(String::as_str).unwrap_or("Share")
+                    ),
+                    None => "Recovery exibindo todos os Shares.".into(),
+                };
+            }
+            UiAction::Pair => {
+                let current = self
+                    .snapshot
+                    .device
+                    .as_ref()
+                    .filter(|device| device.configured)
+                    .map(|device| device.address.clone())
+                    .unwrap_or_else(|| "0.0.0.0:43821".into());
+                self.open_input(
+                    "Endereço publicado do PC",
+                    "Use IP:porta alcançável pelo Android; 0.0.0.0 descobre o IP local.",
+                    current,
+                    Submit::Pair,
+                );
+            }
+            UiAction::ShowQr => match app.pairing_info() {
+                Ok(info) => self.modal = Some(Modal::Qr(info)),
+                Err(_) => self.begin_action(UiAction::Pair, app, tx)?,
+            },
+            UiAction::TestConnection => {
+                self.connection = Some(app.connection_test()?);
+                self.notice =
+                    "Teste concluído; detalhes atualizados no painel do dispositivo.".into();
+            }
+            UiAction::ToggleGlobalPause => {
+                let paused = self
+                    .snapshot
+                    .device
+                    .as_ref()
+                    .is_some_and(|device| device.sync_paused);
+                app.set_sync_paused(!paused)?;
+                self.notice = if paused {
+                    "Sincronização global retomada.".into()
+                } else {
+                    "Sincronização global pausada sem apagar estado.".into()
+                };
+                self.dirty = true;
+            }
+            UiAction::Unlink => self.open_input(
+                "Desvincular Android",
+                "Revoga a confiança e preserva arquivos/recovery. Digite DESVINCULAR.",
+                "",
+                Submit::Unlink,
+            ),
+            UiAction::ExportProfile => self.open_input(
+                "Exportar perfil sem segredos",
+                "Caminho de destino novo, por exemplo /tmp/rowd-profile.json",
+                "",
+                Submit::ExportProfile,
+            ),
+            UiAction::ImportProfile => self.open_input(
+                "Importar perfil sem segredos",
+                "Caminho do perfil. A configuração atual terá backup automático.",
+                "",
+                Submit::ImportProfile,
+            ),
+            UiAction::ExportBackup => self.open_input(
+                "Exportar backup completo criptografado",
+                "Caminho de destino novo.",
+                "",
+                Submit::ExportBackupPath,
+            ),
+            UiAction::ImportBackup => self.open_input(
+                "Importar backup completo criptografado",
+                "Caminho do backup. A configuração atual será preservada antes da troca.",
+                "",
+                Submit::ImportBackupPath,
+            ),
+            UiAction::ExportDiagnostic => self.open_input(
+                "Exportar diagnóstico sanitizado",
+                "Caminho de destino novo; segredos e chave privada não serão incluídos.",
+                "",
+                Submit::ExportDiagnostic,
+            ),
+            UiAction::ResetInterface => self.open_input(
+                "Redefinir interface",
+                "Remove apenas preferências visuais e atalhos. Digite REDEFINIR.",
+                "",
+                Submit::ResetInterface,
+            ),
+            UiAction::ResetInitial => self.open_input(
+                "Restaurar configuração inicial",
+                "Arquiva o estado administrativo e preserva arquivos. Digite INICIAL.",
+                "",
+                Submit::ResetInitial,
+            ),
+            UiAction::ResetAll => self.open_input(
+                "Apagar dados internos do Rowd",
+                "Move .rowd para um arquivo recuperável. Digite APAGAR TUDO.",
+                "",
+                Submit::ResetAll,
+            ),
+            UiAction::ToggleDensity => {
+                self.preferences.dense = !self.preferences.dense;
+                app.save_ui_preferences(&self.preferences)?;
+                self.notice = format!(
+                    "Densidade {}.",
+                    if self.preferences.dense {
+                        "compacta"
+                    } else {
+                        "confortável"
+                    }
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_recovery(&mut self, token: &'static str, constructor: fn(String, String) -> Submit) {
+        if let Some(item) = self.selected_recovery().cloned() {
+            self.open_input(
+                format!("Recovery · {}", item.path),
+                format!("Digite {token} para confirmar."),
+                "",
+                constructor(item.share_id.clone(), item.id.clone()),
+            );
+        }
+    }
+
+    fn submit(
+        &mut self,
+        submit: Submit,
+        value: String,
+        app: &App,
+        tx: &Sender<UiEvent>,
+    ) -> Result<()> {
+        match submit {
+            Submit::Pair => {
+                app.pair(value.trim())?;
+                self.modal = Some(Modal::Qr(app.pairing_info()?));
+                self.notice = "QR pronto para leitura pelo Android.".into();
+            }
+            Submit::AddShare => {
+                let (name, root, mode) = share_form(&value)?;
+                app.add_share(name, root, None, mode)?;
+                self.notice = "Share adicionado.".into();
+            }
+            Submit::EditShare(id) => {
+                let (name, root, mode) = share_form(&value)?;
+                app.edit_share(&id, name, root, mode)?;
+                self.notice =
+                    "Share atualizado; a próxima rodada usará a nova configuração.".into();
+            }
+            Submit::RemoveShare(id) => {
+                require_token(&value, "REMOVER")?;
+                app.remove_share(&id)?;
+                self.notice = "Share removido; arquivos locais foram preservados.".into();
+            }
+            Submit::AcceptRequest(id) => {
+                anyhow::ensure!(!value.trim().is_empty(), "informe a pasta local");
+                let folder = PathBuf::from(value.trim());
+                let app = app.clone();
+                start_job(self, tx, "Aceitando solicitação", move || {
+                    app.accept_share_request(&id, &folder)?;
+                    Ok("Solicitação aceita.".into())
+                })?;
+            }
+            Submit::RejectRequest(id) => {
+                require_token(&value, "REJEITAR")?;
+                let app = app.clone();
+                start_job(self, tx, "Rejeitando solicitação", move || {
+                    app.reject_share_request(&id)?;
+                    Ok(
+                        "Solicitação rejeitada; o Android receberá a decisão na próxima conexão."
+                            .into(),
+                    )
+                })?;
+            }
+            Submit::ReindexShare(id) => {
+                require_token(&value, "REINDEXAR")?;
+                let app = app.clone();
+                start_job(self, tx, "Reindexando Share", move || {
+                    app.reindex_share(&id)?;
+                    Ok("Reindexação concluída; recovery foi preservado.".into())
+                })?;
+            }
+            Submit::RemapShare(id) => {
+                let parts = split_fields(&value, 2, "novo caminho | pc/android/compare")?;
+                let policy = match parts[1] {
+                    "pc" => RemapPolicy::Pc,
+                    "android" => RemapPolicy::Android,
+                    "compare" => RemapPolicy::Compare,
+                    _ => anyhow::bail!("política deve ser pc, android ou compare"),
+                };
+                let android_path = parts[0].to_string();
+                let app = app.clone();
+                start_job(self, tx, "Remapeando Share", move || {
+                    app.remap_share(&id, android_path, policy)?;
+                    Ok("Destino Android remapeado com política explícita.".into())
+                })?;
+            }
+            Submit::Ignore(id) => {
+                let app = app.clone();
+                start_job(self, tx, "Aplicando .rowdignore", move || {
+                    app.set_ignore_text(&id, &value)?;
+                    Ok(".rowdignore validado e aplicado; Share reindexado.".into())
+                })?;
+            }
+            Submit::RestoreRecovery(share, id) => {
+                require_token(&value, "RESTAURAR")?;
+                let app = app.clone();
+                start_job(self, tx, "Restaurando versão", move || {
+                    app.restore_recovery(&share, &id)?;
+                    Ok("Versão restaurada; a versão substituída foi preservada.".into())
+                })?;
+            }
+            Submit::KeepRecovery(share, id) => {
+                require_token(&value, "MANTER")?;
+                let app = app.clone();
+                start_job(self, tx, "Mantendo versão atual", move || {
+                    app.keep_recovery(&share, &id)?;
+                    Ok("Versão atual mantida e recovery marcado como resolvido.".into())
+                })?;
+            }
+            Submit::ExportRecovery(share, id) => {
+                anyhow::ensure!(!value.trim().is_empty(), "informe o destino");
+                let output = PathBuf::from(value.trim());
+                let app = app.clone();
+                start_job(self, tx, "Exportando versão", move || {
+                    app.export_recovery(&share, &id, &output)?;
+                    Ok("Versão exportada.".into())
+                })?;
+            }
+            Submit::CleanupRecovery(share, id) => {
+                require_token(&value, "LIMPAR")?;
+                let app = app.clone();
+                start_job(self, tx, "Limpando recovery", move || {
+                    app.cleanup_recovery(&share, &id)?;
+                    Ok("Registro resolvido removido manualmente.".into())
+                })?;
+            }
+            Submit::Unlink => {
+                require_token(&value, "DESVINCULAR")?;
+                let app = app.clone();
+                start_job(self, tx, "Desvinculando dispositivo", move || {
+                    app.unlink_device()?;
+                    Ok("Vínculo revogado; arquivos e recovery foram preservados.".into())
+                })?;
+            }
+            Submit::ExportProfile => {
+                app.export_profile(required_path(&value)?)?;
+                self.notice = "Perfil sem segredos exportado.".into();
+            }
+            Submit::ImportProfile => {
+                let input = required_path(&value)?.to_path_buf();
+                let app = app.clone();
+                start_job(self, tx, "Importando perfil", move || {
+                    app.import_profile(&input)?;
+                    Ok("Perfil importado.".into())
+                })?;
+            }
+            Submit::ExportBackupPath => {
+                let path = required_path(&value)?.to_path_buf();
+                self.open_secret(
+                    "Senha do backup",
+                    "Mínimo de 8 caracteres. A senha não será armazenada.",
+                    Submit::ExportBackupPassphrase(path),
+                );
+            }
+            Submit::ExportBackupPassphrase(path) => {
+                let app = app.clone();
+                start_job(self, tx, "Exportando backup", move || {
+                    app.export_backup(&path, &value)?;
+                    Ok("Backup completo criptografado exportado com permissão privada.".into())
+                })?;
+            }
+            Submit::ImportBackupPath => {
+                let path = required_path(&value)?.to_path_buf();
+                self.open_secret(
+                    "Senha do backup",
+                    "A autenticação do arquivo ocorre antes de qualquer alteração.",
+                    Submit::ImportBackupPassphrase(path),
+                );
+            }
+            Submit::ImportBackupPassphrase(path) => {
+                let app = app.clone();
+                start_job(self, tx, "Importando backup", move || {
+                    app.import_backup(&path, &value)?;
+                    Ok("Backup completo autenticado e importado.".into())
+                })?;
+            }
+            Submit::ExportDiagnostic => {
+                app.export_diagnostic(required_path(&value)?)?;
+                self.notice = "Diagnóstico sanitizado exportado.".into();
+            }
+            Submit::ResetInterface => {
+                require_token(&value, "REDEFINIR")?;
+                app.reset(ResetLevel::Interface)?;
+                self.preferences = UiPreferences::default();
+                self.notice = "Preferências da interface redefinidas.".into();
+            }
+            Submit::ResetInitial => {
+                require_token(&value, "INICIAL")?;
+                let app = app.clone();
+                start_job(self, tx, "Restaurando configuração inicial", move || {
+                    app.reset(ResetLevel::Initial)?;
+                    Ok("Configuração inicial restaurada; estado anterior arquivado.".into())
+                })?;
+            }
+            Submit::ResetAll => {
+                require_token(&value, "APAGAR TUDO")?;
+                let app = app.clone();
+                start_job(self, tx, "Arquivando dados internos", move || {
+                    app.reset(ResetLevel::AllData)?;
+                    Ok("Dados internos movidos para um arquivo recuperável.".into())
+                })?;
+            }
+            Submit::Binding(action) => {
+                self.preferences.set_key(action, &value)?;
+                app.save_ui_preferences(&self.preferences)?;
+                self.notice = "Atalho salvo separadamente da configuração de sincronização.".into();
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn render(&mut self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        frame.render_widget(Clear, area);
+        let footer_height = if self.preferences.dense { 2 } else { 3 };
+        let regions = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
+        self.render_header(frame, regions[0]);
+        self.render_tabs(frame, regions[1]);
+        self.render_body(frame, regions[2]);
+        self.render_footer(frame, regions[3]);
+        if let Some(modal) = &self.modal {
+            render_modal(frame, area, modal, &self.preferences);
+        }
+    }
+
+    fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
+        let device = self.snapshot.device.as_ref();
+        let paused = device.is_some_and(|device| device.sync_paused);
+        let paired = device.is_some_and(|device| device.paired);
+        let pending: usize = self
+            .snapshot
+            .shares
+            .iter()
+            .map(|status| status.pending)
+            .sum();
+        let conflicts: usize = self
+            .snapshot
+            .shares
+            .iter()
+            .map(|status| status.conflicts.len())
+            .sum();
+        let line_one = Line::from(vec![
+            Span::styled(
+                " ROWD ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" v{}  ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                if paused { "SYNC PAUSADO" } else { "SYNC ATIVO" },
+                Style::default()
+                    .fg(if paused { WARNING } else { SUCCESS })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                if paired {
+                    "ANDROID VINCULADO"
+                } else {
+                    "ANDROID AGUARDANDO"
+                },
+                Style::default().fg(if paired { SUCCESS } else { MUTED }),
+            ),
+        ]);
+        let work = self.job.as_deref().unwrap_or(&self.notice);
+        let line_two = Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} Shares  ·  {pending} pendentes  ·  {conflicts} conflitos  ",
+                    self.snapshot.shares.len()
+                ),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                truncate(work, area.width.saturating_sub(45) as usize),
+                Style::default().fg(if self.job.is_some() {
+                    WARNING
+                } else {
+                    Color::White
+                }),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(Text::from(vec![line_one, line_two])), area);
+    }
+
+    fn render_tabs(&self, frame: &mut Frame<'_>, area: Rect) {
+        let titles = Tab::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| format!(" {} {} ", index + 1, tab.title()))
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Tabs::new(titles)
+                .select(self.tab.index())
+                .block(Block::default().borders(Borders::BOTTOM))
+                .style(Style::default().fg(MUTED))
+                .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+                .divider(" "),
+            area,
+        );
+    }
+
+    fn render_body(&self, frame: &mut Frame<'_>, area: Rect) {
+        let panels = body_panels(area);
+        match self.tab {
+            Tab::Shares => self.render_shares(frame, panels),
+            Tab::Requests => self.render_requests(frame, panels),
+            Tab::Recovery => self.render_recovery(frame, panels),
+            Tab::Device => self.render_device(frame, panels),
+            Tab::Settings => self.render_settings(frame, panels),
+        }
+    }
+
+    fn render_shares(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
+        let items = if self.snapshot.shares.is_empty() {
+            vec![
+                ListItem::new("Nenhum Share\nUse a para criar a primeira rota.")
+                    .style(Style::default().fg(MUTED)),
+            ]
+        } else {
+            self.snapshot
+                .shares
+                .iter()
+                .map(|status| {
+                    let state = if !status.root_available {
+                        "INDISPONÍVEL"
+                    } else if status.share.enabled {
+                        "ATIVO"
+                    } else {
+                        "PAUSADO"
+                    };
+                    ListItem::new(format!(
+                        "{}\n{} · {} · {} pend. · {} conf.",
+                        status.share.name,
+                        state,
+                        mode_label(status.share.mode),
+                        status.pending,
+                        status.conflicts.len()
+                    ))
+                })
+                .collect()
+        };
+        render_list(
+            frame,
+            panels[0],
+            "Rotas de sincronização",
+            items,
+            self.shares_index,
+        );
+        let detail = self.selected_share().map(share_detail).unwrap_or_else(|| {
+            "Cada Share liga uma pasta do PC a uma pasta escolhida no Android.\n\nAdicione uma rota para começar; as validações impedem raízes sobrepostas e caminhos inseguros.".into()
+        });
+        render_detail(frame, panels[1], "Rota selecionada", detail);
+    }
+
+    fn render_requests(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
+        let items = if self.snapshot.requests.is_empty() {
+            vec![ListItem::new("Nenhuma solicitação recebida").style(Style::default().fg(MUTED))]
+        } else {
+            self.snapshot
+                .requests
+                .iter()
+                .map(|request| {
+                    ListItem::new(format!(
+                        "{}\n{} · {}",
+                        request.name,
+                        request_state(request.state),
+                        mode_label(request.mode)
+                    ))
+                })
+                .collect()
+        };
+        render_list(
+            frame,
+            panels[0],
+            "Recebidas do Android",
+            items,
+            self.requests_index,
+        );
+        let detail = self.selected_request().map(|request| {
+            format!(
+                "Nome\n{}\n\nEstado\n{}\n\nModo\n{}\n\nIdentificador\n{}\n\nSolicitações enviadas pelo Android podem ser canceladas no próprio aparelho. Rejeições ficam registradas até os dois lados convergirem.",
+                request.name,
+                request_state(request.state),
+                mode_label(request.mode),
+                short_id(&request.request_id)
+            )
+        }).unwrap_or_else(|| "Aguardando solicitações.\n\nEnviadas: administradas no Android, onde podem ser canceladas antes da aceitação.".into());
+        render_detail(frame, panels[1], "Ciclo da solicitação", detail);
+    }
+
+    fn render_recovery(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
+        let visible = self
+            .snapshot
+            .recovery
+            .iter()
+            .filter(|item| {
+                self.recovery_filter
+                    .as_ref()
+                    .is_none_or(|share_id| &item.share_id == share_id)
+            })
+            .collect::<Vec<_>>();
+        let items = if visible.is_empty() {
+            vec![ListItem::new("Nenhuma versão neste filtro").style(Style::default().fg(MUTED))]
+        } else {
+            visible
+                .iter()
+                .map(|item| {
+                    ListItem::new(format!(
+                        "{}\n{} · {}",
+                        item.path,
+                        item.share_name,
+                        if item.finished {
+                            "RESOLVIDO"
+                        } else {
+                            "PENDENTE"
+                        }
+                    ))
+                })
+                .collect()
+        };
+        render_list(
+            frame,
+            panels[0],
+            "Versões preservadas",
+            items,
+            self.recovery_index,
+        );
+        let total: u64 = self.snapshot.recovery.iter().map(|item| item.bytes).sum();
+        let filtered_total: u64 = visible.iter().map(|item| item.bytes).sum();
+        let mut by_share = BTreeMap::<&str, (usize, u64)>::new();
+        for item in &self.snapshot.recovery {
+            let aggregate = by_share.entry(&item.share_name).or_default();
+            aggregate.0 += 1;
+            aggregate.1 += item.bytes;
+        }
+        let aggregate = by_share
+            .iter()
+            .map(|(name, (count, bytes))| {
+                format!("{name}: {count} versões · {}", human_bytes(*bytes))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let filter = self
+            .recovery_filter
+            .as_ref()
+            .and_then(|id| {
+                self.snapshot
+                    .recovery
+                    .iter()
+                    .find(|item| &item.share_id == id)
+            })
+            .map(|item| item.share_name.as_str())
+            .unwrap_or("todos os Shares");
+        let detail = self.selected_recovery().map(|item| {
+            format!(
+                "Filtro\n{} · {} em {} versões\n\nShare\n{}\n\nCaminho\n{}\n\nEstado\n{}\n\nBackup disponível\n{}\n\nTamanho\n{}\n\nID\n{}\n\nUso total do recovery\n{} em {} versões\n\nPor Share\n{}",
+                filter,
+                human_bytes(filtered_total),
+                visible.len(),
+                item.share_name,
+                item.path,
+                if item.finished { "resolvido" } else { "aguardando decisão" },
+                yes_no(item.backup_available),
+                human_bytes(item.bytes),
+                short_id(&item.id),
+                human_bytes(total),
+                self.snapshot.recovery.len(),
+                if aggregate.is_empty() { "nenhum" } else { &aggregate }
+            )
+        }).unwrap_or_else(|| format!("Filtro\n{filter} · {} em {} versões\n\nO Rowd preserva versões quando uma reconciliação exige decisão. A limpeza é sempre manual e só aceita registros resolvidos.\n\nPor Share\n{}", human_bytes(filtered_total), visible.len(), if aggregate.is_empty() { "nenhum" } else { &aggregate }));
+        render_detail(frame, panels[1], "Versão selecionada", detail);
+    }
+
+    fn render_device(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
+        let summary = self.snapshot.device.as_ref();
+        let left = match summary {
+            Some(device) if device.configured => format!(
+                "Vínculo\n{}\n\nEndereço publicado\n{}\n\nÚltima conexão\n{}\n\nSincronização\n{}\n\nIdentidade do Android\n{}\n\nFingerprint SHA-256\n{}",
+                if device.paired { "Android vinculado" } else { "aguardando primeiro vínculo" },
+                device.address,
+                timestamp_label(device.last_connection),
+                if device.sync_paused { "pausada" } else { "ativa" },
+                short_id(&device.identity),
+                device.fingerprint
+            ),
+            _ => "Dispositivo ainda não configurado.\n\nPressione p, confirme o endereço alcançável na rede local e leia o QR no Android.".into(),
+        };
+        render_detail(frame, panels[0], "Confiança PC ↔ Android", left);
+        let right = if let Some(test) = &self.connection {
+            let checks = test
+                .checks
+                .iter()
+                .map(|check| {
+                    format!(
+                        "[{}] {}\n    {}",
+                        if check.ok { "OK" } else { "FALHA" },
+                        check.label,
+                        check.detail
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "{checks}\n\nShares disponíveis\n{}/{}",
+                test.available_shares, test.total_shares
+            )
+        } else {
+            "Teste por camadas\n\nPC alcançável\nTCP\nTLS\nAutenticação\nDispositivo reconhecido\nShares disponíveis\n\nUse t para executar. Use o para abrir o QR compacto dentro do terminal; o SVG é mantido apenas como fallback/exportação.".into()
+        };
+        render_detail(frame, panels[1], "Diagnóstico e pareamento", right);
+    }
+
+    fn render_settings(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
+        let items = BINDINGS
+            .iter()
+            .map(|binding| {
+                ListItem::new(format!(
+                    "{}\n{} · tecla {}",
+                    binding.label,
+                    binding.tab.title(),
+                    display_key(self.preferences.key(binding.action))
+                ))
+            })
+            .collect::<Vec<_>>();
+        render_list(
+            frame,
+            panels[0],
+            "Atalhos configuráveis",
+            items,
+            self.binding_index,
+        );
+        let selected = BINDINGS.get(self.binding_index);
+        let detail = format!(
+            "Preferências da interface\n\nDensidade\n{}\n\nAtalho selecionado\n{}\n\nTecla atual\n{}\n\nEnter altera o atalho selecionado. As preferências ficam em ui.json, separadas de identidade, segredos e configuração de sincronização.\n\nAtalhos globais fixos\n1..5 abas · Tab/Shift+Tab navegar · ↑↓ selecionar · ? ajuda · Esc voltar · q sair",
+            if self.preferences.dense { "compacta" } else { "confortável" },
+            selected.map(|binding| binding.label).unwrap_or("nenhum"),
+            selected.map(|binding| display_key(self.preferences.key(binding.action))).unwrap_or_else(|| "—".into())
+        );
+        render_detail(frame, panels[1], "Interface", detail);
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let actions = BINDINGS
+            .iter()
+            .filter(|binding| binding.tab == self.tab)
+            .map(|binding| {
+                format!(
+                    "{} {}",
+                    display_key(self.preferences.key(binding.action)),
+                    short_action(binding.label)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        let text = if self.preferences.dense {
+            format!("{actions}  ·  ? ajuda")
+        } else {
+            format!("{actions}\n1..5 abas  Tab/Shift+Tab navegar  ↑↓ selecionar  ? ajuda  q sair")
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::TOP)),
+            area,
+        );
+    }
+}
+
+fn start_job(
+    ui: &mut Ui,
+    tx: &Sender<UiEvent>,
+    label: &str,
+    job: impl FnOnce() -> Result<String> + Send + 'static,
+) -> Result<()> {
+    anyhow::ensure!(ui.job.is_none(), "aguarde a operação em andamento");
+    ui.job = Some(label.into());
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let message = match job() {
+            Ok(message) => message,
+            Err(error) => format!("Ação não concluída: {error:#}"),
+        };
+        let _ = tx.send(UiEvent::JobDone(message));
+    });
+    Ok(())
 }
 
 pub fn run(home: &Path) -> Result<()> {
@@ -65,6 +1596,8 @@ pub fn run(home: &Path) -> Result<()> {
         io::stdin().is_terminal(),
         "A TUI requer terminal interativo; use --help para a CLI."
     );
+    let app = App::new(home);
+    let mut ui = Ui::new(&app);
     enable_raw_mode()?;
     let _screen = Screen;
     execute!(io::stdout(), EnterAlternateScreen)?;
@@ -72,102 +1605,48 @@ pub fn run(home: &Path) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let mut worker: Option<std::thread::JoinHandle<()>> = None;
-    let mut selected: usize = 0;
-    let mut request_index: usize = 0;
-    let mut status = "Pareie o Android para começar. Depois adicione seus Shares.".to_string();
-    let mut input: Option<(char, String)> = None;
-    let mut share_wizard: Option<ShareWizard> = None;
-    let mut qr: Option<String> = None;
-    let mut qr_image = None;
-    let mut fingerprint = String::new();
-    let mut table_state = TableState::default();
-    let mut recovery: Option<Vec<rowd_core::storage::RecoveryEntry>> = None;
-    let mut recovery_index: usize = 0;
-    let mut recovery_table = TableState::default();
+
     loop {
-        if worker.as_ref().is_some_and(|w| w.is_finished()) {
-            worker.take().unwrap().join().ok();
+        if worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
         }
-        if worker.is_none() && home.join(".rowd/device.json").exists() {
-            let home = home.to_path_buf();
-            let tx = tx.clone();
-            let stop = stop.clone();
+        if worker.is_none()
+            && ui
+                .snapshot
+                .device
+                .as_ref()
+                .is_some_and(|device| device.configured)
+        {
+            let worker_home = home.to_path_buf();
+            let worker_stop = stop.clone();
+            let worker_tx = tx.clone();
             worker = Some(std::thread::spawn(move || {
-                if let Err(e) = service::serve(&home, None, false, stop, |s| {
-                    let _ = tx.send(s);
-                }) {
-                    let _ = tx.send(format!("Servidor: {e:#}"));
+                if let Err(error) =
+                    rowd_app::serve(&worker_home, None, false, worker_stop, |message| {
+                        let _ = worker_tx.send(UiEvent::Notice(message));
+                    })
+                {
+                    let _ = worker_tx.send(UiEvent::Notice(format!("Servidor: {error:#}")));
                 }
             }));
         }
         for message in rx.try_iter() {
-            status = message;
+            match message {
+                UiEvent::Notice(message) => ui.notice = message,
+                UiEvent::JobDone(message) => {
+                    ui.job = None;
+                    ui.notice = message;
+                    if let Ok(preferences) = app.load_ui_preferences() {
+                        ui.preferences = preferences.unwrap_or_default();
+                    }
+                    ui.dirty = true;
+                }
+            }
         }
-        let entries = service::status(home).unwrap_or_default();
-        let requests = service::pending_share_requests(home).unwrap_or_default();
-        selected = selected.min(entries.len().saturating_sub(1));
-        request_index = request_index.min(requests.len().saturating_sub(1));
-        terminal.draw(|frame| {
-            let area = frame.area();
-            if let Some(code) = &qr {
-                let width = code.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-                let height = code.lines().count() + 5;
-                let hint = format!("Parear Android · Esc volta · o abre imagem\nQR privado: {}\nSHA-256: {fingerprint}",qr_image.as_ref().map(|p: &PathBuf| p.display().to_string()).unwrap_or_default());
-                let text = if area.width as usize >= width && area.height as usize >= height { format!("{hint}\n{code}") } else { format!("{hint}\n\nAmplie o terminal para {width} × {height} ou pressione o para abrir o QR.\nJSON: rowd pair --address IP:43821 --invite arquivo.json") };
-                frame.render_widget(Paragraph::new(text).wrap(Wrap{trim:false}),area);
-                return;
-            }
-            if let Some(records) = &recovery {
-                let regions = Layout::vertical([Constraint::Min(4),Constraint::Length(3)]).split(area);
-                let rows = records.iter().map(|r| Row::new([r.path.clone(),r.id.clone(),if r.finished {"Preservado".into()} else {"Pendente".into()}]));
-                recovery_table.select(Some(recovery_index));
-                frame.render_stateful_widget(Table::new(rows,[Constraint::Percentage(40),Constraint::Percentage(45),Constraint::Percentage(15)]).header(Row::new(["Caminho","Versão (ID)","Estado"])).row_highlight_style(Style::default().bg(Color::DarkGray)).block(Block::default().title("Versões recuperáveis").borders(Borders::ALL)),regions[0],&mut recovery_table);
-                frame.render_widget(Paragraph::new("↑↓ escolher versão · Enter escolher ação · Esc voltar\nRestaurar conserva a versão atual em outro backup."),regions[1]);
-                return;
-            }
-            let layout = Layout::vertical([Constraint::Length(3),Constraint::Min(5),Constraint::Length(4),Constraint::Length(3),Constraint::Length(4)]).split(area);
-            let paired = DeviceConfig::load(home).ok().and_then(|c| c.peer_device).is_some();
-            frame.render_widget(Paragraph::new(format!("ROWD  /  Seus arquivos, entre seus dispositivos\nAndroid: {}  ·  {} Shares",if paired {"pareado"} else {"aguardando pareamento"},entries.len())).style(Style::default().fg(Color::Green)),layout[0]);
-            let rows = entries.iter().enumerate().map(|(i,s)| Row::new(vec![Cell::from(s.share.name.clone()),Cell::from(format!("{:?}",s.share.mode)),Cell::from(s.pending.to_string()),Cell::from(s.conflicts.len().to_string()),Cell::from(s.last_sync.map(|t| format!("há {}s",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().saturating_sub(t))).unwrap_or_else(|| "Ainda não".into()))]).style(if i == selected { Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD) } else {Style::default()}));
-            table_state.select(Some(selected));
-            frame.render_stateful_widget(Table::new(rows,[Constraint::Percentage(30),Constraint::Percentage(25),Constraint::Percentage(15),Constraint::Percentage(15),Constraint::Percentage(15)]).header(Row::new(["Share","Direção","Pendentes","Conflitos","Última rodada"]).style(Style::default().add_modifier(Modifier::BOLD))).block(Block::default().borders(Borders::TOP|Borders::BOTTOM)),layout[1],&mut table_state);
-            let request_hint = if requests.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\nSolicitações Android (n para alternar): {}",
-                    requests
-                        .iter()
-                        .enumerate()
-                        .map(|(index, request)| format!(
-                            "{}{} ({:?})",
-                            if index == request_index { "→ " } else { "" },
-                            request.name,
-                            request.mode
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                )
-            };
-            let detail = entries.get(selected).map(|s| format!("{} ↔ pasta escolhida no Android\nPendentes: {}\nConflitos: {}\n{}{}",s.share.root.display(),s.pending_paths.iter().take(3).cloned().collect::<Vec<_>>().join(", "),s.conflicts.iter().take(3).cloned().collect::<Vec<_>>().join(", "),s.error.as_deref().unwrap_or(""),request_hint)).unwrap_or_else(|| format!("Nenhum Share cadastrado. Pressione a para adicionar uma pasta.\n{status}{request_hint}"));
-            frame.render_widget(Paragraph::new(detail).wrap(Wrap{trim:false}),layout[2]);
-            frame.render_widget(Paragraph::new(status.clone()).wrap(Wrap{trim:false}),layout[3]);
-            let footer = if let Some(wizard) = &share_wizard {
-            format!("{}\n> {}\nEnter confirma · Esc cancela", wizard.prompt(), match wizard.step { 0 => &wizard.name, 1 => &wizard.folder, _ => &wizard.mode })
-            } else if let Some((action,text)) = &input {
-                let label = match action {
-                    'p' => "Endereço do PC (IP:43821)",
-                    'a' => "Nome | pasta absoluta | modo (bidirectional/to_android/to_pc)",
-                    'e' => "Nome | pasta absoluta | modo",
-                    'd' => "Digite REMOVER para desvincular; arquivos e recovery serão mantidos",
-                    'r' => "Recovery: ID | keep/restore/export | destino de exportação",
-                    'c' => "Pasta local para aceitar a solicitação Android",
-                    _ => "Entrada",
-                };
-                format!("{label}\n> {text}\nEnter confirma · Esc cancela")
-            } else { "↑↓ escolher  p parear  a adicionar  e editar  d remover\nn alternar solicitação Android  c aceitar pasta\ns sincronizar agora  v verificar tudo  r recovery  q sair".into() };
-            frame.render_widget(Paragraph::new(footer).wrap(Wrap{trim:false}),layout[4]);
-        })?;
+        ui.refresh(&app);
+        terminal.draw(|frame| ui.render(frame))?;
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
@@ -177,300 +1656,426 @@ pub fn run(home: &Path) -> Result<()> {
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if qr.is_some() {
-            if key.code == KeyCode::Esc {
-                qr = None;
-            }
-            if key.code == KeyCode::Char('o') {
-                if let Some(path) = &qr_image {
-                    if let Err(e) = std::process::Command::new("xdg-open")
-                        .arg(path)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                    {
-                        status = format!("Não foi possível abrir QR: {e}");
-                        qr = None;
-                    }
-                }
-            }
-            continue;
-        }
-        if let Some(records) = &recovery {
-            match key.code {
-                KeyCode::Esc => recovery = None,
-                KeyCode::Down => {
-                    recovery_index = (recovery_index + 1).min(records.len().saturating_sub(1))
-                }
-                KeyCode::Up => recovery_index = recovery_index.saturating_sub(1),
-                KeyCode::Enter => {
-                    if let Some(record) = records.get(recovery_index) {
-                        input = Some(('r', format!("{} | keep", record.id)));
-                        status = format!(
-                            "Versão selecionada: {} · {}. Escolha keep, restore ou export.",
-                            record.path, record.id
-                        );
-                    }
-                    recovery = None;
-                }
-                _ => {}
-            }
-            continue;
-        }
-        if let Some(mut wizard) = share_wizard.take() {
-            let mut keep_wizard = true;
-            match key.code {
-                KeyCode::Esc => keep_wizard = false,
-                KeyCode::Backspace => match wizard.step {
-                    0 => {
-                        wizard.name.pop();
-                    }
-                    1 => {
-                        wizard.folder.pop();
-                    }
-                    _ => {
-                        wizard.mode.pop();
-                    }
-                },
-                KeyCode::Char(c) => match wizard.step {
-                    0 => wizard.name.push(c),
-                    1 => wizard.folder.push(c),
-                    _ => wizard.mode.push(c),
-                },
-                KeyCode::Enter => match wizard.step {
-                    0 if wizard.name.trim().is_empty() => {
-                        status = "Informe um nome para o Share.".into()
-                    }
-                    0 => wizard.step = 1,
-                    1 if wizard.folder.trim().is_empty() => {
-                        status = "Informe o caminho da pasta.".into()
-                    }
-                    1 => wizard.step = 2,
-                    _ => {
-                        let mode = match wizard.mode.trim() {
-                            "1" => Ok(rowd_core::config::SyncMode::Bidirectional),
-                            "2" => Ok(rowd_core::config::SyncMode::ToAndroid),
-                            "3" => Ok(rowd_core::config::SyncMode::ToPc),
-                            _ => Err(anyhow::anyhow!("Escolha 1, 2 ou 3.")),
-                        };
-                        match mode {
-                            Ok(mode) => {
-                                let result = service::update(home, |cfg| {
-                                    cfg.add_share(
-                                        home,
-                                        wizard.name.trim().into(),
-                                        wizard.folder.trim().into(),
-                                        None,
-                                        mode,
-                                    )?;
-                                    Ok(())
-                                });
-                                status = match result {
-                                    Ok(()) => "Share cadastrado.".into(),
-                                    Err(error) => format!("{error:#}"),
-                                };
-                                keep_wizard = false;
-                            }
-                            Err(error) => status = error.to_string(),
-                        }
-                    }
-                },
-                _ => {}
-            }
-            if keep_wizard {
-                share_wizard = Some(wizard);
-            }
-            continue;
-        }
-        if let Some((action, text)) = &mut input {
-            match key.code {
-                KeyCode::Esc => input = None,
-                KeyCode::Backspace => {
-                    text.pop();
-                }
-                KeyCode::Char(c) => text.push(c),
-                KeyCode::Enter => {
-                    let action = *action;
-                    let text = text.clone();
-                    let request_id = if action == 'c' {
-                        requests
-                            .get(request_index)
-                            .map(|request| request.request_id.clone())
-                    } else {
-                        None
-                    };
-                    input = None;
-                    let result = (|| -> Result<()> {
-                        match action {
-                            'p' => {
-                                let cfg = service::pair(home, text.trim())?;
-                                let (code, image, hash) = pairing_view(home, &cfg)?;
-                                qr = Some(code);
-                                qr_image = Some(image);
-                                fingerprint = hash;
-                            }
-                            'a' | 'e' => {
-                                let parts: Vec<_> = text.split('|').map(str::trim).collect();
-                                anyhow::ensure!(parts.len() == 3, "Use nome | pasta | modo");
-                                let mode = crate::parse_mode(parts[2])?;
-                                service::update(home, |cfg| {
-                                    if action == 'a' {
-                                        cfg.add_share(
-                                            home,
-                                            parts[0].into(),
-                                            PathBuf::from(parts[1]),
-                                            None,
-                                            mode,
-                                        )?;
-                                    } else {
-                                        let mut s = entries
-                                            .get(selected)
-                                            .context("Selecione um Share")?
-                                            .share
-                                            .clone();
-                                        s.name = parts[0].into();
-                                        s.root = parts[1].into();
-                                        s.mode = mode;
-                                        cfg.put_share(home, s)?;
-                                    }
-                                    Ok(())
-                                })?;
-                            }
-                            'd' => {
-                                anyhow::ensure!(text == "REMOVER", "Remoção cancelada");
-                                let s = &entries.get(selected).context("Selecione um Share")?.share;
-                                service::update(home, |cfg| cfg.remove_share(home, &s.share_id))?;
-                            }
-                            'r' => {
-                                let s = &entries.get(selected).context("Selecione um Share")?.share;
-                                let mut store = LocalStore::open_recovery(&s.root)?;
-                                let parts: Vec<_> = text.split('|').map(str::trim).collect();
-                                anyhow::ensure!(
-                                    parts.len() >= 2,
-                                    "Informe ID | ação | destino opcional"
-                                );
-                                store.resolve_recovery(
-                                    parts[0],
-                                    parts[1],
-                                    parts.get(2).filter(|p| !p.is_empty()).map(Path::new),
-                                )?;
-                            }
-                            'c' => {
-                                let request_id = request_id.context("Selecione uma solicitação")?;
-                                anyhow::ensure!(
-                                    !text.trim().is_empty(),
-                                    "Informe o caminho da pasta"
-                                );
-                                service::accept_share_request(
-                                    home,
-                                    &request_id,
-                                    Path::new(text.trim()),
-                                )?;
-                            }
-                            _ => {}
-                        }
-                        Ok(())
-                    })();
-                    status = match result {
-                        Ok(()) => "Configuração salva".into(),
-                        Err(e) => format!("{e:#}"),
-                    };
-                }
-                _ => {}
-            }
-            continue;
-        }
-        match key.code {
-            KeyCode::Char('q') => break,
-            KeyCode::Down => selected = (selected + 1).min(entries.len().saturating_sub(1)),
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Char('p') => match DeviceConfig::load(home) {
-                Ok(cfg) => {
-                    let port = cfg
-                        .address
-                        .parse::<std::net::SocketAddr>()
-                        .map(|address| address.port())
-                        .unwrap_or(43821);
-                    match service::pair(home, &format!("0.0.0.0:{port}"))
-                        .and_then(|cfg| pairing_view(home, &cfg))
-                    {
-                        Ok((code, image, hash)) => {
-                            qr = Some(code);
-                            qr_image = Some(image);
-                            fingerprint = hash;
-                            status =
-                                "QR de pareamento pronto. Pressione o para abrir a imagem.".into();
-                        }
-                        Err(error) => status = format!("Não foi possível gerar o QR: {error:#}"),
-                    }
-                }
-                Err(_) => input = Some(('p', String::new())),
-            },
-            KeyCode::Char('a') => {
-                share_wizard = Some(ShareWizard {
-                    step: 0,
-                    name: String::new(),
-                    folder: String::new(),
-                    mode: String::new(),
-                })
-            }
-            KeyCode::Char('e') => {
-                if let Some(s) = entries.get(selected) {
-                    input = Some((
-                        'e',
-                        format!(
-                            "{} | {} | {}",
-                            s.share.name,
-                            s.share.root.display(),
-                            match s.share.mode {
-                                rowd_core::config::SyncMode::Bidirectional => "bidirectional",
-                                rowd_core::config::SyncMode::ToAndroid => "to_android",
-                                rowd_core::config::SyncMode::ToPc => "to_pc",
-                            }
-                        ),
-                    ));
-                }
-            }
-            KeyCode::Char('d') => input = Some(('d', String::new())),
-            KeyCode::Char('n') if !requests.is_empty() => {
-                request_index = (request_index + 1) % requests.len();
-                status = format!("Solicitação selecionada: {}", requests[request_index].name);
-            }
-            KeyCode::Char('c') if !requests.is_empty() => {
-                status = format!(
-                    "Aceitando {}. Informe a pasta do PC e use pwd para copiar o caminho.",
-                    requests[request_index].name
-                );
-                input = Some(('c', String::new()));
-            }
-            KeyCode::Char('r') => {
-                if let Some(s) = entries.get(selected) {
-                    match LocalStore::open_recovery(&s.share.root)
-                        .and_then(|s| s.recovery_entries())
-                    {
-                        Ok(list) => {
-                            if list.is_empty() {
-                                status = "Nenhuma versão recuperável neste Share".into();
-                            } else {
-                                recovery_index = 0;
-                                recovery = Some(list);
-                            }
-                        }
-                        Err(e) => status = format!("{e:#}"),
-                    }
-                }
-            }
-            KeyCode::Char(c @ ('s' | 'v')) => {
-                let home = home.to_path_buf();
-                let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let message=match service::scan(&home,c=='v') {Ok(())=>"Manifestos atualizados. Aguardando a próxima conexão do Android (ative o modo automático).".into(),Err(e)=>format!("{e:#}")};
-                    let _ = tx.send(message);
-                });
-            }
-            _ => {}
+        if ui.handle_key(key, &app, &tx)? {
+            break;
         }
     }
+
     stop.store(true, Ordering::Relaxed);
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
     Ok(())
+}
+
+fn body_panels(area: Rect) -> [Rect; 2] {
+    let (direction, constraints) = if area.width >= 110 {
+        (
+            Direction::Horizontal,
+            [Constraint::Percentage(38), Constraint::Percentage(62)],
+        )
+    } else if area.width >= 80 {
+        (
+            Direction::Horizontal,
+            [Constraint::Percentage(44), Constraint::Percentage(56)],
+        )
+    } else {
+        (
+            Direction::Vertical,
+            [Constraint::Percentage(43), Constraint::Percentage(57)],
+        )
+    };
+    let regions = Layout::default()
+        .direction(direction)
+        .constraints(constraints)
+        .split(area);
+    [regions[0], regions[1]]
+}
+
+fn render_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    items: Vec<ListItem<'_>>,
+    selected: usize,
+) {
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(format!(" {title} "))
+                    .borders(Borders::ALL),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(ACCENT_DARK)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› "),
+        area,
+        &mut state,
+    );
+}
+
+fn render_detail(frame: &mut Frame<'_>, area: Rect, title: &str, text: String) {
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(format!(" {title} "))
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal, preferences: &UiPreferences) {
+    match modal {
+        Modal::Help => {
+            let popup = centered(area, 92, 32);
+            frame.render_widget(Clear, popup);
+            let mut lines = vec![
+                "Navegação global".to_string(),
+                "1..5 abre aba · Tab/Shift+Tab alterna · ↑↓ seleciona · Esc fecha · q sai".into(),
+                String::new(),
+            ];
+            for tab in Tab::ALL {
+                lines.push(tab.title().to_uppercase());
+                lines.push(
+                    BINDINGS
+                        .iter()
+                        .filter(|binding| binding.tab == tab)
+                        .map(|binding| {
+                            format!(
+                                "{} {}",
+                                display_key(preferences.key(binding.action)),
+                                binding.label
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ·  "),
+                );
+                lines.push(String::new());
+            }
+            frame.render_widget(
+                Paragraph::new(lines.join("\n"))
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .title(" Ajuda · Esc fecha ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(ACCENT)),
+                    ),
+                popup,
+            );
+        }
+        Modal::Qr(info) => {
+            let qr_width = info
+                .qr
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0) as u16;
+            let qr_height = info.qr.lines().count() as u16;
+            let desired_width = qr_width.saturating_add(6).max(54);
+            let desired_height = qr_height.saturating_add(9).max(16);
+            let popup = centered(area, desired_width, desired_height);
+            frame.render_widget(Clear, popup);
+            let fits = popup.width >= qr_width.saturating_add(4)
+                && popup.height >= qr_height.saturating_add(7);
+            let body = if fits {
+                format!(
+                    "Leia no Android\n{}\nFingerprint SHA-256\n{}\nSVG privado: {}",
+                    info.qr,
+                    info.fingerprint,
+                    info.qr_image.display()
+                )
+            } else {
+                format!(
+                    "O terminal está pequeno para este QR.\nAmplie para cerca de {} × {}.\n\nFingerprint SHA-256\n{}\n\nFallback SVG\n{}",
+                    desired_width,
+                    desired_height,
+                    info.fingerprint,
+                    info.qr_image.display()
+                )
+            };
+            frame.render_widget(
+                Paragraph::new(body).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .title(" Pareamento · Esc fecha ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT)),
+                ),
+                popup,
+            );
+        }
+        Modal::Input(input) => {
+            let height = if input.value.contains('\n') { 16 } else { 9 };
+            let popup = centered(area, 76, height);
+            frame.render_widget(Clear, popup);
+            let shown = if input.secret {
+                "•".repeat(input.value.chars().count())
+            } else {
+                input.value.clone()
+            };
+            let body = format!(
+                "{}\n\n> {}\n\nEnter confirma · Esc cancela",
+                input.hint, shown
+            );
+            frame.render_widget(
+                Paragraph::new(body).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .title(format!(" {} ", input.title))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(WARNING)),
+                ),
+                popup,
+            );
+        }
+    }
+}
+
+fn centered(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
+    let width = desired_width.min(area.width.saturating_sub(2)).max(1);
+    let height = desired_height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn share_detail(status: &Status) -> String {
+    let pending = if status.pending_paths.is_empty() {
+        "nenhum".into()
+    } else {
+        status
+            .pending_paths
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
+    let conflicts = if status.conflicts.is_empty() {
+        "nenhum".into()
+    } else {
+        status
+            .conflicts
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
+    let last_error = status
+        .last_error
+        .as_ref()
+        .map(|error| {
+            format!(
+                "{} · {}\n{}\n{}",
+                timestamp_label(Some(error.at)),
+                error.operation,
+                error.message,
+                error
+                    .resolved_at
+                    .map(|at| format!("resolvido {}", timestamp_label(Some(at))))
+                    .unwrap_or_else(|| "não resolvido".into())
+            )
+        })
+        .or_else(|| status.error.clone())
+        .unwrap_or_else(|| "nenhum".into());
+    format!(
+        "{}\n\nEstado\n{}\n\nRaiz PC\n{} · {}\n\nPasta Android\n{}\n\nModo\n{}\n\nÚltimo sync\n{}\n\nPendências ({})\n  {}\n\nConflitos ({})\n  {}\n\nÚltimo erro\n{}",
+        status.share.name,
+        if status.share.enabled { "ativo" } else { "pausado" },
+        status.share.root.display(),
+        if status.root_available { "disponível" } else { "indisponível" },
+        if status.share.android_path.is_empty() { "aguardando seleção no Android" } else { &status.share.android_path },
+        mode_label(status.share.mode),
+        timestamp_label(status.last_sync),
+        status.pending,
+        pending,
+        status.conflicts.len(),
+        conflicts,
+        last_error
+    )
+}
+
+fn share_form(value: &str) -> Result<(String, PathBuf, SyncMode)> {
+    let parts = split_fields(value, 3, "nome | pasta | modo")?;
+    anyhow::ensure!(!parts[0].is_empty(), "informe o nome");
+    anyhow::ensure!(!parts[1].is_empty(), "informe a pasta");
+    Ok((
+        parts[0].into(),
+        PathBuf::from(parts[1]),
+        crate::parse_mode(parts[2])?,
+    ))
+}
+
+fn split_fields<'a>(value: &'a str, expected: usize, format: &str) -> Result<Vec<&'a str>> {
+    let parts = value.split('|').map(str::trim).collect::<Vec<_>>();
+    anyhow::ensure!(parts.len() == expected, "use {format}");
+    Ok(parts)
+}
+
+fn require_token(value: &str, expected: &str) -> Result<()> {
+    anyhow::ensure!(
+        value.trim() == expected,
+        "confirmação não corresponde a {expected}"
+    );
+    Ok(())
+}
+
+fn required_path(value: &str) -> Result<&Path> {
+    anyhow::ensure!(!value.trim().is_empty(), "informe o caminho");
+    Ok(Path::new(value.trim()))
+}
+
+fn clamp_index(index: usize, len: usize) -> usize {
+    index.min(len.saturating_sub(1))
+}
+
+fn mode_label(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::Bidirectional => "bidirecional",
+        SyncMode::ToAndroid => "PC → Android",
+        SyncMode::ToPc => "Android → PC",
+    }
+}
+
+fn mode_value(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::Bidirectional => "bidirectional",
+        SyncMode::ToAndroid => "to_android",
+        SyncMode::ToPc => "to_pc",
+    }
+}
+
+fn request_state(state: ShareRequestState) -> &'static str {
+    match state {
+        ShareRequestState::Pending => "PENDENTE",
+        ShareRequestState::Accepted => "ACEITA",
+        ShareRequestState::Rejected => "REJEITADA",
+        ShareRequestState::Cancelled => "CANCELADA",
+    }
+}
+
+fn timestamp_label(timestamp: Option<u64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "ainda não".into();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let elapsed = now.saturating_sub(timestamp);
+    if elapsed < 60 {
+        format!("há {elapsed}s")
+    } else if elapsed < 3600 {
+        format!("há {}min", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("há {}h", elapsed / 3600)
+    } else {
+        format!("há {}d", elapsed / 86_400)
+    }
+}
+
+fn short_id(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= 18 {
+        value.into()
+    } else {
+        format!(
+            "{}…{}",
+            characters[..10].iter().collect::<String>(),
+            characters[characters.len() - 6..]
+                .iter()
+                .collect::<String>()
+        )
+    }
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if width < 4 {
+        return String::new();
+    }
+    if value.chars().count() <= width {
+        value.into()
+    } else {
+        value.chars().take(width - 1).collect::<String>() + "…"
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "sim"
+    } else {
+        "não"
+    }
+}
+
+fn display_key(value: &str) -> String {
+    match value {
+        "space" => "Espaço".into(),
+        "enter" => "Enter".into(),
+        value => value.into(),
+    }
+}
+
+fn short_action(value: &str) -> &str {
+    value
+        .strip_suffix(" Share")
+        .or_else(|| value.strip_suffix(" solicitação"))
+        .or_else(|| value.strip_suffix(" versão"))
+        .unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_changes_at_the_two_breakpoints() {
+        let wide = body_panels(Rect::new(0, 0, 120, 30));
+        let medium = body_panels(Rect::new(0, 0, 90, 30));
+        let narrow = body_panels(Rect::new(0, 0, 70, 30));
+        assert_eq!(wide[0].y, wide[1].y);
+        assert_eq!(medium[0].y, medium[1].y);
+        assert!(narrow[1].y > narrow[0].y);
+    }
+
+    #[test]
+    fn keymap_uses_persisted_contextual_override() {
+        let mut preferences = UiPreferences::default();
+        preferences.set_key(UiAction::AddShare, "c").unwrap();
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(matches!(
+            KeyMap::resolve(key, Tab::Shares, &preferences),
+            Some(KeyCommand::Action(UiAction::AddShare))
+        ));
+        assert!(KeyMap::resolve(key, Tab::Device, &preferences).is_none());
+    }
+
+    #[test]
+    fn reserved_or_duplicate_keys_are_rejected() {
+        let mut preferences = UiPreferences::default();
+        assert!(preferences.set_key(UiAction::AddShare, "q").is_err());
+        assert!(preferences.set_key(UiAction::AddShare, "e").is_err());
+    }
 }
