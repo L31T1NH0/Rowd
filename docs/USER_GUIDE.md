@@ -1,5 +1,8 @@
 # Rowd user guide
 
+> [!WARNING]
+> **Unstable alpha (0.5.0).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+
 Rowd links one Linux PC and one Android phone over a local network. A **Share** connects one folder on each device. You can create several Shares and set a direction for each one.
 
 This guide describes Rowd 0.5.0 and network protocol V8. Update the Linux binary and Android APK together. The Android app currently uses Portuguese button labels; this guide quotes them so you can find them on screen.
@@ -134,7 +137,7 @@ The desktop terminal app has a **Recovery** tab. The CLI can list records and ac
 
 Restoring a version preserves the displaced version. Exporting does not overwrite an existing destination.
 
-The project remains experimental. The Rust tests and Android build run in CI, but they do not cover every physical Android provider, long background sessions, or all interruption points on a real phone. Start with folders you can replace, and keep an independent copy of important files.
+The Rust tests and Android build run in CI, but they do not cover every physical Android provider, long background sessions, or all interruption points on a real phone.
 
 ## Configuration and backups
 

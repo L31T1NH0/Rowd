@@ -1,12 +1,15 @@
 # <img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="40"> Rowd
 
+> [!WARNING]
+> **Unstable alpha (0.5.0).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+
 Rowd syncs folders between one Linux PC and one Android phone on the same local network. You choose which folders connect and whether files travel both ways, to Android, or to the PC. The devices transfer files over TLS without a cloud account or relay.
 
-**Rowd 0.5.0 is experimental.** The Rust test suite and Android build pass, and the app has seen use on a real device. We have not documented a full test matrix across Android storage providers, long sessions, network failures, and recovery. Start with disposable folders and keep a separate copy of important files.
+The Rust test suite and Android build pass, and the app has seen use on a real device. We have not documented a full test matrix across Android storage providers, long sessions, network failures, and recovery.
 
 ## Get Rowd
 
-Download both files from the [latest release](https://github.com/L31T1NH0/Rowd/releases/latest):
+Download both files from the [0.5.0 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.5.0):
 
 | Device | File |
 | --- | --- |
