@@ -14,5 +14,5 @@ rustup target add aarch64-linux-android
 cargo build --release -p rowd-android --target aarch64-linux-android
 mkdir -p android/app/src/main/jniLibs/arm64-v8a
 cp target/aarch64-linux-android/release/librowd_android.so android/app/src/main/jniLibs/arm64-v8a/
-"$rowd_root/.toolchain/gradle-8.9/bin/gradle" -p android assembleDebug --console=plain
-echo "APK: $rowd_root/android/app/build/outputs/apk/debug/app-debug.apk"
+"$rowd_root/.toolchain/gradle-8.9/bin/gradle" -p android assembleRelease --console=plain
+echo "APK: $rowd_root/android/app/build/outputs/apk/release/app-release.apk"

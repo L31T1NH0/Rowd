@@ -1,7 +1,7 @@
 # <img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="40"> Rowd
 
 > [!WARNING]
-> **Unstable alpha (0.5.0).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+> **Unstable alpha (0.5.1).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
 
 Rowd syncs folders between one Linux PC and one Android phone on the same local network. You choose which folders connect and whether files travel both ways, to Android, or to the PC. The devices transfer files over TLS without a cloud account or relay.
 
@@ -9,20 +9,20 @@ The Rust test suite and Android build pass, and the app has seen use on a real d
 
 ## Get Rowd
 
-Download both files from the [0.5.0 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.5.0):
+Download both files from the [0.5.1 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.5.1):
 
 | Device | File |
 | --- | --- |
-| Linux x86_64 | `rowd-v0.5.0-linux-x86_64` |
-| Android 8 or newer, ARM64 | `rowd-v0.5.0-android-arm64.apk` |
+| Linux x86_64 | `rowd-v0.5.1-linux-x86_64` |
+| Android 8 or newer, ARM64 | `rowd-v0.5.1-android-arm64.apk` |
 
-The release includes `rowd-v0.5.0-SHA256SUMS` so you can check both downloads. The APK uses a debug signing key. Update the PC binary and APK together: version 0.5.0 uses network protocol V8 and rejects older peers.
+The release includes `rowd-v0.5.1-SHA256SUMS` so you can check both downloads. The Android release APK is signed with the debug key. Update the PC binary and APK together: version 0.5.1 uses network protocol V8 and rejects older peers.
 
 On Linux, make the downloaded binary executable and start it:
 
 ```bash
-chmod +x rowd-v0.5.0-linux-x86_64
-./rowd-v0.5.0-linux-x86_64
+chmod +x rowd-v0.5.1-linux-x86_64
+./rowd-v0.5.1-linux-x86_64
 ```
 
 Keep both devices on the same LAN. The phone must reach TCP port `43821` on the PC.
@@ -36,6 +36,10 @@ Keep both devices on the same LAN. The phone must reach TCP port `43821` on the 
 5. Leave Rowd running on both devices while you want changes to sync.
 
 The Android buttons still use Portuguese labels. You can also create a Share on the PC and bind its Android folder with **Vincular pasta a Share pendente**. The [user guide](docs/USER_GUIDE.md) covers both paths and the CLI.
+
+## Performance trace
+
+For synchronization diagnostics, run `rowd run --trace` on the PC. In the terminal app, press `t` on the **Device** tab to toggle tracing. On Android, enable **Trace de desempenho** on the main screen. Each device writes its own trace; use **Exportar trace** on Android to save both Android traces in a ZIP. See the [trace guide](docs/USER_GUIDE.md#performance-trace) for file locations and details.
 
 ## What happens to your files
 

@@ -1,21 +1,21 @@
 # Rowd user guide
 
 > [!WARNING]
-> **Unstable alpha (0.5.0).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+> **Unstable alpha (0.5.1).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
 
 Rowd links one Linux PC and one Android phone over a local network. A **Share** connects one folder on each device. You can create several Shares and set a direction for each one.
 
-This guide describes Rowd 0.5.0 and network protocol V8. Update the Linux binary and Android APK together. The Android app currently uses Portuguese button labels; this guide quotes them so you can find them on screen.
+This guide describes Rowd 0.5.1 and network protocol V8. Update the Linux binary and Android APK together. The Android app currently uses Portuguese button labels; this guide quotes them so you can find them on screen.
 
 ## Install and pair
 
-Download `rowd-v0.5.0-linux-x86_64` and `rowd-v0.5.0-android-arm64.apk` from the [0.5.0 release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.5.0). The APK supports Android 8 or newer on ARM64 and uses a debug signing key. Use the release's `SHA256SUMS` file if you want to verify the downloads.
+Download `rowd-v0.5.1-linux-x86_64` and `rowd-v0.5.1-android-arm64.apk` from the [0.5.1 release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.5.1). The Android release APK supports Android 8 or newer on ARM64 and is signed with the debug key. Use the release's `SHA256SUMS` file if you want to verify the downloads.
 
 On Linux:
 
 ```bash
-chmod +x rowd-v0.5.0-linux-x86_64
-./rowd-v0.5.0-linux-x86_64
+chmod +x rowd-v0.5.1-linux-x86_64
+./rowd-v0.5.1-linux-x86_64
 ```
 
 The terminal app starts the server. Keep it open and allow the phone to reach TCP port `43821` on the PC. Both devices need to be on the same LAN.
@@ -156,6 +156,20 @@ Complete backups use PBKDF2-HMAC-SHA256 and AES-256-GCM. The diagnostic report o
 
 For a reset, run `./rowd reset --level initial --confirm`. The available levels are `share`, `unlink`, `initial`, and `all`; read the command's help before choosing one.
 
+## Performance trace
+
+Enable tracing on both devices while reproducing a slow sync. On the PC, start the server with:
+
+```bash
+./rowd run --trace
+```
+
+This writes `performance-trace-pc.jsonl` under the Rowd home directory, inside `.rowd/`. In the terminal app, the **Device** tab's `t` key toggles tracing for later operations; the row shows whether it is on. Stopping `rowd run --trace` flushes and closes the file.
+
+On Android, turn on **Trace de desempenho** on the main screen. The preference survives service restarts. Tap **Exportar trace** and choose a destination to save a ZIP containing `performance-trace-android-kotlin.jsonl` and `performance-trace-android-rust.jsonl`. Turning tracing off flushes both files.
+
+The traces use JSON Lines. `elapsed_us` gives event order within that device; `wall_ms` helps align the two device timelines approximately. Compare matching `file_id` values to follow a file without logging its path. The trace records sync, peer wait, transfer, install, state persistence, and Android SAF phases. It complements the aggregate Share metrics.
+
 ## Upgrade an older installation
 
 Stop old processes and update both devices. Protocol V8 rejects older network peers. Rowd can migrate V1 data from a folder root:
@@ -177,4 +191,4 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked
 ```
 
-Android requires JDK 17, SDK 35, NDK 27.2, and Gradle 8.9. `scripts/build-android.sh` builds the ARM64 Rust library and a debug APK using the local `.toolchain/` directory. GitHub Actions runs the same Rust and Android compilation paths on pushes and pull requests.
+Android requires JDK 17, SDK 35, NDK 27.2, and Gradle 8.9. `scripts/build-android.sh` builds the ARM64 Rust library and a release APK signed with the debug key using the local `.toolchain/` directory. GitHub Actions runs the Rust and Android debug compilation paths on pushes and pull requests.
