@@ -129,7 +129,7 @@ Também é possível administrar Shares, dispositivo, recovery, backups e diagn�
 
 ## Estado atual
 
-**V6 · 0.5.0**
+**Protocolo V8 · Rowd 0.5.0**
 
 A versão atual suporta:
 
@@ -597,7 +597,7 @@ Pare processos antigos e atualize PC e APK juntos.
 ./rowd
 ```
 
-A migração reutiliza credenciais, identidade Android, ID da pasta e estado-base. O protocolo de rede V6 exige atualizar o PC e o APK juntos.
+A migração reutiliza credenciais, identidade Android, ID da pasta e estado-base. O protocolo de rede V8 exige atualizar o PC e o APK juntos.
 
 Shares antigos que dependiam de destino Android inferido ficam pausados até uma pasta explícita ser escolhida.
 
