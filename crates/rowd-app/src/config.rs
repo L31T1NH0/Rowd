@@ -1,18 +1,19 @@
 use anyhow::{ensure, Context, Result};
+use fs2::FileExt;
 use rowd_core::{
     config::{ShareConfig, ShareRequest, SyncMode},
-    model::validate_path,
     random_id,
     storage::atomic_json,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const CURRENT_DEVICE_VERSION: u32 = 3;
+pub const CURRENT_DEVICE_VERSION: u32 = 8;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceConfig {
@@ -20,32 +21,226 @@ pub struct DeviceConfig {
     pub address: String,
     pub listen: String,
     pub pair_id: String,
-    pub folder_id: String,
     pub cert: String,
     pub key: String,
     pub secret: String,
     #[serde(default, alias = "peer_root")]
     pub peer_device: Option<String>,
     pub shares: Vec<ShareConfig>,
-    pub removed: Vec<String>,
     #[serde(default)]
     pub share_requests: Vec<ShareRequest>,
     #[serde(default)]
+    pub rejected_requests: Vec<ShareRequest>,
+    #[serde(default)]
     pub sync_paused: bool,
+    #[serde(default)]
+    pub pending_unlink: bool,
+    #[serde(default)]
+    pub import_generation: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ImportTransaction {
+    pub generation: String,
+    pub had_state: bool,
+}
+
+pub(crate) fn import_transaction_path(home: &Path) -> PathBuf {
+    home.join(".rowd/import-transaction.json")
+}
+
+pub(crate) fn recover_import(home: &Path) -> Result<()> {
+    let marker = import_transaction_path(home);
+    if !marker.exists() {
+        return Ok(());
+    }
+    let transaction: ImportTransaction = serde_json::from_reader(File::open(&marker)?)?;
+    rowd_core::model::validate_hash(&transaction.generation)?;
+    let state = home.join(".rowd/shares");
+    let archived = home
+        .join(".rowd")
+        .join(format!("shares-before-import-{}", transaction.generation));
+    let configured: DeviceConfig =
+        serde_json::from_reader(File::open(home.join(".rowd/device.json"))?)?;
+    if configured.import_generation.as_deref() == Some(&transaction.generation) {
+        ensure!(state.is_dir(), "imported Share state is missing");
+    } else if archived.exists() {
+        if state.exists() {
+            fs::rename(
+                &state,
+                home.join(".rowd")
+                    .join(format!("shares-aborted-import-{}", transaction.generation)),
+            )?;
+        }
+        fs::rename(&archived, &state)?;
+    } else if transaction.had_state {
+        ensure!(state.is_dir(), "previous Share state is missing");
+    } else if state.exists() {
+        fs::rename(
+            &state,
+            home.join(".rowd")
+                .join(format!("shares-aborted-import-{}", transaction.generation)),
+        )?;
+    }
+    fs::remove_file(marker)?;
+    #[cfg(unix)]
+    File::open(home.join(".rowd"))?.sync_all()?;
+    Ok(())
+}
+
+fn migrate_legacy_ignore(root: &Path, legacy: &str) -> Result<()> {
+    rowd_core::ignore::Ignore::validate(legacy)?;
+    ensure!(
+        !fs::symlink_metadata(root)?.file_type().is_symlink(),
+        "Share root changed during ignore migration"
+    );
+    let path = root.join(".rowdignore");
+    match fs::symlink_metadata(&path) {
+        Ok(meta) => ensure!(
+            !meta.file_type().is_symlink(),
+            "symlink .rowdignore cannot be migrated"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let current = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    rowd_core::ignore::Ignore::validate(&current)?;
+    let mut combined = current.clone();
+    let mut known = current
+        .lines()
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    for rule in legacy
+        .lines()
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && !rule.starts_with('#'))
+    {
+        if known.insert(rule.to_owned()) {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(rule);
+            combined.push('\n');
+        }
+    }
+    rowd_core::ignore::Ignore::validate(&combined)?;
+    if combined != current {
+        let private = root.join(".rowd");
+        if private.exists() {
+            ensure!(
+                !fs::symlink_metadata(&private)?.file_type().is_symlink(),
+                "symlink metadata directory"
+            );
+        }
+        let backup_dir = private.join("ignore-backups");
+        match fs::symlink_metadata(&backup_dir) {
+            Ok(meta) => ensure!(
+                !meta.file_type().is_symlink(),
+                "symlink ignore backup directory"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let backup = backup_dir.join(format!(
+            "before-migration-{}.txt",
+            hex::encode(Sha256::digest(current.as_bytes()))
+        ));
+        if path.exists() && !backup.exists() {
+            rowd_core::storage::atomic_write(&backup, current.as_bytes())?;
+        }
+        rowd_core::storage::atomic_write(&path, combined.as_bytes())?;
+    }
+    Ok(())
 }
 
 impl DeviceConfig {
     pub fn load(home: &Path) -> Result<Self> {
+        if import_transaction_path(home).exists() {
+            let locks = home.join(".rowd-locks");
+            fs::create_dir_all(&locks)?;
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(locks.join("config.lock"))?;
+            lock.try_lock_exclusive()
+                .context("backup import in progress")?;
+            recover_import(home)?;
+        }
         let path = home.join(".rowd/device.json");
-        let mut config: Self = serde_json::from_reader(
+        let mut raw: serde_json::Value = serde_json::from_reader(
             File::open(&path).context("Pareie o dispositivo primeiro (rowd pair)")?,
         )?;
+        let version = raw
+            .get("version")
+            .and_then(|value| value.as_u64())
+            .context("invalid device configuration version")?;
+        let mut requests_migrated = false;
+        if version <= 7 {
+            let mut pending = Vec::new();
+            let mut rejected = raw
+                .get("rejected_requests")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let requests = raw
+                .as_object_mut()
+                .context("invalid device configuration")?
+                .entry("share_requests")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .context("invalid Share request list")?;
+            for mut request in std::mem::take(requests) {
+                let state = request
+                    .as_object_mut()
+                    .context("invalid Share request")?
+                    .remove("state");
+                if state.is_some() {
+                    requests_migrated = true;
+                }
+                match state.as_ref().and_then(|value| value.as_str()).unwrap_or("pending") {
+                    "pending" => pending.push(request),
+                    "rejected" => rejected.push(request),
+                    _ => anyhow::bail!("ambiguous legacy Share request state; resolve it with the original Rowd version"),
+                }
+            }
+            raw["share_requests"] = serde_json::Value::Array(pending);
+            raw["rejected_requests"] = serde_json::Value::Array(rejected);
+        }
+        let mut config: Self = serde_json::from_value(raw)?;
         match config.version {
-            CURRENT_DEVICE_VERSION => {}
-            2 => {
-                backup_config(home, "migration-v2")?;
-                config.version = CURRENT_DEVICE_VERSION;
-                config.save(home)?;
+            CURRENT_DEVICE_VERSION | 2..=7 => {
+                let previous_version = config.version;
+                let mut changed = requests_migrated;
+                for share in &mut config.shares {
+                    if share.remap_policy.is_some() && share.binding_revision == 0 {
+                        share.binding_revision = 1;
+                        changed = true;
+                    }
+                    if !share.legacy_ignore.is_empty() && share.root.is_dir() {
+                        migrate_legacy_ignore(&share.root, &share.legacy_ignore)?;
+                        share.legacy_ignore.clear();
+                        changed = true;
+                    }
+                }
+                if config
+                    .shares
+                    .iter()
+                    .all(|share| share.legacy_ignore.is_empty())
+                {
+                    config.version = CURRENT_DEVICE_VERSION;
+                    changed |= previous_version != CURRENT_DEVICE_VERSION;
+                }
+                if changed {
+                    backup_config(home, &format!("migration-v{previous_version}"))?;
+                    config.save(home)?;
+                }
             }
             version => anyhow::bail!("unsupported device configuration version {version}"),
         }
@@ -53,6 +248,14 @@ impl DeviceConfig {
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {
+        if self.version == CURRENT_DEVICE_VERSION {
+            ensure!(
+                self.shares
+                    .iter()
+                    .all(|share| share.legacy_ignore.is_empty()),
+                "legacy ignore rules require migration before saving"
+            );
+        }
         atomic_json(&home.join(".rowd/device.json"), self)
     }
 
@@ -67,9 +270,6 @@ impl DeviceConfig {
                 && !share.name.chars().any(char::is_control),
             "invalid Share name"
         );
-        if !share.android_path.is_empty() {
-            validate_path(&share.android_path)?;
-        }
         share.root = share
             .root
             .canonicalize()
@@ -89,10 +289,6 @@ impl DeviceConfig {
         );
         for other in &self.shares {
             if other.share_id == share.share_id {
-                ensure!(
-                    other.android_path == share.android_path || share.remap_policy.is_some(),
-                    "choose a remap policy before changing the Android destination"
-                );
                 continue;
             }
             ensure!(
@@ -100,30 +296,6 @@ impl DeviceConfig {
                 "overlapping Share roots: {}",
                 other.name
             );
-            let first = PathBuf::from(share.android_path.to_lowercase());
-            let second = PathBuf::from(other.android_path.to_lowercase());
-            ensure!(
-                (share.android_path.is_empty() != other.android_path.is_empty())
-                    || (!first.starts_with(&second) && !second.starts_with(&first)),
-                "overlapping Android destinations: {}",
-                other.name
-            );
-        }
-        if !share.android_path.is_empty() {
-            for legacy in self
-                .shares
-                .iter_mut()
-                .filter(|item| item.android_path.is_empty())
-            {
-                let rule = format!("{}/", share.android_path);
-                if !legacy.ignore.lines().any(|line| line == rule) {
-                    ensure!(
-                        !legacy.root.join(&share.android_path).exists(),
-                        "destination collides with legacy content"
-                    );
-                    legacy.ignore.push_str(&format!("\n{rule}"));
-                }
-            }
         }
         if let Some(old) = self
             .shares
@@ -143,22 +315,19 @@ impl DeviceConfig {
         home: &Path,
         name: String,
         root: PathBuf,
-        android_path: Option<String>,
         mode: SyncMode,
     ) -> Result<String> {
         let id = random_id()?;
-        let android_path = android_path.unwrap_or_else(|| name.clone());
-        ensure!(!android_path.is_empty(), "Android destination is required");
         self.put_share(
             home,
             ShareConfig {
                 share_id: id.clone(),
                 name,
                 root,
-                android_path,
+                binding_revision: 0,
                 mode,
                 enabled: true,
-                ignore: String::new(),
+                legacy_ignore: String::new(),
                 request_id: None,
                 remap_policy: None,
             },
@@ -172,9 +341,6 @@ impl DeviceConfig {
             "unknown Share"
         );
         self.shares.retain(|share| share.share_id != id);
-        if !self.removed.iter().any(|removed| removed == id) {
-            self.removed.push(id.into());
-        }
         Ok(())
     }
 }
@@ -229,15 +395,16 @@ mod tests {
             address: String::new(),
             listen: String::new(),
             pair_id: random_id().unwrap(),
-            folder_id: random_id().unwrap(),
             cert: String::new(),
             key: String::new(),
             secret: String::new(),
             peer_device: None,
             shares: Vec::new(),
-            removed: Vec::new(),
             share_requests: Vec::new(),
+            rejected_requests: Vec::new(),
             sync_paused: false,
+            pending_unlink: false,
+            import_generation: None,
         }
     }
 
@@ -252,25 +419,18 @@ mod tests {
         }
         let mut config = config();
         let id = config
-            .add_share(
-                &home,
-                "Fotos".into(),
-                pictures.clone(),
-                None,
-                SyncMode::default(),
-            )
+            .add_share(&home, "Fotos".into(), pictures.clone(), SyncMode::default())
             .unwrap();
         assert!(config
             .add_share(
                 &home,
                 "Camera".into(),
                 pictures.join("Camera"),
-                None,
                 SyncMode::default(),
             )
             .is_err());
         config
-            .add_share(&home, "Docs".into(), documents, None, SyncMode::default())
+            .add_share(&home, "Docs".into(), documents, SyncMode::default())
             .unwrap();
         config.save(&home).unwrap();
         let reloaded = DeviceConfig::load(&home).unwrap();
@@ -296,5 +456,97 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn legacy_ignore_migrates_once_and_waits_for_an_offline_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let root = directory.path().join("share");
+        fs::create_dir_all(home.join(".rowd")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".rowdignore"), "existing/\n").unwrap();
+        let mut config = config();
+        config.version = 6;
+        config
+            .add_share(&home, "Docs".into(), root.clone(), SyncMode::Bidirectional)
+            .unwrap();
+        config.shares[0].legacy_ignore = "secret/\n*.tmp\n".into();
+        config.save(&home).unwrap();
+        let unavailable = directory.path().join("temporarily-offline");
+        fs::rename(&root, &unavailable).unwrap();
+        let waiting = DeviceConfig::load(&home).unwrap();
+        assert_eq!(waiting.version, 6);
+        assert!(!waiting.shares[0].legacy_ignore.is_empty());
+        fs::rename(&unavailable, &root).unwrap();
+        let migrated = DeviceConfig::load(&home).unwrap();
+        assert_eq!(migrated.version, CURRENT_DEVICE_VERSION);
+        assert!(migrated.shares[0].legacy_ignore.is_empty());
+        let policy = fs::read_to_string(root.join(".rowdignore")).unwrap();
+        assert_eq!(policy, "existing/\nsecret/\n*.tmp\n");
+        assert_eq!(
+            fs::read_dir(root.join(".rowd/ignore-backups"))
+                .unwrap()
+                .count(),
+            1
+        );
+        // A crash after writing .rowdignore but before device.json is safe to retry.
+        config.save(&home).unwrap();
+        DeviceConfig::load(&home).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".rowdignore")).unwrap(),
+            policy
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ignore_migration_rejects_symlinked_policy_and_backup_directory() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("share");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(root.join(".rowd")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("policy"), "private/\n").unwrap();
+        symlink(outside.join("policy"), root.join(".rowdignore")).unwrap();
+        assert!(migrate_legacy_ignore(&root, "*.tmp\n").is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("policy")).unwrap(),
+            "private/\n"
+        );
+        fs::remove_file(root.join(".rowdignore")).unwrap();
+        fs::write(root.join(".rowdignore"), "existing/\n").unwrap();
+        symlink(&outside, root.join(".rowd/ignore-backups")).unwrap();
+        assert!(migrate_legacy_ignore(&root, "*.tmp\n").is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rejected_request_migrates_to_temporary_payload_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        fs::create_dir_all(home.join(".rowd")).unwrap();
+        let mut config = config();
+        config.version = 7;
+        config.share_requests.push(ShareRequest {
+            request_id: random_id().unwrap(),
+            name: "Camera".into(),
+            mode: SyncMode::ToPc,
+        });
+        let mut old = serde_json::to_value(&config).unwrap();
+        old["share_requests"][0]["state"] = serde_json::json!("rejected");
+        atomic_json(&home.join(".rowd/device.json"), &old).unwrap();
+        let migrated = DeviceConfig::load(home).unwrap();
+        assert_eq!(migrated.version, CURRENT_DEVICE_VERSION);
+        assert!(migrated.share_requests.is_empty());
+        assert_eq!(migrated.rejected_requests[0].name, "Camera");
+        old["share_requests"][0]["state"] = serde_json::json!("accepted");
+        atomic_json(&home.join(".rowd/device.json"), &old).unwrap();
+        assert!(DeviceConfig::load(home)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("ambiguous legacy"));
     }
 }

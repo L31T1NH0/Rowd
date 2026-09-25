@@ -12,4 +12,4 @@ rowd-core = { path = "../rowd-core" }
 anyhow.workspace = true
 serde_json.workspace = true
 jni = "0.21"
-
+tempfile = "3"

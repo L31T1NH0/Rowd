@@ -2,7 +2,7 @@ mod tui;
 
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
-use rowd_app::{App, ResetLevel};
+use rowd_app::App;
 use rowd_core::config::{RemapPolicy, SyncMode};
 use std::path::PathBuf;
 
@@ -55,19 +55,9 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
-    DeviceSync {
-        #[arg(long)]
-        folder: PathBuf,
-        #[arg(long)]
-        invite: PathBuf,
-        #[arg(long)]
-        watch: bool,
-    },
     Scan,
     Shares,
     Recovery {
-        #[arg(long)]
-        folder: Option<PathBuf>,
         #[arg(long)]
         share: Option<String>,
         #[arg(long)]
@@ -82,40 +72,12 @@ enum Command {
         output: PathBuf,
     },
     Reset {
-        #[arg(long)]
+        #[arg(long, value_parser = ["share", "unlink", "initial", "all"])]
         level: String,
         #[arg(long)]
         share: Option<String>,
         #[arg(long)]
         confirm: bool,
-    },
-    Init {
-        #[arg(long)]
-        folder: PathBuf,
-        #[arg(long)]
-        address: String,
-        #[arg(long)]
-        invite: PathBuf,
-    },
-    Serve {
-        #[arg(long)]
-        folder: PathBuf,
-        #[arg(long, default_value = "0.0.0.0:43821")]
-        listen: String,
-        #[arg(long)]
-        once: bool,
-    },
-    Sync {
-        #[arg(long)]
-        folder: PathBuf,
-        #[arg(long)]
-        invite: PathBuf,
-        #[arg(long)]
-        watch: bool,
-    },
-    Status {
-        #[arg(long)]
-        folder: PathBuf,
     },
 }
 
@@ -126,8 +88,6 @@ enum ShareCommand {
         name: String,
         #[arg(long)]
         folder: PathBuf,
-        #[arg(long)]
-        android: Option<String>,
         #[arg(long, default_value = "bidirectional")]
         mode: String,
     },
@@ -156,8 +116,6 @@ enum ShareCommand {
     },
     Remap {
         id: String,
-        #[arg(long)]
-        android: String,
         #[arg(long)]
         policy: String,
     },
@@ -190,6 +148,10 @@ enum DeviceCommand {
     Pause,
     Resume,
     Unlink {
+        #[arg(long)]
+        confirm: bool,
+    },
+    Revoke {
         #[arg(long)]
         confirm: bool,
     },
@@ -249,19 +211,13 @@ fn run() -> Result<()> {
             let info = app.pairing_info()?;
             println!("{}", info.qr);
             println!("QR privado: {}", info.qr_image.display());
-            println!("Certificado SHA-256: {}", info.fingerprint);
+            println!("Certificado SHA-256: {}", info.device.fingerprint);
         }
-        Command::Migrate { folder, address } => rowd_app::migrate(&home, &folder, &address)?,
+        Command::Migrate { folder, address } => app.migrate(&folder, &address)?,
         Command::Share { command } => match command {
-            ShareCommand::Add {
-                name,
-                folder,
-                android,
-                mode,
-            } => println!(
-                "{}",
-                app.add_share(name, folder, android, parse_mode(&mode)?)?
-            ),
+            ShareCommand::Add { name, folder, mode } => {
+                println!("{}", app.add_share(name, folder, parse_mode(&mode)?)?)
+            }
             ShareCommand::Edit {
                 id,
                 name,
@@ -283,21 +239,16 @@ fn run() -> Result<()> {
             ShareCommand::Pause { id } => app.set_share_enabled(&id, false)?,
             ShareCommand::Resume { id } => app.set_share_enabled(&id, true)?,
             ShareCommand::Reindex { id } => app.reindex_share(&id)?,
-            ShareCommand::Remap {
-                id,
-                android,
-                policy,
-            } => app.remap_share(&id, android, parse_policy(&policy)?)?,
+            ShareCommand::Remap { id, policy } => app.remap_share(&id, parse_policy(&policy)?)?,
             ShareCommand::Ignore { id, file } => {
                 app.set_ignore_text(&id, &std::fs::read_to_string(file)?)?
             }
             ShareCommand::Sync { id } => app.request_share_sync(&id)?,
         },
         Command::Request { command } => match command {
-            RequestCommand::List => println!(
-                "{}",
-                serde_json::to_string_pretty(&rowd_app::share_requests(&home)?)?
-            ),
+            RequestCommand::List => {
+                println!("{}", serde_json::to_string_pretty(&app.share_requests()?)?)
+            }
             RequestCommand::Accept { id, folder } => app.accept_share_request(&id, &folder)?,
             RequestCommand::Reject { id } => app.reject_share_request(&id)?,
         },
@@ -308,8 +259,15 @@ fn run() -> Result<()> {
             DeviceCommand::Pause => app.set_sync_paused(true)?,
             DeviceCommand::Resume => app.set_sync_paused(false)?,
             DeviceCommand::Unlink { confirm } => {
-                ensure!(confirm, "use --confirm to revoke the current pairing");
+                ensure!(confirm, "use --confirm to request bilateral unlink");
                 app.unlink_device()?;
+            }
+            DeviceCommand::Revoke { confirm } => {
+                ensure!(
+                    confirm,
+                    "use --confirm to revoke immediately without Android acknowledgement"
+                );
+                app.revoke_device()?;
             }
         },
         Command::Config { command } => match command {
@@ -322,37 +280,21 @@ fn run() -> Result<()> {
                 app.import_backup(&input, &passphrase)?
             }
         },
-        Command::Run { listen, once } => rowd_app::serve(
-            &home,
+        Command::Run { listen, once } => app.serve(
             listen.as_deref(),
             once,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             |event| println!("{event}"),
         )?,
-        Command::DeviceSync {
-            folder,
-            invite,
-            watch,
-        } => rowd_app::device_sync(&folder, &invite, watch)?,
-        Command::Scan => rowd_app::scan(&home, true)?,
+        Command::Scan => app.scan(true)?,
         Command::Shares => println!("{}", serde_json::to_string_pretty(&app.status()?)?),
         Command::Recovery {
-            folder,
             share,
             id,
             action,
             output,
         } => {
-            if let Some(folder) = folder {
-                if let Some(entries) = rowd_app::legacy_recovery(
-                    &folder,
-                    id.as_deref(),
-                    action.as_deref(),
-                    output.as_deref(),
-                )? {
-                    println!("{}", serde_json::to_string_pretty(&entries)?);
-                }
-            } else if let Some(id) = id {
+            if let Some(id) = id {
                 let share = share.context("--share is required with --id")?;
                 match action.as_deref().context("--action is required")? {
                     "keep" => app.keep_recovery(&share, &id)?,
@@ -376,35 +318,14 @@ fn run() -> Result<()> {
             confirm,
         } => {
             ensure!(confirm, "use --confirm for reset operations");
-            let level = match level.as_str() {
-                "interface" => ResetLevel::Interface,
-                "share" => ResetLevel::Share(share.context("--share is required")?),
-                "unlink" => ResetLevel::Unlink,
-                "initial" => ResetLevel::Initial,
-                "all" => ResetLevel::AllData,
-                _ => anyhow::bail!("level must be interface, share, unlink, initial or all"),
-            };
-            app.reset(level)?;
+            match level.as_str() {
+                "share" => app.reindex_share(&share.context("--share is required")?)?,
+                "unlink" => app.unlink_device()?,
+                "initial" => app.reset_device_configuration()?,
+                "all" => app.archive_all_application_data()?,
+                _ => anyhow::bail!("level must be share, unlink, initial or all"),
+            }
         }
-        Command::Init {
-            folder,
-            address,
-            invite,
-        } => rowd_app::legacy_init(&folder, &address, &invite)?,
-        Command::Serve {
-            folder,
-            listen,
-            once,
-        } => rowd_app::legacy_serve(&folder, &listen, once)?,
-        Command::Sync {
-            folder,
-            invite,
-            watch,
-        } => rowd_app::legacy_sync(&folder, &invite, watch)?,
-        Command::Status { folder } => println!(
-            "{}",
-            serde_json::to_string_pretty(&rowd_app::legacy_status(&folder)?)?
-        ),
     }
     Ok(())
 }

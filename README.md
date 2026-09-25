@@ -2,7 +2,7 @@
 
 Sincronização de vários diretórios entre **um PC Linux e um Android**, pela rede local. Rust no núcleo, Ratatui no terminal e Kotlin/SAF no Android. Sem servidor intermediário.
 
-**V4 · 0.4.0:** a lógica desktop compartilhada vive em `rowd-app`; CLI e TUI são frontends. A administração inclui pausa global/por Share, reindexação, remapeamento explícito, ciclo completo de solicitações, resets graduais, backups criptografados, diagnóstico e recovery.
+**0.5.0:** a sessão TCP/TLS permanece conectada entre rodadas e sincroniza os Shares acordados pelo watcher do PC ou pelo ContentObserver do Android. A lógica desktop compartilhada vive em `rowd-app`; CLI e TUI são frontends. A administração inclui pausa global/por Share, reindexação, remapeamento explícito, solicitações de Share, resets graduais, backups criptografados, diagnóstico e recovery.
 
 ## Começar
 
@@ -32,21 +32,21 @@ A TUI inicia o servidor automaticamente. Mantenha o Rowd aberto nos dois disposi
 
 | Tecla | Ação global |
 | --- | --- |
-| 1..5 | Abrir Shares, Solicitações, Recovery, Dispositivo ou Configuração |
+| 1..4 | Abrir Shares, Solicitações, Recovery ou Dispositivo |
 | Tab / Shift+Tab | Próxima aba / aba anterior |
 | ↑ / ↓ | Selecionar item |
 | ? | Abrir ajuda com todas as ações contextuais |
 | Esc | Fechar modal |
 | q | Sair |
 
-O rodapé mostra somente ações da aba atual. Na aba Configuração, **Enter** altera o atalho selecionado; atalhos e densidade ficam em `.rowd/ui.json`, separados da configuração crítica. O painel mostra pendências, conflitos, último sincronismo, último erro persistente e progresso da rodada. Um arquivo grande ainda é transferido inteiro, sem retomada.
+O rodapé mostra os atalhos fixos da aba atual. O painel mostra pendências, conflitos, último sincronismo, último erro persistente e progresso da rodada. Um arquivo grande ainda é transferido inteiro, sem retomada.
 
 ## Configuração e CLI
 
 A configuração fica em `~/.local/share/rowd/.rowd/`. Use `--home DIRETORIO` ou `ROWD_HOME` para escolher outro lugar. Guarde esse diretório: contém certificado, chave privada, credencial e vínculo com o Android.
 
 ```bash
-./rowd pair --address 192.168.1.20:43821 --invite /tmp/rowd-convite.json
+./rowd pair --address 192.168.1.20:43821 --invite /tmp/rowd-convite.txt
 ./rowd share add --name Projetos --folder "$HOME/Projects"
 ./rowd share add --name Fotos --folder "$HOME/Pictures" --mode to_pc
 ./rowd shares
@@ -60,13 +60,13 @@ A configuração fica em `~/.local/share/rowd/.rowd/`. Use `--home DIRETORIO` ou
 ./rowd share pause ID
 ./rowd share resume ID
 ./rowd share reindex ID
-./rowd share remap ID --android NovoDestino --policy compare
+./rowd share remap ID --policy compare
 ./rowd share sync ID
 ./rowd share remove ID --confirm
 ./rowd scan
 ```
 
-No Android real, a pasta é sempre escolhida explicitamente pelo seletor SAF. `--android caminho/relativo` permanece apenas para o cliente local `device-sync`. Ao remapear, escolha `pc`, `android` ou `compare`; o Android exige uma nova seleção SAF antes da primeira rodada. Raízes PC iguais, ancestrais ou descendentes, inclusive por symlink, são recusadas. Pastas Android iguais, ancestrais ou descendentes também são recusadas.
+No Android real, a pasta é sempre escolhida explicitamente pelo seletor SAF. Ao remapear, escolha `pc`, `android` ou `compare`; o PC incrementa a revisão do vínculo e o Android exige uma nova seleção SAF antes da primeira rodada. Raízes PC iguais, ancestrais ou descendentes, inclusive por symlink, são recusadas. Pastas Android iguais, ancestrais ou descendentes também são recusadas.
 
 Administração também está disponível pela CLI:
 
@@ -77,18 +77,19 @@ Administração também está disponível pela CLI:
 ./rowd device test
 ./rowd device pause
 ./rowd device unlink --confirm
+./rowd device revoke --confirm  # aparelho perdido: revogação imediata, sem confirmação Android
 ./rowd config export-profile /tmp/rowd-profile.json
 ./rowd config export-backup /tmp/rowd-backup.json --passphrase 'senha longa'
 ./rowd diagnostic --output /tmp/rowd-diagnostico.json
-./rowd reset --level interface --confirm
+./rowd reset --level initial --confirm
 ```
 
 Perfis não contêm credenciais. Backups completos usam PBKDF2-HMAC-SHA256 e AES-256-GCM, são criados com permissão privada e exigem senha de pelo menos oito caracteres. O relatório de diagnóstico não inclui segredo nem chave privada.
 
-`./rowd run --listen 0.0.0.0:43821` mantém todos os Shares e o watcher em um processo. Para simular o Android sem aparelho, use uma raiz de teste exclusiva:
+`./rowd run --listen 0.0.0.0:43821` mantém todos os Shares e o watcher em um processo. O simulador filesystem fica restrito aos testes de desenvolvimento:
 
 ```bash
-./rowd device-sync --folder /tmp/rowd-android --invite /tmp/rowd-convite.json --watch
+cargo test -p rowd --test v2
 ```
 
 A primeira identidade Android autenticada fica vinculada ao PC. Essa identidade pertence ao aparelho, não a uma pasta. Outro cliente é recusado.
@@ -97,32 +98,34 @@ A primeira identidade Android autenticada fica vinculada ao PC. Essa identidade 
 
 O Android não escolhe a pasta do PC diretamente. Toque em **Escolher pasta para novo Share**, escolha qualquer pasta local, informe o nome e o modo; a solicitação fica salva no telefone até ser entregue.
 
-Na aba Solicitações da TUI, **a** aceita e **r** rejeita. Informe o caminho absoluto da pasta do PC ao aceitar. No Android, uma solicitação pendente pode ser cancelada e o histórico informa se ela foi aceita, rejeitada ou cancelada. Estados terminais convergem na próxima conexão e não reaparecem indefinidamente.
+Na aba Solicitações da TUI, **a** aceita e **r** rejeita. Informe o caminho absoluto da pasta do PC ao aceitar. No Android, uma solicitação pendente pode ser cancelada; o cancelamento e a decisão do PC são confirmados na próxima conexão. O aplicativo não mantém um histórico de decisões como fonte de verdade.
 
 Se o PC estiver offline, a solicitação permanece pendente no Android. O envio é repetido com o mesmo ID até o PC aceitar, evitando Shares duplicados.
 
 ### Migrar V1
 
-Pare os processos antigos e atualize PC e APK juntos. O protocolo de rede V4 rejeita versões anteriores explicitamente; o formato lógico do convite continua na versão 1, independente da versão do protocolo e dos pacotes.
+Pare os processos antigos e atualize PC e APK juntos. O protocolo de rede V6 rejeita versões anteriores explicitamente. O convite externo é `rowd1:` versão 2; convites JSON V1 já armazenados são convertidos pelo decoder Rust durante a migração.
 
 ```bash
 ./rowd migrate --folder /caminho/da/pasta-v1 --address 192.168.1.20:43821
 ./rowd
 ```
 
-A migração reutiliza credenciais, identidade do Android, ID da pasta e estado-base. Os backups continuam na raiz original. O convite JSON já importado permanece válido.
+A migração reutiliza credenciais, identidade do Android, ID da pasta como Share e estado-base. Os backups continuam na raiz original. Um convite JSON V1 já importado é aceito apenas como entrada de migração; o Android o regrava em formato `rowd1:`.
 
 O primeiro Share migrado conserva a antiga pasta Android como seu extremo explícito. Shares antigos que ainda dependiam de subpastas inferidas ficam pausados até que o usuário escolha sua pasta pelo botão **Vincular pasta a Share pendente**; nenhum caminho é adivinhado durante a atualização.
 
-Os comandos `init`, `serve --folder`, `sync --folder` e `status --folder` continuam disponíveis para operar uma pasta, com o protocolo atualizado. O APK V4 usa a administração multi-Share; use `migrate` e `run` para conectar uma instalação antiga.
+Os comandos V1 de runtime foram removidos. Use `migrate` e `run` para conectar uma instalação antiga.
 
 ## Pendências, cache e eventos
 
-Cada Share possui manifesto, base conhecida e journal JSON atômico próprios. Enquanto o outro dispositivo está offline, novas versões substituem a pendência anterior do mesmo caminho. A fila só confirma a versão cujo hash foi entregue e reconhecido. Uma queda antes do ACK mantém a pendência; repetir uma instalação é idempotente.
+Cada Share mantém `base.json` como memória de convergência. O cache e os hints aceleram a comparação; snapshots e instalações verificam SHA-256 antes de transmitir ou publicar conteúdo, e auditorias periódicas revalidam a árvore inteira. Uma queda antes do ACK é resolvida pelo replay idempotente da instalação e pela comparação com a base. O antigo `journal.json` de sync é arquivado quando encontrado. Os registros de recovery físico permanecem separados.
 
-No Linux, inotify marca alterações e um debounce de 350 ms agrupa eventos. A varredura consulta metadados e reutiliza hashes quando dispositivo, inode, tamanho, mtime e ctime com nanossegundos permanecem iguais. Snapshots e instalações sempre conferem SHA-256. Há verificação periódica por metadados a cada minuto, scan completo periódico a cada 15 minutos e reconstrução após overflow; `scan` força todos os Shares e **x** reindexa o Share selecionado.
+No Linux, inotify marca alterações e um debounce de 350 ms agrupa eventos. Enquanto o telefone está offline, esses eventos gravam apenas um hint durável dos caminhos afetados, sem antecipar scan/hash; a conexão seguinte revalida os paths indicados. Após uma rodada completa bem-sucedida na sessão, peers com o mesmo token de base podem trocar apenas os arquivos conhecidos alterados. O delta não monta o manifesto completo. Novo arquivo, remoção, rename, mudança de política, restart ou perda de confiança forçam auditoria completa. Snapshots e instalações sempre conferem SHA-256; `scan` força todos os Shares e **x** reindexa o Share selecionado.
 
-No Android, avisos do DocumentsProvider e mudanças administrativas acordam a próxima rodada, com fallback de 5 segundos no modo automático. A pasta SAF selecionada fica congelada durante uma rodada; um novo vínculo passa a valer na rodada seguinte. SAF não fornece metadados ou eventos universalmente confiáveis: o fallback recalcula hashes. A fila local é atualizada antes de tentar a conexão, inclusive quando o PC está offline. O Android inicia cada sessão; alterações no PC são entregues na próxima conexão do telefone.
+No Android, avisos do DocumentsProvider antecipam uma rodada focada no Share. Quando a URI identifica um arquivo conhecido, o serviço reabre e rehasha apenas esse path; no delta, só esse path entra na resposta. Avisos sem path identificável forçam scan completo **daquele Share**. Mudanças de vínculo/ignore invalidam o cache, e uma auditoria automática a cada minuto percorre todos os Shares; ela também detecta alterações do PC. A pasta SAF selecionada fica congelada durante uma rodada; um novo vínculo passa a valer na rodada seguinte. SAF não fornece eventos universalmente confiáveis: a auditoria completa continua sendo o fallback.
+
+O benchmark local de uma rodada warm pode ser executado com `ROWD_BENCH_FILES=50000 cargo test -p rowd-core large_share_one_small_change_baseline -- --ignored --nocapture`. Ele usa dois stores de teste e socket Unix, não mede SAF físico. Após uma rodada full inicial, 50 mil arquivos iguais e uma alteração de 4 KiB produziram 2 enumerações, 1 entrada de delta, 1 path reconciliado, 0 ACKs e 0 full scans na rodada medida. Os números antes/depois estão em [métricas da implementação](plan/ROWD_IMPLEMENTACAO_METRICAS.md).
 
 ### `.rowdignore`
 
@@ -137,7 +140,7 @@ target/
 docs/private/
 ```
 
-Padrões sem `/` correspondem a nomes em qualquer nível. Padrões com `/` são relativos à raiz. `*` é o único curinga; não há negação nem implementação completa de `.gitignore`. A configuração de ignore do PC é enviada ao Android; regras locais Android também são respeitadas. Ignorados ficam fora do hash e das pendências. `.rowd/` e `.rowdignore` não são transferidos.
+Padrões sem `/` correspondem a nomes em qualquer nível. Padrões com `/` são relativos à raiz. `*` é o único curinga; não há negação nem implementação completa de `.gitignore`. A política efetiva do PC é enviada ao Android; a cópia Android de `.rowdignore` não define outra política. Ignorados ficam fora do hash e das pendências. `.rowd/` e `.rowdignore` não são transferidos.
 
 ## Modos e preservação
 
@@ -152,9 +155,9 @@ Exclusões **não são propagadas**. Um arquivo removido pode voltar na próxima
 Na aba Recovery da TUI, **f** percorre os filtros por Share; o painel mostra contagem e espaço total e por Share. **Enter** restaura, **k** mantém a versão atual, **e** exporta e **d** limpa manualmente um registro já resolvido. Restaurar também conserva a versão deslocada; exportar nunca substitui um arquivo existente.
 
 ```bash
-./rowd recovery --folder /pasta/do/share
-./rowd recovery --folder /pasta/do/share --id ID --action restore
-./rowd recovery --folder /pasta/do/share --id ID --action export --output /tmp/versao-recuperada
+./rowd recovery
+./rowd recovery --share SHARE_ID --id ID --action restore
+./rowd recovery --share SHARE_ID --id ID --action export --output /tmp/versao-recuperada
 ```
 
 No Android, **Revisar versões recuperáveis** permite manter a atual ou restaurar a anterior; **Exportar cópias de recuperação** conserva os registros e arquivos `.old`/`.new` fora do armazenamento privado. Um resultado de escrita ambíguo bloqueia novas rodadas até a escolha. Não limpe os dados do aplicativo antes de exportar.
@@ -180,11 +183,11 @@ cargo test --workspace
 
 Os testes usam sockets locais TCP/TLS e Unix; precisam de um ambiente que permita esses sockets. Consulte [Validação V4](docs/V4_VALIDATION.md) para o estado desta refatoração e os cenários que ainda exigem aparelho.
 
-Limites: 8 GiB por arquivo, 50 mil arquivos por Share, 16 MiB por mensagem, até 256 Shares no protocolo, uma transferência por vez. Symlinks, pastas vazias, permissões e timestamps originais não são sincronizados. Não há daemon, mDNS, conexão persistente, múltiplos dispositivos, blocos ou retomada nesta versão.
+Limites: 8 GiB por arquivo, 50 mil arquivos por Share, 16 MiB por mensagem, até 256 Shares no protocolo, janela FIFO de até 4 arquivos e 8 MiB de staging por batch. Arquivos maiores seguem serialmente. Symlinks, pastas vazias, permissões e timestamps originais não são sincronizados. Não há daemon, mDNS, conexão persistente, múltiplos dispositivos, blocos ou retomada nesta versão.
 
 ## Estrutura
 
-- `crates/rowd-core`: protocolo, modelos compartilhados, reconciliação, TLS/HMAC, journal e armazenamento.
+- `crates/rowd-core`: protocolo, modelos compartilhados, reconciliação, TLS/HMAC, recovery físico e armazenamento.
 - `crates/rowd-app`: casos de uso desktop, configuração, servidor/watcher e operações administrativas.
 - `crates/rowd`: argumentos CLI, apresentação textual e TUI Ratatui.
 - `crates/rowd-android`: ponte JNI, utilizando o mesmo serviço cliente Rust.

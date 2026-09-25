@@ -9,7 +9,8 @@ use sha2::Sha256;
 use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const MANIFEST_CHUNK_FILES: usize = 1024;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -19,39 +20,49 @@ pub enum Message {
         message: Box<Message>,
     },
     Shares {
-        shares: Vec<crate::config::ShareConfig>,
-        removed: Vec<String>,
+        shares: Vec<crate::config::ShareDefinition>,
     },
     Capabilities {
         device_id: String,
-        polling: bool,
-        managed_shares: bool,
         share_requests: Vec<crate::config::ShareRequest>,
+        cancel_intents: Vec<String>,
         available_shares: Vec<String>,
+        requested_share_ids: Vec<String>,
+        audit: bool,
         #[serde(default)]
         unlink_requested: bool,
     },
     ShareRequestStatus {
         accepted: Vec<String>,
-        pending: Vec<String>,
         #[serde(default)]
         rejected: Vec<String>,
         #[serde(default)]
         cancelled: Vec<String>,
     },
     DeviceUnlinked,
+    UnlinkAck,
+    UnlinkComplete,
     SelectShare {
         share_id: String,
     },
+    StartRound,
+    WakeShare {
+        share_id: String,
+    },
+    ShareSkipped {
+        share_id: String,
+        reason: String,
+    },
     SessionDone,
-    Ack {
-        path: String,
-        entry: Entry,
+    RoundDeferred {
+        shares: Vec<String>,
+    },
+    AckBatch {
+        entries: Manifest,
     },
     Hello {
         version: u32,
         pair_id: String,
-        folder_id: String,
         device_id: String,
     },
     Challenge {
@@ -62,8 +73,24 @@ pub enum Message {
     },
     Ready,
     Scan,
-    Files {
+    DeltaScan {
+        base_token: String,
+        paths: std::collections::BTreeSet<String>,
+    },
+    DeltaManifest {
+        paths: std::collections::BTreeSet<String>,
         files: Manifest,
+        metrics: crate::storage::StoreMetrics,
+    },
+    NeedFullScan,
+    ManifestBegin {
+        count: usize,
+    },
+    ManifestChunk {
+        files: Manifest,
+    },
+    ManifestEnd {
+        metrics: crate::storage::StoreMetrics,
     },
     Get {
         path: String,
@@ -81,6 +108,7 @@ pub enum Message {
     Done {
         transferred: usize,
         conflicts: usize,
+        base_token: String,
     },
     Error {
         message: String,
@@ -110,6 +138,22 @@ pub fn receive(io: &mut impl Read) -> Result<Message> {
     Ok(message)
 }
 
+pub fn receive_after_first(io: &mut impl Read, first: u8) -> Result<Message> {
+    struct Prefixed<'a, R>(&'a mut R, Option<u8>);
+    impl<R: Read> Read for Prefixed<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !buf.is_empty() {
+                if let Some(first) = self.1.take() {
+                    buf[0] = first;
+                    return Ok(1);
+                }
+            }
+            self.0.read(buf)
+        }
+    }
+    receive(&mut Prefixed(io, Some(first)))
+}
+
 pub fn send_for(io: &mut impl Write, share_id: &str, message: Message) -> Result<()> {
     send(
         io,
@@ -134,6 +178,82 @@ pub fn receive_for(io: &mut impl Read, share_id: &str) -> Result<Message> {
     Ok(*message)
 }
 
+pub fn send_manifest(io: &mut impl Write, share_id: &str, files: &Manifest) -> Result<()> {
+    send_manifest_with_metrics(io, share_id, files, Default::default())
+}
+
+pub fn send_manifest_with_metrics(
+    io: &mut impl Write,
+    share_id: &str,
+    files: &Manifest,
+    metrics: crate::storage::StoreMetrics,
+) -> Result<()> {
+    crate::model::validate_manifest(files)?;
+    send_for(io, share_id, Message::ManifestBegin { count: files.len() })?;
+    let mut chunk = Manifest::new();
+    for (path, entry) in files {
+        chunk.insert(path.clone(), entry.clone());
+        if chunk.len() == MANIFEST_CHUNK_FILES {
+            send_for(
+                io,
+                share_id,
+                Message::ManifestChunk {
+                    files: std::mem::take(&mut chunk),
+                },
+            )?;
+        }
+    }
+    if !chunk.is_empty() {
+        send_for(io, share_id, Message::ManifestChunk { files: chunk })?;
+    }
+    send_for(io, share_id, Message::ManifestEnd { metrics })
+}
+
+pub fn receive_manifest(io: &mut impl Read, share_id: &str) -> Result<Manifest> {
+    Ok(receive_manifest_with_metrics(io, share_id)?.0)
+}
+
+pub fn receive_manifest_with_metrics(
+    io: &mut impl Read,
+    share_id: &str,
+) -> Result<(Manifest, crate::storage::StoreMetrics, u64)> {
+    struct Counted<'a, R>(&'a mut R, u64);
+    impl<R: Read> Read for Counted<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let size = self.0.read(buf)?;
+            self.1 += size as u64;
+            Ok(size)
+        }
+    }
+    let mut io = Counted(io, 0);
+    let Message::ManifestBegin { count } = receive_for(&mut io, share_id)? else {
+        anyhow::bail!("expected manifest begin")
+    };
+    ensure!(count <= crate::model::MAX_FILES, "too many files");
+    let mut files = Manifest::new();
+    while files.len() < count {
+        let Message::ManifestChunk { files: chunk } = receive_for(&mut io, share_id)? else {
+            anyhow::bail!("expected manifest chunk")
+        };
+        ensure!(
+            !chunk.is_empty() && chunk.len() <= MANIFEST_CHUNK_FILES,
+            "invalid manifest chunk"
+        );
+        for (path, entry) in chunk {
+            ensure!(
+                files.insert(path.clone(), entry).is_none(),
+                "duplicate manifest path: {path}"
+            );
+        }
+        ensure!(files.len() <= count, "manifest exceeds declared count");
+    }
+    let Message::ManifestEnd { metrics } = receive_for(&mut io, share_id)? else {
+        anyhow::bail!("expected manifest end")
+    };
+    crate::model::validate_manifest(&files)?;
+    Ok((files, metrics, io.1))
+}
+
 pub fn copy_exact(reader: &mut impl Read, writer: &mut impl Write, size: u64) -> Result<()> {
     ensure!(size <= MAX_FILE, "file too large");
     let n = std::io::copy(&mut reader.take(size), writer)?;
@@ -142,44 +262,28 @@ pub fn copy_exact(reader: &mut impl Read, writer: &mut impl Write, size: u64) ->
     Ok(())
 }
 
-fn auth_mac(
-    secret: &str,
-    nonce: &str,
-    pair_id: &str,
-    folder_id: &str,
-    device_id: &str,
-) -> Result<Hmac<Sha256>> {
+fn auth_mac(secret: &str, nonce: &str, pair_id: &str, device_id: &str) -> Result<Hmac<Sha256>> {
     let key = hex::decode(secret)?;
     ensure!(key.len() == 32, "invalid pairing secret");
     let mut mac = Hmac::<Sha256>::new_from_slice(&key)?;
     // Fixed-length identities and a domain label avoid ambiguous concatenations.
-    mac.update(b"rowd-auth-v1\0");
-    for value in [nonce, pair_id, folder_id, device_id] {
+    mac.update(b"rowd-auth-v2\0");
+    for value in [nonce, pair_id, device_id] {
         crate::model::validate_hash(value)?;
         mac.update(&hex::decode(value)?);
     }
     Ok(mac)
 }
 
-pub fn server_auth(
-    io: &mut (impl Read + Write),
-    pair_id: &str,
-    folder_id: &str,
-    secret: &str,
-) -> Result<String> {
+pub fn server_auth(io: &mut (impl Read + Write), pair_id: &str, secret: &str) -> Result<String> {
     let Message::Hello {
         version,
         pair_id: peer,
-        folder_id: folder,
         device_id,
     } = receive(io)?
     else {
         anyhow::bail!("expected hello")
     };
-    ensure!(
-        peer == pair_id && folder == folder_id,
-        "wrong pair or folder"
-    );
     if version != PROTOCOL_VERSION {
         let message =
             format!("incompatible protocol: expected {PROTOCOL_VERSION}, received {version}");
@@ -191,6 +295,7 @@ pub fn server_auth(
         )?;
         anyhow::bail!(message);
     }
+    ensure!(peer == pair_id, "wrong pairing identity");
     let nonce = random_id()?;
     send(
         io,
@@ -201,7 +306,7 @@ pub fn server_auth(
     let Message::Proof { mac } = receive(io)? else {
         anyhow::bail!("expected auth proof")
     };
-    auth_mac(secret, &nonce, pair_id, folder_id, &device_id)?
+    auth_mac(secret, &nonce, pair_id, &device_id)?
         .verify_slice(&hex::decode(mac)?)
         .context("authentication failed")?;
     send(io, &Message::Ready)?;
@@ -211,7 +316,6 @@ pub fn server_auth(
 pub fn client_auth(
     io: &mut (impl Read + Write),
     pair_id: &str,
-    folder_id: &str,
     secret: &str,
     device_id: &str,
 ) -> Result<()> {
@@ -220,14 +324,13 @@ pub fn client_auth(
         &Message::Hello {
             version: PROTOCOL_VERSION,
             pair_id: pair_id.into(),
-            folder_id: folder_id.into(),
             device_id: device_id.into(),
         },
     )?;
     let Message::Challenge { nonce } = receive(io)? else {
         anyhow::bail!("expected challenge")
     };
-    let mac = auth_mac(secret, &nonce, pair_id, folder_id, device_id)?
+    let mac = auth_mac(secret, &nonce, pair_id, device_id)?
         .finalize()
         .into_bytes();
     send(
@@ -255,18 +358,57 @@ mod tests {
     fn proof_is_bound_to_nonce_and_device() {
         let h = "a".repeat(64);
         let other = "b".repeat(64);
-        let proof = auth_mac(&h, &h, &h, &h, &h)
-            .unwrap()
-            .finalize()
-            .into_bytes();
-        assert!(auth_mac(&h, &other, &h, &h, &h)
+        let proof = auth_mac(&h, &h, &h, &h).unwrap().finalize().into_bytes();
+        assert!(auth_mac(&h, &other, &h, &h)
             .unwrap()
             .verify_slice(&proof)
             .is_err());
-        assert!(auth_mac(&h, &h, &h, &h, &other)
+        assert!(auth_mac(&h, &h, &h, &other)
             .unwrap()
             .verify_slice(&proof)
             .is_err());
+    }
+    #[test]
+    fn chunked_manifest_round_trips_and_rejects_invalid_sequences() {
+        let entry = Entry {
+            hash: "a".repeat(64),
+            size: 1,
+        };
+        let files: Manifest = (0..2050)
+            .map(|index| (format!("file-{index:05}"), entry.clone()))
+            .collect();
+        let mut bytes = Vec::new();
+        send_manifest(&mut bytes, "share", &files).unwrap();
+        assert_eq!(
+            receive_manifest(&mut std::io::Cursor::new(bytes), "share").unwrap(),
+            files
+        );
+
+        let mut missing = Vec::new();
+        send_for(&mut missing, "share", Message::ManifestBegin { count: 1 }).unwrap();
+        send_for(
+            &mut missing,
+            "share",
+            Message::ManifestEnd {
+                metrics: Default::default(),
+            },
+        )
+        .unwrap();
+        assert!(receive_manifest(&mut std::io::Cursor::new(missing), "share").is_err());
+
+        let mut duplicate = Vec::new();
+        send_for(&mut duplicate, "share", Message::ManifestBegin { count: 2 }).unwrap();
+        for _ in 0..2 {
+            send_for(
+                &mut duplicate,
+                "share",
+                Message::ManifestChunk {
+                    files: Manifest::from([("a".into(), entry.clone())]),
+                },
+            )
+            .unwrap();
+        }
+        assert!(receive_manifest(&mut std::io::Cursor::new(duplicate), "share").is_err());
     }
 }
 
@@ -297,9 +439,8 @@ mod v2_tests {
         send(
             &mut input,
             &Message::Hello {
-                version: 1,
+                version: 4,
                 pair_id: h.clone(),
-                folder_id: h.clone(),
                 device_id: h.clone(),
             },
         )
@@ -308,7 +449,7 @@ mod v2_tests {
             input: std::io::Cursor::new(input),
             output: vec![],
         };
-        assert!(server_auth(&mut io, &h, &h, &h)
+        assert!(server_auth(&mut io, &h, &h)
             .unwrap_err()
             .to_string()
             .contains("incompatible protocol"));

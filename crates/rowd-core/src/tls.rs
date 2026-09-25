@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+pub type ClientStream = StreamOwned<ClientConnection, TcpStream>;
+
 pub fn server_config(cert: &str, key: &str) -> Result<Arc<ServerConfig>> {
     Ok(Arc::new(
         ServerConfig::builder()

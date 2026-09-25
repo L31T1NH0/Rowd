@@ -5,7 +5,7 @@
 // FORM: responsive master/detail desk; concept candidate 3, seed a0e162b2.
 // FINISH: keyboard, empty/error/loading states, compact QR, and narrow layouts ship together.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -19,9 +19,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame, Terminal,
 };
-use rowd_app::{App, ConnectionTest, DeviceInfo, DeviceSummary, RecoveryItem, ResetLevel, Status};
-use rowd_core::config::{RemapPolicy, ShareRequest, ShareRequestState, SyncMode};
-use serde::{Deserialize, Serialize};
+use rowd_app::{App, AppSnapshot, ConnectionTest, PairingInfo, RecoveryItem, Status};
+use rowd_core::config::{RemapPolicy, ShareRequest, SyncMode};
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal},
@@ -49,23 +48,16 @@ impl Drop for Screen {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Shares,
     Requests,
     Recovery,
     Device,
-    Settings,
 }
 
 impl Tab {
-    const ALL: [Self; 5] = [
-        Self::Shares,
-        Self::Requests,
-        Self::Recovery,
-        Self::Device,
-        Self::Settings,
-    ];
+    const ALL: [Self; 4] = [Self::Shares, Self::Requests, Self::Recovery, Self::Device];
 
     fn index(self) -> usize {
         Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
@@ -77,7 +69,6 @@ impl Tab {
             Self::Requests => "Solicitações",
             Self::Recovery => "Recovery",
             Self::Device => "Dispositivo",
-            Self::Settings => "Configuração",
         }
     }
 
@@ -117,47 +108,11 @@ enum UiAction {
     ExportBackup,
     ImportBackup,
     ExportDiagnostic,
-    ResetInterface,
     ResetInitial,
     ResetAll,
-    ToggleDensity,
 }
 
 impl UiAction {
-    fn id(self) -> &'static str {
-        match self {
-            Self::AddShare => "add_share",
-            Self::EditShare => "edit_share",
-            Self::ToggleShare => "toggle_share",
-            Self::SyncShare => "sync_share",
-            Self::ReindexShare => "reindex_share",
-            Self::RemapShare => "remap_share",
-            Self::EditIgnore => "edit_ignore",
-            Self::RemoveShare => "remove_share",
-            Self::AcceptRequest => "accept_request",
-            Self::RejectRequest => "reject_request",
-            Self::RestoreRecovery => "restore_recovery",
-            Self::KeepRecovery => "keep_recovery",
-            Self::ExportRecovery => "export_recovery",
-            Self::CleanupRecovery => "cleanup_recovery",
-            Self::FilterRecovery => "filter_recovery",
-            Self::Pair => "pair",
-            Self::ShowQr => "show_qr",
-            Self::TestConnection => "test_connection",
-            Self::ToggleGlobalPause => "toggle_global_pause",
-            Self::Unlink => "unlink",
-            Self::ExportProfile => "export_profile",
-            Self::ImportProfile => "import_profile",
-            Self::ExportBackup => "export_backup",
-            Self::ImportBackup => "import_backup",
-            Self::ExportDiagnostic => "export_diagnostic",
-            Self::ResetInterface => "reset_interface",
-            Self::ResetInitial => "reset_initial",
-            Self::ResetAll => "reset_all",
-            Self::ToggleDensity => "toggle_density",
-        }
-    }
-
     fn mutates(self) -> bool {
         !matches!(
             self,
@@ -337,73 +292,12 @@ const BINDINGS: &[BindingDef] = &[
         label: "Apagar dados internos",
         default: "X",
     },
-    BindingDef {
-        action: UiAction::ResetInterface,
-        tab: Tab::Settings,
-        label: "Redefinir interface",
-        default: "z",
-    },
-    BindingDef {
-        action: UiAction::ToggleDensity,
-        tab: Tab::Settings,
-        label: "Alternar densidade",
-        default: "v",
-    },
 ];
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-struct UiPreferences {
-    bindings: BTreeMap<String, String>,
-    dense: bool,
-}
-
-impl UiPreferences {
-    fn key(&self, action: UiAction) -> &str {
-        self.bindings
-            .get(action.id())
-            .map(String::as_str)
-            .unwrap_or_else(|| {
-                BINDINGS
-                    .iter()
-                    .find(|binding| binding.action == action)
-                    .map(|binding| binding.default)
-                    .unwrap_or("")
-            })
-    }
-
-    fn set_key(&mut self, action: UiAction, value: &str) -> Result<()> {
-        let value = value.trim();
-        anyhow::ensure!(
-            value == "space" || value == "enter" || value.chars().count() == 1,
-            "use uma letra, space ou enter"
-        );
-        anyhow::ensure!(
-            !matches!(value, "1" | "2" | "3" | "4" | "5" | "q" | "?"),
-            "atalho reservado pela navegação global"
-        );
-        let tab = binding(action).context("ação não configurável")?.tab;
-        anyhow::ensure!(
-            !BINDINGS.iter().any(|candidate| {
-                candidate.tab == tab
-                    && candidate.action != action
-                    && self.key(candidate.action) == value
-            }),
-            "atalho já usado nesta aba"
-        );
-        self.bindings.insert(action.id().into(), value.into());
-        Ok(())
-    }
-}
-
-fn binding(action: UiAction) -> Option<&'static BindingDef> {
-    BINDINGS.iter().find(|binding| binding.action == action)
-}
 
 struct KeyMap;
 
 impl KeyMap {
-    fn resolve(key: KeyEvent, tab: Tab, preferences: &UiPreferences) -> Option<KeyCommand> {
+    fn resolve(key: KeyEvent, tab: Tab) -> Option<KeyCommand> {
         let fixed = match key.code {
             KeyCode::Char('q') => Some(KeyCommand::Quit),
             KeyCode::Char('?') => Some(KeyCommand::Help),
@@ -411,20 +305,18 @@ impl KeyMap {
             KeyCode::Char('2') => Some(KeyCommand::OpenTab(Tab::Requests)),
             KeyCode::Char('3') => Some(KeyCommand::OpenTab(Tab::Recovery)),
             KeyCode::Char('4') => Some(KeyCommand::OpenTab(Tab::Device)),
-            KeyCode::Char('5') => Some(KeyCommand::OpenTab(Tab::Settings)),
             KeyCode::Tab => Some(KeyCommand::NextTab),
             KeyCode::BackTab => Some(KeyCommand::PreviousTab),
             KeyCode::Up => Some(KeyCommand::MoveUp),
             KeyCode::Down => Some(KeyCommand::MoveDown),
             KeyCode::Esc => Some(KeyCommand::Close),
-            KeyCode::Enter if tab == Tab::Settings => Some(KeyCommand::ConfigureBinding),
             _ => None,
         };
         fixed.or_else(|| {
             BINDINGS
                 .iter()
                 .filter(|binding| binding.tab == tab)
-                .find(|binding| key_matches(key.code, preferences.key(binding.action)))
+                .find(|binding| key_matches(key.code, binding.default))
                 .map(|binding| KeyCommand::Action(binding.action))
         })
     }
@@ -451,16 +343,7 @@ enum KeyCommand {
     MoveUp,
     MoveDown,
     Close,
-    ConfigureBinding,
     Action(UiAction),
-}
-
-#[derive(Default)]
-struct Snapshot {
-    shares: Vec<Status>,
-    requests: Vec<ShareRequest>,
-    recovery: Vec<RecoveryItem>,
-    device: Option<DeviceSummary>,
 }
 
 enum Submit {
@@ -485,10 +368,8 @@ enum Submit {
     ImportBackupPath,
     ImportBackupPassphrase(PathBuf),
     ExportDiagnostic,
-    ResetInterface,
     ResetInitial,
     ResetAll,
-    Binding(UiAction),
 }
 
 struct InputDialog {
@@ -501,7 +382,7 @@ struct InputDialog {
 
 enum Modal {
     Help,
-    Qr(DeviceInfo),
+    Qr(PairingInfo),
     Input(InputDialog),
 }
 
@@ -516,9 +397,7 @@ struct Ui {
     requests_index: usize,
     recovery_index: usize,
     recovery_filter: Option<String>,
-    binding_index: usize,
-    preferences: UiPreferences,
-    snapshot: Snapshot,
+    snapshot: AppSnapshot,
     modal: Option<Modal>,
     notice: String,
     connection: Option<ConnectionTest>,
@@ -535,9 +414,7 @@ impl Ui {
             requests_index: 0,
             recovery_index: 0,
             recovery_filter: None,
-            binding_index: 0,
-            preferences: app.load_ui_preferences().ok().flatten().unwrap_or_default(),
-            snapshot: Snapshot::default(),
+            snapshot: AppSnapshot::default(),
             modal: None,
             notice: "Pronto. Use ? para consultar todas as ações.".into(),
             connection: None,
@@ -553,26 +430,8 @@ impl Ui {
         if !self.dirty && self.last_refresh.elapsed() < Duration::from_secs(1) {
             return;
         }
-        self.snapshot.device = app.device_summary().ok();
-        let configured = self
-            .snapshot
-            .device
-            .as_ref()
-            .is_some_and(|device| device.configured);
-        if configured {
-            if let Ok(shares) = app.status() {
-                self.snapshot.shares = shares;
-            }
-            if let Ok(requests) = app.share_requests() {
-                self.snapshot.requests = requests;
-            }
-            if let Ok(recovery) = app.recovery() {
-                self.snapshot.recovery = recovery;
-            }
-        } else {
-            self.snapshot.shares.clear();
-            self.snapshot.requests.clear();
-            self.snapshot.recovery.clear();
+        if let Ok(snapshot) = app.snapshot() {
+            self.snapshot = snapshot;
         }
         self.shares_index = clamp_index(self.shares_index, self.snapshot.shares.len());
         self.requests_index = clamp_index(self.requests_index, self.snapshot.requests.len());
@@ -586,7 +445,6 @@ impl Ui {
             self.recovery_filter = None;
         }
         self.recovery_index = clamp_index(self.recovery_index, self.recovery_len());
-        self.binding_index = clamp_index(self.binding_index, BINDINGS.len());
         self.last_refresh = Instant::now();
         self.dirty = false;
     }
@@ -630,7 +488,6 @@ impl Ui {
             Tab::Requests => (&mut self.requests_index, self.snapshot.requests.len()),
             Tab::Recovery => (&mut self.recovery_index, recovery_len),
             Tab::Device => return,
-            Tab::Settings => (&mut self.binding_index, BINDINGS.len()),
         };
         *index = if down {
             (*index + 1).min(len.saturating_sub(1))
@@ -669,12 +526,11 @@ impl Ui {
         if self.modal.is_some() {
             return self.handle_modal_key(key, app, tx).map(|()| false);
         }
-        let Some(command) = KeyMap::resolve(key, self.tab, &self.preferences) else {
+        let Some(command) = KeyMap::resolve(key, self.tab) else {
             return Ok(false);
         };
         let blocked_by_job = match command {
             KeyCommand::Action(action) => action.mutates(),
-            KeyCommand::ConfigureBinding => true,
             _ => false,
         };
         if self.job.is_some() && blocked_by_job {
@@ -691,18 +547,7 @@ impl Ui {
             KeyCommand::MoveUp => self.move_selection(false),
             KeyCommand::MoveDown => self.move_selection(true),
             KeyCommand::Close => {}
-            KeyCommand::ConfigureBinding => {
-                if let Some(binding) = BINDINGS.get(self.binding_index).copied() {
-                    let current = self.preferences.key(binding.action).to_owned();
-                    self.open_input(
-                        format!("Atalho · {}", binding.label),
-                        "Uma letra, space ou enter. 1..5, q e ? são reservados.",
-                        current,
-                        Submit::Binding(binding.action),
-                    );
-                }
-            }
-            KeyCommand::Action(action) => self.begin_action(action, app, tx)?,
+            KeyCommand::Action(action) => self.begin_action(action, app)?,
         }
         Ok(false)
     }
@@ -737,7 +582,21 @@ impl Ui {
         Ok(())
     }
 
-    fn begin_action(&mut self, action: UiAction, app: &App, tx: &Sender<UiEvent>) -> Result<()> {
+    fn open_pair_input(&mut self) {
+        let current = if self.snapshot.device.configured {
+            self.snapshot.device.address.clone()
+        } else {
+            "0.0.0.0:43821".into()
+        };
+        self.open_input(
+            "Endereço publicado do PC",
+            "Use IP:porta alcançável pelo Android; 0.0.0.0 descobre o IP local.",
+            current,
+            Submit::Pair,
+        );
+    }
+
+    fn begin_action(&mut self, action: UiAction, app: &App) -> Result<()> {
         match action {
             UiAction::AddShare => self.open_input(
                 "Novo Share",
@@ -791,8 +650,8 @@ impl Ui {
                 if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
                     self.open_input(
                         format!("Remapear Android · {}", share.name),
-                        "novo caminho Android | pc/android/compare",
-                        format!("{} | compare", share.android_path),
+                        "pc/android/compare; a pasta SAF será escolhida no Android",
+                        "compare",
                         Submit::RemapShare(share.share_id),
                     );
                 }
@@ -821,10 +680,6 @@ impl Ui {
             }
             UiAction::AcceptRequest => {
                 if let Some(request) = self.selected_request().cloned() {
-                    anyhow::ensure!(
-                        request.state == ShareRequestState::Pending,
-                        "solicitação não está pendente"
-                    );
                     self.open_input(
                         format!("Aceitar · {}", request.name),
                         "Pasta absoluta no PC que receberá este Share.",
@@ -835,10 +690,6 @@ impl Ui {
             }
             UiAction::RejectRequest => {
                 if let Some(request) = self.selected_request().cloned() {
-                    anyhow::ensure!(
-                        request.state == ShareRequestState::Pending,
-                        "solicitação não está pendente"
-                    );
                     self.open_input(
                         format!("Rejeitar · {}", request.name),
                         "A decisão será enviada ao Android. Digite REJEITAR.",
@@ -885,24 +736,10 @@ impl Ui {
                     None => "Recovery exibindo todos os Shares.".into(),
                 };
             }
-            UiAction::Pair => {
-                let current = self
-                    .snapshot
-                    .device
-                    .as_ref()
-                    .filter(|device| device.configured)
-                    .map(|device| device.address.clone())
-                    .unwrap_or_else(|| "0.0.0.0:43821".into());
-                self.open_input(
-                    "Endereço publicado do PC",
-                    "Use IP:porta alcançável pelo Android; 0.0.0.0 descobre o IP local.",
-                    current,
-                    Submit::Pair,
-                );
-            }
+            UiAction::Pair => self.open_pair_input(),
             UiAction::ShowQr => match app.pairing_info() {
                 Ok(info) => self.modal = Some(Modal::Qr(info)),
-                Err(_) => self.begin_action(UiAction::Pair, app, tx)?,
+                Err(_) => self.open_pair_input(),
             },
             UiAction::TestConnection => {
                 self.connection = Some(app.connection_test()?);
@@ -910,11 +747,7 @@ impl Ui {
                     "Teste concluído; detalhes atualizados no painel do dispositivo.".into();
             }
             UiAction::ToggleGlobalPause => {
-                let paused = self
-                    .snapshot
-                    .device
-                    .as_ref()
-                    .is_some_and(|device| device.sync_paused);
+                let paused = self.snapshot.device.sync_paused;
                 app.set_sync_paused(!paused)?;
                 self.notice = if paused {
                     "Sincronização global retomada.".into()
@@ -925,7 +758,7 @@ impl Ui {
             }
             UiAction::Unlink => self.open_input(
                 "Desvincular Android",
-                "Revoga a confiança e preserva arquivos/recovery. Digite DESVINCULAR.",
+                "Aguarda confirmação do Android antes de revogar. Digite DESVINCULAR.",
                 "",
                 Submit::Unlink,
             ),
@@ -959,12 +792,6 @@ impl Ui {
                 "",
                 Submit::ExportDiagnostic,
             ),
-            UiAction::ResetInterface => self.open_input(
-                "Redefinir interface",
-                "Remove apenas preferências visuais e atalhos. Digite REDEFINIR.",
-                "",
-                Submit::ResetInterface,
-            ),
             UiAction::ResetInitial => self.open_input(
                 "Restaurar configuração inicial",
                 "Arquiva o estado administrativo e preserva arquivos. Digite INICIAL.",
@@ -977,18 +804,6 @@ impl Ui {
                 "",
                 Submit::ResetAll,
             ),
-            UiAction::ToggleDensity => {
-                self.preferences.dense = !self.preferences.dense;
-                app.save_ui_preferences(&self.preferences)?;
-                self.notice = format!(
-                    "Densidade {}.",
-                    if self.preferences.dense {
-                        "compacta"
-                    } else {
-                        "confortável"
-                    }
-                );
-            }
         }
         Ok(())
     }
@@ -1019,7 +834,7 @@ impl Ui {
             }
             Submit::AddShare => {
                 let (name, root, mode) = share_form(&value)?;
-                app.add_share(name, root, None, mode)?;
+                app.add_share(name, root, mode)?;
                 self.notice = "Share adicionado.".into();
             }
             Submit::EditShare(id) => {
@@ -1062,18 +877,16 @@ impl Ui {
                 })?;
             }
             Submit::RemapShare(id) => {
-                let parts = split_fields(&value, 2, "novo caminho | pc/android/compare")?;
-                let policy = match parts[1] {
+                let policy = match value.trim() {
                     "pc" => RemapPolicy::Pc,
                     "android" => RemapPolicy::Android,
                     "compare" => RemapPolicy::Compare,
                     _ => anyhow::bail!("política deve ser pc, android ou compare"),
                 };
-                let android_path = parts[0].to_string();
                 let app = app.clone();
                 start_job(self, tx, "Remapeando Share", move || {
-                    app.remap_share(&id, android_path, policy)?;
-                    Ok("Destino Android remapeado com política explícita.".into())
+                    app.remap_share(&id, policy)?;
+                    Ok("Vínculo Android invalidado; escolha a nova pasta SAF no aparelho.".into())
                 })?;
             }
             Submit::Ignore(id) => {
@@ -1121,7 +934,7 @@ impl Ui {
                 let app = app.clone();
                 start_job(self, tx, "Desvinculando dispositivo", move || {
                     app.unlink_device()?;
-                    Ok("Vínculo revogado; arquivos e recovery foram preservados.".into())
+                    Ok("Desvinculação pendente até o Android confirmar; arquivos e recovery preservados.".into())
                 })?;
             }
             Submit::ExportProfile => {
@@ -1170,17 +983,11 @@ impl Ui {
                 app.export_diagnostic(required_path(&value)?)?;
                 self.notice = "Diagnóstico sanitizado exportado.".into();
             }
-            Submit::ResetInterface => {
-                require_token(&value, "REDEFINIR")?;
-                app.reset(ResetLevel::Interface)?;
-                self.preferences = UiPreferences::default();
-                self.notice = "Preferências da interface redefinidas.".into();
-            }
             Submit::ResetInitial => {
                 require_token(&value, "INICIAL")?;
                 let app = app.clone();
                 start_job(self, tx, "Restaurando configuração inicial", move || {
-                    app.reset(ResetLevel::Initial)?;
+                    app.reset_device_configuration()?;
                     Ok("Configuração inicial restaurada; estado anterior arquivado.".into())
                 })?;
             }
@@ -1188,14 +995,9 @@ impl Ui {
                 require_token(&value, "APAGAR TUDO")?;
                 let app = app.clone();
                 start_job(self, tx, "Arquivando dados internos", move || {
-                    app.reset(ResetLevel::AllData)?;
+                    app.archive_all_application_data()?;
                     Ok("Dados internos movidos para um arquivo recuperável.".into())
                 })?;
-            }
-            Submit::Binding(action) => {
-                self.preferences.set_key(action, &value)?;
-                app.save_ui_preferences(&self.preferences)?;
-                self.notice = "Atalho salvo separadamente da configuração de sincronização.".into();
             }
         }
         self.dirty = true;
@@ -1205,12 +1007,11 @@ impl Ui {
     fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         frame.render_widget(Clear, area);
-        let footer_height = if self.preferences.dense { 2 } else { 3 };
         let regions = Layout::vertical([
             Constraint::Length(2),
             Constraint::Length(3),
             Constraint::Min(6),
-            Constraint::Length(footer_height),
+            Constraint::Length(3),
         ])
         .split(area);
         self.render_header(frame, regions[0]);
@@ -1218,20 +1019,13 @@ impl Ui {
         self.render_body(frame, regions[2]);
         self.render_footer(frame, regions[3]);
         if let Some(modal) = &self.modal {
-            render_modal(frame, area, modal, &self.preferences);
+            render_modal(frame, area, modal);
         }
     }
 
     fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let device = self.snapshot.device.as_ref();
-        let paused = device.is_some_and(|device| device.sync_paused);
-        let paired = device.is_some_and(|device| device.paired);
-        let pending: usize = self
-            .snapshot
-            .shares
-            .iter()
-            .map(|status| status.pending)
-            .sum();
+        let paused = self.snapshot.device.sync_paused;
+        let paired = self.snapshot.device.paired;
         let conflicts: usize = self
             .snapshot
             .shares
@@ -1270,7 +1064,7 @@ impl Ui {
         let line_two = Line::from(vec![
             Span::styled(
                 format!(
-                    " {} Shares  ·  {pending} pendentes  ·  {conflicts} conflitos  ",
+                    " {} Shares  ·  {conflicts} conflitos  ",
                     self.snapshot.shares.len()
                 ),
                 Style::default().fg(MUTED),
@@ -1311,7 +1105,6 @@ impl Ui {
             Tab::Requests => self.render_requests(frame, panels),
             Tab::Recovery => self.render_recovery(frame, panels),
             Tab::Device => self.render_device(frame, panels),
-            Tab::Settings => self.render_settings(frame, panels),
         }
     }
 
@@ -1334,11 +1127,10 @@ impl Ui {
                         "PAUSADO"
                     };
                     ListItem::new(format!(
-                        "{}\n{} · {} · {} pend. · {} conf.",
+                        "{}\n{} · {} · {} conf.",
                         status.share.name,
                         state,
                         mode_label(status.share.mode),
-                        status.pending,
                         status.conflicts.len()
                     ))
                 })
@@ -1368,7 +1160,7 @@ impl Ui {
                     ListItem::new(format!(
                         "{}\n{} · {}",
                         request.name,
-                        request_state(request.state),
+                        "PENDENTE",
                         mode_label(request.mode)
                     ))
                 })
@@ -1385,7 +1177,7 @@ impl Ui {
             format!(
                 "Nome\n{}\n\nEstado\n{}\n\nModo\n{}\n\nIdentificador\n{}\n\nSolicitações enviadas pelo Android podem ser canceladas no próprio aparelho. Rejeições ficam registradas até os dois lados convergirem.",
                 request.name,
-                request_state(request.state),
+                "PENDENTE",
                 mode_label(request.mode),
                 short_id(&request.request_id)
             )
@@ -1477,9 +1269,9 @@ impl Ui {
     }
 
     fn render_device(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
-        let summary = self.snapshot.device.as_ref();
-        let left = match summary {
-            Some(device) if device.configured => format!(
+        let device = &self.snapshot.device;
+        let left = if device.configured {
+            format!(
                 "Vínculo\n{}\n\nEndereço publicado\n{}\n\nÚltima conexão\n{}\n\nSincronização\n{}\n\nIdentidade do Android\n{}\n\nFingerprint SHA-256\n{}",
                 if device.paired { "Android vinculado" } else { "aguardando primeiro vínculo" },
                 device.address,
@@ -1487,8 +1279,9 @@ impl Ui {
                 if device.sync_paused { "pausada" } else { "ativa" },
                 short_id(&device.identity),
                 device.fingerprint
-            ),
-            _ => "Dispositivo ainda não configurado.\n\nPressione p, confirme o endereço alcançável na rede local e leia o QR no Android.".into(),
+            )
+        } else {
+            "Dispositivo ainda não configurado.\n\nPressione p, confirme o endereço alcançável na rede local e leia o QR no Android.".into()
         };
         render_detail(frame, panels[0], "Confiança PC ↔ Android", left);
         let right = if let Some(test) = &self.connection {
@@ -1515,35 +1308,6 @@ impl Ui {
         render_detail(frame, panels[1], "Diagnóstico e pareamento", right);
     }
 
-    fn render_settings(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
-        let items = BINDINGS
-            .iter()
-            .map(|binding| {
-                ListItem::new(format!(
-                    "{}\n{} · tecla {}",
-                    binding.label,
-                    binding.tab.title(),
-                    display_key(self.preferences.key(binding.action))
-                ))
-            })
-            .collect::<Vec<_>>();
-        render_list(
-            frame,
-            panels[0],
-            "Atalhos configuráveis",
-            items,
-            self.binding_index,
-        );
-        let selected = BINDINGS.get(self.binding_index);
-        let detail = format!(
-            "Preferências da interface\n\nDensidade\n{}\n\nAtalho selecionado\n{}\n\nTecla atual\n{}\n\nEnter altera o atalho selecionado. As preferências ficam em ui.json, separadas de identidade, segredos e configuração de sincronização.\n\nAtalhos globais fixos\n1..5 abas · Tab/Shift+Tab navegar · ↑↓ selecionar · ? ajuda · Esc voltar · q sair",
-            if self.preferences.dense { "compacta" } else { "confortável" },
-            selected.map(|binding| binding.label).unwrap_or("nenhum"),
-            selected.map(|binding| display_key(self.preferences.key(binding.action))).unwrap_or_else(|| "—".into())
-        );
-        render_detail(frame, panels[1], "Interface", detail);
-    }
-
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let actions = BINDINGS
             .iter()
@@ -1551,17 +1315,14 @@ impl Ui {
             .map(|binding| {
                 format!(
                     "{} {}",
-                    display_key(self.preferences.key(binding.action)),
+                    display_key(binding.default),
                     short_action(binding.label)
                 )
             })
             .collect::<Vec<_>>()
             .join("  ");
-        let text = if self.preferences.dense {
-            format!("{actions}  ·  ? ajuda")
-        } else {
-            format!("{actions}\n1..5 abas  Tab/Shift+Tab navegar  ↑↓ selecionar  ? ajuda  q sair")
-        };
+        let text =
+            format!("{actions}\n1..4 abas  Tab/Shift+Tab navegar  ↑↓ selecionar  ? ajuda  q sair");
         frame.render_widget(
             Paragraph::new(text)
                 .style(Style::default().fg(MUTED))
@@ -1612,19 +1373,13 @@ pub fn run(home: &Path) -> Result<()> {
                 let _ = worker.join();
             }
         }
-        if worker.is_none()
-            && ui
-                .snapshot
-                .device
-                .as_ref()
-                .is_some_and(|device| device.configured)
-        {
+        if worker.is_none() && ui.snapshot.device.configured {
             let worker_home = home.to_path_buf();
             let worker_stop = stop.clone();
             let worker_tx = tx.clone();
             worker = Some(std::thread::spawn(move || {
                 if let Err(error) =
-                    rowd_app::serve(&worker_home, None, false, worker_stop, |message| {
+                    App::new(&worker_home).serve(None, false, worker_stop, |message| {
                         let _ = worker_tx.send(UiEvent::Notice(message));
                     })
                 {
@@ -1638,9 +1393,6 @@ pub fn run(home: &Path) -> Result<()> {
                 UiEvent::JobDone(message) => {
                     ui.job = None;
                     ui.notice = message;
-                    if let Ok(preferences) = app.load_ui_preferences() {
-                        ui.preferences = preferences.unwrap_or_default();
-                    }
                     ui.dirty = true;
                 }
             }
@@ -1731,14 +1483,14 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, title: &str, text: String) {
     );
 }
 
-fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal, preferences: &UiPreferences) {
+fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal) {
     match modal {
         Modal::Help => {
             let popup = centered(area, 92, 32);
             frame.render_widget(Clear, popup);
             let mut lines = vec![
                 "Navegação global".to_string(),
-                "1..5 abre aba · Tab/Shift+Tab alterna · ↑↓ seleciona · Esc fecha · q sai".into(),
+                "1..4 abre aba · Tab/Shift+Tab alterna · ↑↓ seleciona · Esc fecha · q sai".into(),
                 String::new(),
             ];
             for tab in Tab::ALL {
@@ -1748,11 +1500,7 @@ fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal, preferences: &
                         .iter()
                         .filter(|binding| binding.tab == tab)
                         .map(|binding| {
-                            format!(
-                                "{} {}",
-                                display_key(preferences.key(binding.action)),
-                                binding.label
-                            )
+                            format!("{} {}", display_key(binding.default), binding.label)
                         })
                         .collect::<Vec<_>>()
                         .join("  ·  "),
@@ -1789,7 +1537,7 @@ fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal, preferences: &
                 format!(
                     "Leia no Android\n{}\nFingerprint SHA-256\n{}\nSVG privado: {}",
                     info.qr,
-                    info.fingerprint,
+                    info.device.fingerprint,
                     info.qr_image.display()
                 )
             } else {
@@ -1797,7 +1545,7 @@ fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal, preferences: &
                     "O terminal está pequeno para este QR.\nAmplie para cerca de {} × {}.\n\nFingerprint SHA-256\n{}\n\nFallback SVG\n{}",
                     desired_width,
                     desired_height,
-                    info.fingerprint,
+                    info.device.fingerprint,
                     info.qr_image.display()
                 )
             };
@@ -1849,17 +1597,6 @@ fn centered(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
 }
 
 fn share_detail(status: &Status) -> String {
-    let pending = if status.pending_paths.is_empty() {
-        "nenhum".into()
-    } else {
-        status
-            .pending_paths
-            .iter()
-            .take(6)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n  ")
-    };
     let conflicts = if status.conflicts.is_empty() {
         "nenhum".into()
     } else {
@@ -1889,16 +1626,14 @@ fn share_detail(status: &Status) -> String {
         .or_else(|| status.error.clone())
         .unwrap_or_else(|| "nenhum".into());
     format!(
-        "{}\n\nEstado\n{}\n\nRaiz PC\n{} · {}\n\nPasta Android\n{}\n\nModo\n{}\n\nÚltimo sync\n{}\n\nPendências ({})\n  {}\n\nConflitos ({})\n  {}\n\nÚltimo erro\n{}",
+        "{}\n\nEstado\n{}\n\nRaiz PC\n{} · {}\n\nPasta Android\n{}\n\nModo\n{}\n\nÚltimo sync\n{}\n\nConflitos ({})\n  {}\n\nÚltimo erro\n{}",
         status.share.name,
         if status.share.enabled { "ativo" } else { "pausado" },
         status.share.root.display(),
         if status.root_available { "disponível" } else { "indisponível" },
-        if status.share.android_path.is_empty() { "aguardando seleção no Android" } else { &status.share.android_path },
+        if status.share.remap_policy.is_some() { "aguardando nova seleção no Android" } else { "definida no aparelho (SAF)" },
         mode_label(status.share.mode),
         timestamp_label(status.last_sync),
-        status.pending,
-        pending,
         status.conflicts.len(),
         conflicts,
         last_error
@@ -1952,15 +1687,6 @@ fn mode_value(mode: SyncMode) -> &'static str {
         SyncMode::Bidirectional => "bidirectional",
         SyncMode::ToAndroid => "to_android",
         SyncMode::ToPc => "to_pc",
-    }
-}
-
-fn request_state(state: ShareRequestState) -> &'static str {
-    match state {
-        ShareRequestState::Pending => "PENDENTE",
-        ShareRequestState::Accepted => "ACEITA",
-        ShareRequestState::Rejected => "REJEITADA",
-        ShareRequestState::Cancelled => "CANCELADA",
     }
 }
 
@@ -2061,21 +1787,12 @@ mod tests {
     }
 
     #[test]
-    fn keymap_uses_persisted_contextual_override() {
-        let mut preferences = UiPreferences::default();
-        preferences.set_key(UiAction::AddShare, "c").unwrap();
-        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    fn keymap_uses_fixed_contextual_bindings() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(matches!(
-            KeyMap::resolve(key, Tab::Shares, &preferences),
+            KeyMap::resolve(key, Tab::Shares),
             Some(KeyCommand::Action(UiAction::AddShare))
         ));
-        assert!(KeyMap::resolve(key, Tab::Device, &preferences).is_none());
-    }
-
-    #[test]
-    fn reserved_or_duplicate_keys_are_rejected() {
-        let mut preferences = UiPreferences::default();
-        assert!(preferences.set_key(UiAction::AddShare, "q").is_err());
-        assert!(preferences.set_key(UiAction::AddShare, "e").is_err());
+        assert!(KeyMap::resolve(key, Tab::Device).is_none());
     }
 }

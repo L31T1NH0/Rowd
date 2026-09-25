@@ -15,6 +15,7 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
 
 [dev-dependencies]
+rowd-core = { path = "../rowd-core", features = ["dev-tools"] }
 tempfile = "3"
 hex.workspace = true
 rcgen = "0.13"

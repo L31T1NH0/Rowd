@@ -1,6 +1,25 @@
 #[derive(Default, Clone)]
 pub struct Ignore(Vec<String>);
 impl Ignore {
+    pub fn validate(text: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(text.len() <= 64 * 1024, ".rowdignore is too large");
+        for (index, raw) in text.lines().enumerate() {
+            let rule = raw.trim();
+            if rule.is_empty() || rule.starts_with('#') {
+                continue;
+            }
+            anyhow::ensure!(
+                !rule.starts_with('!')
+                    && !rule.starts_with('/')
+                    && !rule.contains('\\')
+                    && !rule.split('/').any(|part| part == "..")
+                    && !rule.chars().any(char::is_control),
+                "unsupported .rowdignore rule on line {}",
+                index + 1
+            );
+        }
+        Ok(())
+    }
     pub fn parse(text: &str) -> Self {
         Self(
             text.lines()
@@ -11,6 +30,9 @@ impl Ignore {
         )
     }
     pub fn matches(&self, path: &str, directory: bool) -> bool {
+        if path == "Rowd Conflicts" || path.starts_with("Rowd Conflicts/") {
+            return false;
+        }
         if path.split('/').any(|s| s == ".rowd") || path == ".rowdignore" {
             return true;
         }
@@ -74,5 +96,12 @@ mod tests {
         for p in ["node_modules", "docs/public/a", "a.tmp.txt"] {
             assert!(!i.matches(p, false), "{p}");
         }
+    }
+    #[test]
+    fn conflict_copies_ignore_user_wildcards() {
+        let ignore = Ignore::parse("*\nRowd Conflicts/\n");
+        assert!(!ignore.matches("Rowd Conflicts", true));
+        assert!(!ignore.matches("Rowd Conflicts/abc/def/file", false));
+        assert!(ignore.matches("other", false));
     }
 }
