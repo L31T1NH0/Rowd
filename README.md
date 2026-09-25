@@ -1,6 +1,4 @@
-<img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="128">
-
-# Rowd
+# <img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="40"> Rowd
 
 Rowd syncs folders between one Linux PC and one Android phone on the same local network. You choose which folders connect and whether files travel both ways, to Android, or to the PC. The devices transfer files over TLS without a cloud account or relay.
 
