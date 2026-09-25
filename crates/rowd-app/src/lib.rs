@@ -446,6 +446,15 @@ fn device_runtime(home: &Path) -> DeviceRuntime {
 }
 
 fn record_share_error(home: &Path, share_id: &str, operation: &str, error: &anyhow::Error) {
+    rowd_core::trace::event(
+        "sync",
+        "error",
+        Some(share_id),
+        None,
+        None,
+        None,
+        Some(operation),
+    );
     let path = runtime_path(home, share_id);
     let mut runtime: ShareRuntime = File::open(&path)
         .ok()

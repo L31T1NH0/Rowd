@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod storage;
 pub mod sync;
 pub mod tls;
+pub mod trace;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};

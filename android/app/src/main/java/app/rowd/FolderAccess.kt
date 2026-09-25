@@ -26,6 +26,13 @@ class FolderAccess(private val context: Context) {
     }
 
     private val resolver = context.contentResolver
+    private fun <T> traced(name: String, path: String?, block: () -> T): T {
+        if (!PerformanceTrace.enabled()) return block()
+        val share = active?.optString("share_id")
+        val start = PerformanceTrace.now()
+        PerformanceTrace.event("${name}_start", share, path)
+        return try { block() } finally { PerformanceTrace.event("${name}_end", share, path, start = start) }
+    }
     private val recovery = File(context.filesDir, "recovery").apply { mkdirs() }
     private val definitions = File(context.filesDir, "shares.json")
     private val requests = File(context.filesDir, "share-requests.json")
@@ -721,16 +728,18 @@ class FolderAccess(private val context: Context) {
     }
 
     private fun copyToPrivate(document: DocumentFile, file: File, deadline: Long? = null) {
-        val input = resolver.openInputStream(document.uri) ?: error("Não foi possível abrir ${document.name}")
+        val input = traced("saf_open", null) { resolver.openInputStream(document.uri) ?: error("Não foi possível abrir ${document.name}") }
         input.use { source -> FileOutputStream(file).use { out ->
             val buffer = ByteArray(64 * 1024)
-            while (true) {
-                if (deadline != null) checkLocalDeadline(deadline)
-                val count = source.read(buffer)
-                if (count < 0) break
-                out.write(buffer, 0, count)
+            traced("saf_copy", null) {
+                while (true) {
+                    if (deadline != null) checkLocalDeadline(deadline)
+                    val count = source.read(buffer)
+                    if (count < 0) break
+                    out.write(buffer, 0, count)
+                }
             }
-            out.fd.sync()
+            traced("snapshot_fsync", null) { out.fd.sync() }
         } }
     }
 
@@ -908,17 +917,22 @@ class FolderAccess(private val context: Context) {
 
     fun snapshot(path: String): String {
         val started = android.os.SystemClock.elapsedRealtime()
+        val traceStarted = PerformanceTrace.now()
+        val share = active?.optString("share_id")
+        PerformanceTrace.event("snapshot_start", share, path)
         val deadline = android.os.SystemClock.elapsedRealtime() + LOCAL_OP_TIMEOUT_MS
         checkLocalDeadline(deadline)
         check(!ignored(path,false,ignoreRules())) { "Caminho ignorado: $path" }
-        val source = find(path) ?: error("STALE_SOURCE: $path")
+        val source = traced("saf_find", path) { find(path) } ?: error("STALE_SOURCE: $path")
         val staged = File.createTempFile("rowd-send-", ".part", context.cacheDir)
         try {
             val (hash, size) = FileOutputStream(staged).use { output ->
-                val result = digest(resolver.openInputStream(source.uri) ?: error("STALE_SOURCE: $path"), output, deadline)
-                output.fd.sync()
+                val input = traced("saf_open", path) { resolver.openInputStream(source.uri) ?: error("STALE_SOURCE: $path") }
+                val result = traced("saf_copy", path) { digest(input, output, deadline) }
+                traced("snapshot_fsync", path) { output.fd.sync() }
                 result
             }
+            PerformanceTrace.event("snapshot_end", share, path, size, traceStarted)
             android.util.Log.i("RowdLatency", "snapshot_ms=${android.os.SystemClock.elapsedRealtime() - started} bytes=$size")
             return JSONObject().put("path", staged.absolutePath).put("hash", hash).put("size", size).toString()
         } catch (e: Exception) { staged.delete(); throw e }
@@ -926,16 +940,20 @@ class FolderAccess(private val context: Context) {
 
     fun install(path: String, expectedHash: String, newHash: String, sourcePath: String): String {
         val started = android.os.SystemClock.elapsedRealtime()
+        val traceStarted = PerformanceTrace.now()
+        val share = active?.optString("share_id")
+        PerformanceTrace.event("install_start", share, path)
         check(!ignored(path,false,ignoreRules())) { "Caminho ignorado: $path" }
         active?.optString("share_id")?.takeIf(String::isNotEmpty)?.let { id ->
             synchronized(scanLock) { dirtyPaths.getOrPut(id) { mutableSetOf() }.add(path) }
         }
         val source = File(sourcePath)
-        val old = find(path)
-        val actual = old?.let { hash(it) } ?: ""
+        val old = traced("saf_find", path) { find(path) }
+        val actual = traced("target_hash", path) { old?.let { hash(it) } ?: "" }
         if (actual == newHash) {
             check(digest(source.inputStream()).first == newHash) { "SHA-256 não confere." }
             android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} replay=true")
+            PerformanceTrace.event("install_end", share, path, start = traceStarted)
             return "ok"
         }
         check(actual == expectedHash) { "STALE_TARGET: $path" }
@@ -945,9 +963,9 @@ class FolderAccess(private val context: Context) {
         val journalFile = File(recovery, "$id.json")
         try {
             FileOutputStream(incoming).use { out ->
-                val (hash, _) = digest(source.inputStream(), out)
+                val (hash, _) = traced("incoming_copy", path) { digest(source.inputStream(), out) }
                 check(hash == newHash) { "SHA-256 não confere." }
-                out.fd.sync()
+                traced("incoming_fsync", path) { out.fd.sync() }
             }
         } catch (error: Exception) {
             incoming.delete()
@@ -955,8 +973,8 @@ class FolderAccess(private val context: Context) {
         }
         if (old != null) {
             val backupHash = FileOutputStream(backup).use { output ->
-                val result = digest(resolver.openInputStream(old.uri) ?: error("STALE_TARGET: $path"), output)
-                output.fd.sync()
+                val result = traced("backup_copy", path) { digest(resolver.openInputStream(old.uri) ?: error("STALE_TARGET: $path"), output) }
+                traced("backup_fsync", path) { output.fd.sync() }
                 result.first
             }
             check(backupHash == expectedHash) { "STALE_TARGET: $path" }
@@ -964,22 +982,23 @@ class FolderAccess(private val context: Context) {
         val preparedMs = android.os.SystemClock.elapsedRealtime() - started
         val journal = JSONObject().put("path", path).put("tree", activeTree.toString())
             .put("share_id", active?.optString("share_id") ?: "").put("oldHash", expectedHash).put("newHash", newHash).put("finished", false)
-        persist(journalFile, journal)
+        traced("journal_persist", path) { persist(journalFile, journal) }
         // SAF lacks atomic compare-and-replace. Recheck immediately and retain both snapshots.
-        if ((find(path)?.let { hash(it) } ?: "") != expectedHash) {
+        if (traced("target_recheck", path) { find(path)?.let { hash(it) } ?: "" } != expectedHash) {
             // No shared document was touched; this is an aborted operation, not a crash.
             journal.put("finished", true)
-            persist(journalFile, journal)
+            traced("journal_persist", path) { persist(journalFile, journal) }
             error("STALE_TARGET: $path")
         }
         val (directory, name) = parent(path)
         val target = old ?: directory.createFile("application/octet-stream", name)
             ?: error("Não foi possível criar $path")
         check(target.name == name) { "O provedor alterou o nome do arquivo; sincronização interrompida." }
-        writeDocument(incoming, target)
-        check(hash(target) == newHash) { "Falha na gravação. Cópias preservadas para recuperação." }
+        traced("saf_write", path) { writeDocument(incoming, target) }
+        check(traced("target_verify", path) { hash(target) } == newHash) { "Falha na gravação. Cópias preservadas para recuperação." }
         journal.put("finished", true)
-        persist(journalFile, journal)
+        traced("journal_persist", path) { persist(journalFile, journal) }
+        PerformanceTrace.event("install_end", share, path, start = traceStarted)
         android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} prepare_ms=$preparedMs")
         return "ok"
     }

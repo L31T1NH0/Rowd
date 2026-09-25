@@ -4,6 +4,7 @@ use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use rowd_app::App;
 use rowd_core::config::{RemapPolicy, SyncMode};
+use rowd_core::trace;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -54,6 +55,8 @@ enum Command {
         listen: Option<String>,
         #[arg(long)]
         once: bool,
+        #[arg(long)]
+        trace: bool,
     },
     Scan,
     Shares,
@@ -280,12 +283,26 @@ fn run() -> Result<()> {
                 app.import_backup(&input, &passphrase)?
             }
         },
-        Command::Run { listen, once } => app.serve(
-            listen.as_deref(),
+        Command::Run {
+            listen,
             once,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            |event| println!("{event}"),
-        )?,
+            trace: tracing,
+        } => {
+            if tracing {
+                std::fs::create_dir_all(home.join(".rowd"))?;
+                trace::enable(&home.join(".rowd/performance-trace-pc.jsonl"), "pc")?;
+            }
+            let result = app.serve(
+                listen.as_deref(),
+                once,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                |event| println!("{event}"),
+            );
+            if tracing {
+                trace::disable()?;
+            }
+            result?;
+        }
         Command::Scan => app.scan(true)?,
         Command::Shares => println!("{}", serde_json::to_string_pretty(&app.status()?)?),
         Command::Recovery {

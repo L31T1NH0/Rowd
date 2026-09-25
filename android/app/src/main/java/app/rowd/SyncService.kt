@@ -72,6 +72,10 @@ class SyncService : Service() {
     }
     override fun onCreate() {
         super.onCreate()
+        if (getSharedPreferences("rowd", MODE_PRIVATE).getBoolean("performanceTrace", false) && !PerformanceTrace.enabled()) {
+            runCatching { PerformanceTrace.enable(this) }
+                .onFailure { android.util.Log.e("RowdTrace", "Não foi possível iniciar o trace", it) }
+        }
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("sync", "Sincronização", NotificationManager.IMPORTANCE_LOW)
         )

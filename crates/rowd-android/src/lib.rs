@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use jni::{
     objects::{JObject, JString, JValue},
-    sys::jstring,
+    sys::{jboolean, jstring},
     JNIEnv,
 };
 use rowd_core::{
@@ -12,6 +12,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use std::time::Instant;
 use tempfile::{NamedTempFile, TempPath};
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -43,6 +44,7 @@ struct AndroidStore<'a, 'b, 'c> {
     focus: Option<Vec<String>>,
     metrics: rowd_core::storage::StoreMetrics,
     token_key: Option<String>,
+    share_id: Option<String>,
 }
 impl AndroidStore<'_, '_, '_> {
     fn request_records(&mut self) -> Result<Vec<serde_json::Value>> {
@@ -163,9 +165,28 @@ impl Store for AndroidStore<'_, '_, '_> {
         let file = std::fs::File::open(&owned)?;
         let hash = staged["hash"].as_str().context("snapshot hash missing")?;
         let size = staged["size"].as_u64().context("snapshot size missing")?;
+        rowd_core::trace::event(
+            "storage",
+            "snapshot_verify_start",
+            self.share_id.as_deref(),
+            Some(path),
+            Some(size),
+            None,
+            None,
+        );
+        let verifying = Instant::now();
         let verified =
             VerifiedStaged::from_digest(NamedTempFile::from_parts(file, owned), entry, hash, size)
                 .with_context(|| format!("STALE_SOURCE: {path}"))?;
+        rowd_core::trace::event(
+            "storage",
+            "snapshot_verify_end",
+            self.share_id.as_deref(),
+            Some(path),
+            Some(size),
+            Some(verifying),
+            None,
+        );
         check_cancelled()?;
         Ok(verified)
     }
@@ -194,6 +215,29 @@ impl Store for AndroidStore<'_, '_, '_> {
     }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_setTrace(
+    mut env: JNIEnv,
+    _class: JObject,
+    path: JString,
+) -> jboolean {
+    if let Ok(path) = env.get_string(&path) {
+        let path: String = path.into();
+        let result = if path.is_empty() {
+            rowd_core::trace::disable()
+        } else {
+            rowd_core::trace::enable(std::path::Path::new(&path), "android")
+        };
+        return result.is_ok().into();
+    }
+    false.into()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_flushTrace(_env: JNIEnv, _class: JObject) {
+    let _ = rowd_core::trace::flush();
+}
+
 impl rowd_core::managed::ManagedClient for AndroidStore<'_, '_, '_> {
     fn configure(&mut self, shares: &[rowd_core::config::ShareDefinition]) -> Result<()> {
         self.call("configureShares", &[&serde_json::to_string(shares)?])?;
@@ -202,6 +246,7 @@ impl rowd_core::managed::ManagedClient for AndroidStore<'_, '_, '_> {
     fn select(&mut self, id: &str) -> Result<()> {
         check_cancelled()?;
         self.call("selectShare", &[id])?;
+        self.share_id = Some(id.to_owned());
         self.ignore = rowd_core::ignore::Ignore::parse(&self.call("ignoreText", &[])?);
         self.token_key = Some(format!("{id}|{}", self.call("bindingIdentity", &[])?));
         Ok(())
@@ -306,6 +351,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
             },
             metrics: Default::default(),
             token_key: None,
+            share_id: None,
         };
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
@@ -362,7 +408,18 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
     }));
     let output = match result {
         Ok(Ok(value)) => value,
-        Ok(Err(e)) => serde_json::json!({"error":format!("{e:#}")}).to_string(),
+        Ok(Err(e)) => {
+            rowd_core::trace::event(
+                "sync",
+                "error",
+                None,
+                None,
+                None,
+                None,
+                Some("round_failed"),
+            );
+            serde_json::json!({"error":format!("{e:#}")}).to_string()
+        }
         Err(_) => {
             serde_json::json!({"error":"Falha interna do Rowd; os backups foram preservados."})
                 .to_string()

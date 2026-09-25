@@ -9,6 +9,7 @@ use crate::{
     },
     protocol::{self, Message},
     storage::{atomic_write, Snapshot, Store, VerifiedStaged},
+    trace,
 };
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -116,13 +117,36 @@ fn session_tokens() -> &'static Mutex<BTreeMap<PathBuf, String>> {
     TOKENS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn persist_state(path: &Path, state: &State, metrics: &mut ShareMetrics) -> Result<()> {
+fn persist_state(
+    path: &Path,
+    state: &State,
+    metrics: &mut ShareMetrics,
+    file: Option<&str>,
+) -> Result<()> {
     let started = Instant::now();
+    trace::event(
+        "sync",
+        "state_persist_start",
+        Some(&state.share_id),
+        file,
+        None,
+        None,
+        None,
+    );
     let bytes = serde_json::to_vec(state)?;
     atomic_write(path, &bytes)?;
     metrics.state_persist_ms += started.elapsed().as_millis();
     metrics.state_persist_count += 1;
     metrics.state_bytes_written += bytes.len() as u64;
+    trace::event(
+        "sync",
+        "state_persist_end",
+        Some(&state.share_id),
+        file,
+        Some(bytes.len() as u64),
+        Some(started),
+        None,
+    );
     Ok(())
 }
 
@@ -145,6 +169,15 @@ fn remote_snapshot(
     first_byte_ms: &mut Option<u128>,
     round_started: Instant,
 ) -> Result<Snapshot> {
+    trace::event(
+        "sync",
+        "get_sent",
+        Some(share_id),
+        Some(path),
+        Some(entry.size),
+        None,
+        None,
+    );
     protocol::send_for(
         io,
         share_id,
@@ -158,7 +191,27 @@ fn remote_snapshot(
     };
     ensure!(actual == *entry, "STALE_SOURCE");
     first_byte_ms.get_or_insert_with(|| round_started.elapsed().as_millis());
-    receive_blob(io, entry)
+    trace::event(
+        "sync",
+        "blob_receive_start",
+        Some(share_id),
+        Some(path),
+        Some(entry.size),
+        None,
+        None,
+    );
+    let started = Instant::now();
+    let blob = receive_blob(io, entry)?;
+    trace::event(
+        "sync",
+        "blob_receive_end",
+        Some(share_id),
+        Some(path),
+        Some(entry.size),
+        Some(started),
+        None,
+    );
+    Ok(blob)
 }
 fn remote_install(
     share_id: &str,
@@ -172,6 +225,15 @@ fn remote_install(
         staged.entry() == entry,
         "staged entry does not match transfer"
     );
+    trace::event(
+        "sync",
+        "put_sent",
+        Some(share_id),
+        Some(path),
+        Some(entry.size),
+        None,
+        None,
+    );
     protocol::send_for(
         io,
         share_id,
@@ -181,10 +243,38 @@ fn remote_install(
             entry: entry.clone(),
         },
     )?;
+    trace::event(
+        "sync",
+        "blob_send_start",
+        Some(share_id),
+        Some(path),
+        Some(entry.size),
+        None,
+        None,
+    );
+    let sending = Instant::now();
     protocol::copy_exact(&mut File::open(staged.path())?, io, entry.size)?;
+    trace::event(
+        "sync",
+        "blob_send_end",
+        Some(share_id),
+        Some(path),
+        Some(entry.size),
+        Some(sending),
+        None,
+    );
     ensure!(
         matches!(protocol::receive_for(io, share_id)?, Message::Accept),
         "expected file confirmation"
+    );
+    trace::event(
+        "sync",
+        "accept_received",
+        Some(share_id),
+        Some(path),
+        None,
+        None,
+        None,
     );
     Ok(())
 }
@@ -214,14 +304,41 @@ fn drain_puts(
 ) -> Result<()> {
     for job in pending.drain(..) {
         let waiting = Instant::now();
+        trace::event(
+            "sync",
+            "peer_wait_start",
+            Some(&state.share_id),
+            Some(&job.path),
+            None,
+            None,
+            None,
+        );
         ensure!(
             matches!(protocol::receive_for(io, &state.share_id)?, Message::Accept),
             "expected file confirmation"
         );
+        trace::event(
+            "sync",
+            "accept_received",
+            Some(&state.share_id),
+            Some(&job.path),
+            None,
+            None,
+            None,
+        );
         report.metrics.wait_peer_ms += waiting.elapsed().as_millis();
+        trace::event(
+            "sync",
+            "peer_wait_end",
+            Some(&state.share_id),
+            Some(&job.path),
+            None,
+            Some(waiting),
+            None,
+        );
         state.files.insert(job.path.clone(), job.entry.hash.clone());
         store.acknowledge(&job.path, &job.entry)?;
-        persist_state(state_path, state, &mut report.metrics)?;
+        persist_state(state_path, state, &mut report.metrics, Some(&job.path))?;
         report.metrics.bytes_transferred += job.entry.size;
         report.metrics.control_messages += 2;
         report.transferred += 1;
@@ -243,9 +360,27 @@ fn drain_gets(
     let mut staged = Vec::with_capacity(pending.len());
     for job in pending.drain(..) {
         let waiting = Instant::now();
+        trace::event(
+            "sync",
+            "peer_wait_start",
+            Some(&state.share_id),
+            Some(&job.path),
+            None,
+            None,
+            None,
+        );
         let Message::Blob { entry: actual } = protocol::receive_for(io, &state.share_id)? else {
             anyhow::bail!("expected blob")
         };
+        trace::event(
+            "sync",
+            "peer_wait_end",
+            Some(&state.share_id),
+            Some(&job.path),
+            None,
+            Some(waiting),
+            None,
+        );
         ensure!(actual == job.entry, "STALE_SOURCE");
         report.metrics.wait_peer_ms += waiting.elapsed().as_millis();
         report
@@ -253,20 +388,56 @@ fn drain_gets(
             .first_byte_ms
             .get_or_insert_with(|| round_started.elapsed().as_millis());
         let transferring = Instant::now();
+        trace::event(
+            "sync",
+            "blob_receive_start",
+            Some(&state.share_id),
+            Some(&job.path),
+            Some(job.entry.size),
+            None,
+            None,
+        );
         let snapshot = receive_blob(io, &job.entry)?;
+        trace::event(
+            "sync",
+            "blob_receive_end",
+            Some(&state.share_id),
+            Some(&job.path),
+            Some(job.entry.size),
+            Some(transferring),
+            None,
+        );
         report.metrics.transfer_ms += transferring.elapsed().as_millis();
         staged.push((job, snapshot));
     }
     for (job, snapshot) in staged {
         let installing = Instant::now();
+        trace::event(
+            "sync",
+            "install_start",
+            Some(&state.share_id),
+            Some(&job.path),
+            Some(job.entry.size),
+            None,
+            None,
+        );
         store.install(&job.path, job.expected.as_deref(), &job.entry, &snapshot)?;
+        trace::event(
+            "sync",
+            "install_end",
+            Some(&state.share_id),
+            Some(&job.path),
+            Some(job.entry.size),
+            Some(installing),
+            None,
+        );
         report.metrics.install_ms += installing.elapsed().as_millis();
         ack_batch.insert(job.path.clone(), job.entry.clone());
         if ack_batch.len() == protocol::MANIFEST_CHUNK_FILES {
             flush_ack_batch(io, &state.share_id, ack_batch, &mut report.metrics)?;
         }
-        state.files.insert(job.path, job.entry.hash);
-        persist_state(state_path, state, &mut report.metrics)?;
+        state.files.insert(job.path.clone(), job.entry.hash);
+        persist_state(state_path, state, &mut report.metrics, Some(&job.path))?;
         report.metrics.bytes_transferred += job.entry.size;
         report.metrics.control_messages += 2;
         report.transferred += 1;
@@ -281,6 +452,15 @@ fn flush_ack_batch(
     metrics: &mut ShareMetrics,
 ) -> Result<()> {
     if !batch.is_empty() {
+        trace::event(
+            "sync",
+            "ack_sent",
+            Some(share_id),
+            None,
+            Some(batch.len() as u64),
+            None,
+            None,
+        );
         metrics.ack_entries += batch.len() as u64;
         protocol::send_for(
             io,
@@ -331,11 +511,38 @@ pub fn coordinate_with_progress(
 ) -> Result<Report> {
     let started = Instant::now();
     let share_id = state.share_id.clone();
+    trace::event(
+        "sync",
+        "round_start",
+        Some(&share_id),
+        None,
+        None,
+        None,
+        None,
+    );
     let store_metrics_before = store.metrics();
     let previous_token = session_tokens().lock().unwrap().remove(state_path);
     let session_matches = previous_token.is_some();
     state.base_token = None;
     let manifest_started = Instant::now();
+    trace::event(
+        "sync",
+        "manifest_start",
+        Some(&share_id),
+        None,
+        None,
+        None,
+        None,
+    );
+    trace::event(
+        "sync",
+        "scan_start",
+        Some(&share_id),
+        None,
+        None,
+        None,
+        None,
+    );
     let mut delta = None;
     if remap.is_none() && state.last_sync.is_some() && session_matches {
         if let Some(dirty) = store.delta_paths()? {
@@ -410,6 +617,28 @@ pub fn coordinate_with_progress(
         (pc, android, paths, metrics, bytes)
     };
     let android_count = android.len();
+    trace::event(
+        "sync",
+        "scan_end",
+        Some(&share_id),
+        None,
+        None,
+        Some(manifest_started),
+        if used_delta {
+            Some("delta")
+        } else {
+            Some("full")
+        },
+    );
+    trace::event(
+        "sync",
+        "manifest_end",
+        Some(&share_id),
+        None,
+        Some(manifest_bytes),
+        Some(manifest_started),
+        None,
+    );
     let received_chunks = if used_delta {
         0
     } else {
@@ -480,6 +709,15 @@ pub fn coordinate_with_progress(
     let mut put_bytes = 0u64;
     let mut get_bytes = 0u64;
     let total = paths.len();
+    trace::event(
+        "sync",
+        "reconcile_start",
+        Some(&share_id),
+        None,
+        Some(total as u64),
+        None,
+        None,
+    );
     for (index, path) in paths.into_iter().enumerate() {
         if store.excluded(&path) {
             continue;
@@ -537,7 +775,7 @@ pub fn coordinate_with_progress(
         if prohibited {
             state.conflicts.insert(path.clone());
             report.conflicts += 1;
-            persist_state(state_path, state, &mut report.metrics)?;
+            persist_state(state_path, state, &mut report.metrics, Some(&path))?;
             continue;
         }
         if action != Action::Conflict && !path.starts_with("Rowd Conflicts/") {
@@ -571,7 +809,25 @@ pub fn coordinate_with_progress(
                     put_bytes = 0;
                 }
                 let preparing = Instant::now();
+                trace::event(
+                    "sync",
+                    "snapshot_start",
+                    Some(&share_id),
+                    Some(&path),
+                    Some(entry.size),
+                    None,
+                    None,
+                );
                 let temp = store.snapshot(&path, entry)?;
+                trace::event(
+                    "sync",
+                    "snapshot_end",
+                    Some(&share_id),
+                    Some(&path),
+                    Some(entry.size),
+                    Some(preparing),
+                    None,
+                );
                 report.metrics.snapshot_ms += preparing.elapsed().as_millis();
                 report.metrics.socket_idle_ms += preparing.elapsed().as_millis();
                 if entry.size > MAX_STAGED_BYTES {
@@ -589,6 +845,15 @@ pub fn coordinate_with_progress(
                     report.metrics.control_messages += 2;
                 } else {
                     let started_transfer = Instant::now();
+                    trace::event(
+                        "sync",
+                        "put_sent",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
                     protocol::send_for(
                         io,
                         &share_id,
@@ -602,7 +867,26 @@ pub fn coordinate_with_progress(
                         .metrics
                         .first_byte_ms
                         .get_or_insert_with(|| started.elapsed().as_millis());
+                    trace::event(
+                        "sync",
+                        "blob_send_start",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
+                    let sending = Instant::now();
                     protocol::copy_exact(&mut File::open(temp.path())?, io, entry.size)?;
+                    trace::event(
+                        "sync",
+                        "blob_send_end",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        Some(sending),
+                        None,
+                    );
                     report.metrics.transfer_ms += started_transfer.elapsed().as_millis();
                     put_bytes += entry.size;
                     pending_puts.push(PendingPut {
@@ -650,7 +934,25 @@ pub fn coordinate_with_progress(
                         started,
                     )?;
                     let installing = Instant::now();
+                    trace::event(
+                        "sync",
+                        "install_start",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
                     store.install(&path, ph, entry, &temp)?;
+                    trace::event(
+                        "sync",
+                        "install_end",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        Some(installing),
+                        None,
+                    );
                     report.metrics.install_ms += installing.elapsed().as_millis();
                     report.metrics.transfer_ms += started_transfer.elapsed().as_millis();
                     ack_batch.insert(path.clone(), entry.clone());
@@ -662,6 +964,15 @@ pub fn coordinate_with_progress(
                     report.metrics.bytes_transferred += entry.size;
                     report.metrics.control_messages += 2;
                 } else {
+                    trace::event(
+                        "sync",
+                        "get_sent",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
                     protocol::send_for(
                         io,
                         &share_id,
@@ -720,7 +1031,7 @@ pub fn coordinate_with_progress(
         }
         // An unchanged scan should not rewrite the entire state once per file.
         if state.files.get(&path) != previous_base.as_ref() {
-            persist_state(state_path, state, &mut report.metrics)?;
+            persist_state(state_path, state, &mut report.metrics, Some(&path))?;
         }
     }
     drain_puts(io, store, state, state_path, &mut pending_puts, &mut report)?;
@@ -735,6 +1046,15 @@ pub fn coordinate_with_progress(
         started,
     )?;
     flush_ack_batch(io, &share_id, &mut ack_batch, &mut report.metrics)?;
+    trace::event(
+        "sync",
+        "reconcile_end",
+        Some(&share_id),
+        None,
+        Some(total as u64),
+        Some(started),
+        None,
+    );
     progress("", total, total);
     let first_sync = state.last_sync.is_none();
     state.last_sync = Some(
@@ -744,7 +1064,7 @@ pub fn coordinate_with_progress(
     );
     let new_token = crate::random_id()?;
     if first_sync {
-        persist_state(state_path, state, &mut report.metrics)?;
+        persist_state(state_path, state, &mut report.metrics, None)?;
     }
     let store_metrics = store.metrics();
     report.metrics.files_hashed = store_metrics
@@ -773,6 +1093,15 @@ pub fn coordinate_with_progress(
         .lock()
         .unwrap()
         .insert(state_path.to_path_buf(), new_token);
+    trace::event(
+        "sync",
+        "round_end",
+        Some(&share_id),
+        None,
+        Some(report.metrics.bytes_transferred),
+        Some(started),
+        None,
+    );
     Ok(report)
 }
 
@@ -786,6 +1115,16 @@ pub fn respond_share(
     expected_share: Option<&str>,
 ) -> Result<Report> {
     let mut share = expected_share.map(str::to_owned);
+    let started = Instant::now();
+    trace::event(
+        "sync",
+        "round_start",
+        expected_share,
+        None,
+        None,
+        None,
+        None,
+    );
     let result = (|| -> Result<Report> {
         loop {
             let Message::Scoped { share_id, message } = protocol::receive(io)? else {
@@ -798,6 +1137,15 @@ pub fn respond_share(
             }
             match *message {
                 Message::AckBatch { entries } => {
+                    trace::event(
+                        "sync",
+                        "ack_received",
+                        Some(&share_id),
+                        None,
+                        Some(entries.len() as u64),
+                        None,
+                        None,
+                    );
                     ensure!(
                         !entries.is_empty() && entries.len() <= protocol::MANIFEST_CHUNK_FILES,
                         "invalid ACK batch"
@@ -808,11 +1156,40 @@ pub fn respond_share(
                     }
                 }
                 Message::Scan => {
+                    let scanning = Instant::now();
+                    trace::event(
+                        "sync",
+                        "scan_start",
+                        Some(&share_id),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
                     store.set_base_token(None);
                     store.require_full_scan()?;
                     let before = store.metrics();
                     let files = store.scan()?;
+                    trace::event(
+                        "sync",
+                        "scan_end",
+                        Some(&share_id),
+                        None,
+                        Some(files.len() as u64),
+                        Some(scanning),
+                        None,
+                    );
                     let after = store.metrics();
+                    trace::event(
+                        "sync",
+                        "manifest_start",
+                        Some(&share_id),
+                        None,
+                        Some(files.len() as u64),
+                        None,
+                        None,
+                    );
+                    let manifest_started = Instant::now();
                     protocol::send_manifest_with_metrics(
                         io,
                         &share_id,
@@ -827,6 +1204,15 @@ pub fn respond_share(
                             ..Default::default()
                         },
                     )?;
+                    trace::event(
+                        "sync",
+                        "manifest_end",
+                        Some(&share_id),
+                        None,
+                        Some(files.len() as u64),
+                        Some(manifest_started),
+                        None,
+                    );
                 }
                 Message::DeltaScan { base_token, paths } => {
                     let old = store.base_token();
@@ -882,7 +1268,35 @@ pub fn respond_share(
                 }
                 Message::Get { path, entry } => {
                     crate::model::validate_path(&path)?;
+                    trace::event(
+                        "sync",
+                        "get_received",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
+                    let snapshot_started = Instant::now();
+                    trace::event(
+                        "sync",
+                        "snapshot_start",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
                     let temp = store.snapshot(&path, &entry)?;
+                    trace::event(
+                        "sync",
+                        "snapshot_end",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        Some(snapshot_started),
+                        None,
+                    );
                     protocol::send_for(
                         io,
                         &share_id,
@@ -890,7 +1304,26 @@ pub fn respond_share(
                             entry: entry.clone(),
                         },
                     )?;
+                    trace::event(
+                        "sync",
+                        "blob_send_start",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
+                    let sending = Instant::now();
                     protocol::copy_exact(&mut File::open(temp.path())?, io, entry.size)?;
+                    trace::event(
+                        "sync",
+                        "blob_send_end",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        Some(sending),
+                        None,
+                    );
                 }
                 Message::Put {
                     path,
@@ -899,9 +1332,65 @@ pub fn respond_share(
                 } => {
                     crate::model::validate_path(&path)?;
                     crate::model::validate_hash(&entry.hash)?;
+                    trace::event(
+                        "sync",
+                        "put_received",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
+                    trace::event(
+                        "sync",
+                        "blob_receive_start",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
+                    let receiving = Instant::now();
                     let temp = receive_blob(io, &entry)?;
+                    trace::event(
+                        "sync",
+                        "blob_receive_end",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        Some(receiving),
+                        None,
+                    );
+                    trace::event(
+                        "sync",
+                        "install_start",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        None,
+                        None,
+                    );
+                    let installing = Instant::now();
                     store.install(&path, expected.as_deref(), &entry, &temp)?;
+                    trace::event(
+                        "sync",
+                        "install_end",
+                        Some(&share_id),
+                        Some(&path),
+                        Some(entry.size),
+                        Some(installing),
+                        None,
+                    );
                     protocol::send_for(io, &share_id, Message::Accept)?;
+                    trace::event(
+                        "sync",
+                        "accept_sent",
+                        Some(&share_id),
+                        Some(&path),
+                        None,
+                        None,
+                        None,
+                    );
                 }
                 Message::Done {
                     transferred,
@@ -910,6 +1399,15 @@ pub fn respond_share(
                 } => {
                     crate::model::validate_hash(&base_token)?;
                     store.set_base_token(Some(base_token));
+                    trace::event(
+                        "sync",
+                        "round_end",
+                        Some(&share_id),
+                        None,
+                        Some(transferred as u64),
+                        Some(started),
+                        None,
+                    );
                     return Ok(Report {
                         pending_wakes: Vec::new(),
                         round_deferred: false,
@@ -924,6 +1422,19 @@ pub fn respond_share(
         }
     })();
     if let Err(ref e) = result {
+        trace::event(
+            "sync",
+            "error",
+            share.as_deref(),
+            None,
+            None,
+            None,
+            Some(if e.to_string().starts_with("STALE_") {
+                "stale"
+            } else {
+                "round_failed"
+            }),
+        );
         store.set_base_token(None);
         let _ = protocol::send(
             io,

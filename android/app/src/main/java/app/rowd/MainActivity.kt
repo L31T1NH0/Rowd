@@ -85,6 +85,9 @@ class MainActivity : AppCompatActivity() {
 
         }
     }
+    private val tracePicker = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) safely { PerformanceTrace.export(this, uri); message("Trace exportado", "Os dois arquivos de trace foram salvos no ZIP.") }
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (!prefs.contains("deviceId")) {
@@ -94,6 +97,7 @@ class MainActivity : AppCompatActivity() {
             prefs.edit().putString("deviceId", id).remove("rootId").apply()
         }
         ui = ActivityMainBinding.inflate(layoutInflater); setContentView(ui.root)
+        if (prefs.getBoolean("performanceTrace", false) && !PerformanceTrace.enabled()) safely { PerformanceTrace.enable(this) }
         ViewCompat.setOnApplyWindowInsetsListener(ui.page) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
             view.setPadding(bars.left, bars.top, bars.right, bars.bottom); insets
@@ -133,6 +137,21 @@ class MainActivity : AppCompatActivity() {
             }
         }
         ui.exportRecovery.setOnClickListener { recoveryPicker.launch(null) }
+        ui.performanceTrace.isChecked = prefs.getBoolean("performanceTrace", false)
+        var updatingTrace = false
+        ui.performanceTrace.setOnCheckedChangeListener { button, checked ->
+            if (updatingTrace) return@setOnCheckedChangeListener
+            try {
+                if (checked) PerformanceTrace.enable(this) else PerformanceTrace.disable()
+                prefs.edit().putBoolean("performanceTrace", checked).apply()
+            } catch (error: Exception) {
+                updatingTrace = true
+                button.isChecked = !checked
+                updatingTrace = false
+                message("Trace indisponível", error.message ?: "Não foi possível alterar o trace.")
+            }
+        }
+        ui.exportTrace.setOnClickListener { tracePicker.launch("rowd-performance-trace.zip") }
         ui.changeAddress.setOnClickListener {
             val current = prefs.getString("invitation", "")!!
             val input = EditText(this).apply { setSingleLine(); setText(previewInvitation(current).getString("address")); hint = "192.168.1.20:43821" }

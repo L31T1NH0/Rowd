@@ -21,6 +21,7 @@ use ratatui::{
 };
 use rowd_app::{App, AppSnapshot, ConnectionTest, PairingInfo, RecoveryItem, Status};
 use rowd_core::config::{RemapPolicy, ShareRequest, SyncMode};
+use rowd_core::trace;
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal},
@@ -101,6 +102,7 @@ enum UiAction {
     Pair,
     ShowQr,
     TestConnection,
+    ToggleTrace,
     ToggleGlobalPause,
     Unlink,
     ExportProfile,
@@ -116,7 +118,7 @@ impl UiAction {
     fn mutates(self) -> bool {
         !matches!(
             self,
-            Self::FilterRecovery | Self::ShowQr | Self::TestConnection
+            Self::FilterRecovery | Self::ShowQr | Self::TestConnection | Self::ToggleTrace
         )
     }
 }
@@ -236,6 +238,12 @@ const BINDINGS: &[BindingDef] = &[
         action: UiAction::TestConnection,
         tab: Tab::Device,
         label: "Testar conexão",
+        default: "T",
+    },
+    BindingDef {
+        action: UiAction::ToggleTrace,
+        tab: Tab::Device,
+        label: "Trace de desempenho",
         default: "t",
     },
     BindingDef {
@@ -745,6 +753,16 @@ impl Ui {
                 self.connection = Some(app.connection_test()?);
                 self.notice =
                     "Teste concluído; detalhes atualizados no painel do dispositivo.".into();
+            }
+            UiAction::ToggleTrace => {
+                if trace::enabled() {
+                    trace::disable()?;
+                    self.notice = "Trace de desempenho desligado.".into();
+                } else {
+                    std::fs::create_dir_all(app.home().join(".rowd"))?;
+                    trace::enable(&app.home().join(".rowd/performance-trace-pc.jsonl"), "pc")?;
+                    self.notice = "Trace de desempenho ligado.".into();
+                }
             }
             UiAction::ToggleGlobalPause => {
                 let paused = self.snapshot.device.sync_paused;
@@ -1272,16 +1290,17 @@ impl Ui {
         let device = &self.snapshot.device;
         let left = if device.configured {
             format!(
-                "Vínculo\n{}\n\nEndereço publicado\n{}\n\nÚltima conexão\n{}\n\nSincronização\n{}\n\nIdentidade do Android\n{}\n\nFingerprint SHA-256\n{}",
+                "Vínculo\n{}\n\nEndereço publicado\n{}\n\nÚltima conexão\n{}\n\nSincronização\n{}\n\nTrace de desempenho\n{}\n\nIdentidade do Android\n{}\n\nFingerprint SHA-256\n{}",
                 if device.paired { "Android vinculado" } else { "aguardando primeiro vínculo" },
                 device.address,
                 timestamp_label(device.last_connection),
                 if device.sync_paused { "pausada" } else { "ativa" },
+                if trace::enabled() { "Ligado" } else { "Desligado" },
                 short_id(&device.identity),
                 device.fingerprint
             )
         } else {
-            "Dispositivo ainda não configurado.\n\nPressione p, confirme o endereço alcançável na rede local e leia o QR no Android.".into()
+            format!("Dispositivo ainda não configurado.\n\nTrace de desempenho    {}\n\nPressione p, confirme o endereço alcançável na rede local e leia o QR no Android.", if trace::enabled() { "Ligado" } else { "Desligado" })
         };
         render_detail(frame, panels[0], "Confiança PC ↔ Android", left);
         let right = if let Some(test) = &self.connection {
@@ -1303,7 +1322,7 @@ impl Ui {
                 test.available_shares, test.total_shares
             )
         } else {
-            "Teste por camadas\n\nPC alcançável\nTCP\nTLS\nAutenticação\nDispositivo reconhecido\nShares disponíveis\n\nUse t para executar. Use o para abrir o QR compacto dentro do terminal; o SVG é mantido apenas como fallback/exportação.".into()
+            "Teste por camadas\n\nPC alcançável\nTCP\nTLS\nAutenticação\nDispositivo reconhecido\nShares disponíveis\n\nUse T para testar, t para alternar o trace e o para abrir o QR compacto no terminal.".into()
         };
         render_detail(frame, panels[1], "Diagnóstico e pareamento", right);
     }
@@ -1417,6 +1436,7 @@ pub fn run(home: &Path) -> Result<()> {
     if let Some(worker) = worker {
         let _ = worker.join();
     }
+    trace::disable()?;
     Ok(())
 }
 

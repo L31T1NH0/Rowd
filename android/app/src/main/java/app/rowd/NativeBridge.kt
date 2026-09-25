@@ -7,4 +7,6 @@ object NativeBridge {
     external fun previewInvitation(invitation: String, address: String): String
     external fun cancel()
     external fun resetCancellation()
+    external fun setTrace(path: String): Boolean
+    external fun flushTrace()
 }
