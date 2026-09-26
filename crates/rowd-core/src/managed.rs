@@ -136,7 +136,7 @@ pub fn client_round(
 }
 
 pub fn client_round_on(
-    io: &mut (impl std::io::Read + std::io::Write),
+    io: &mut (impl std::io::Read + std::io::Write + Send),
     root: &str,
     store: &mut impl ManagedClient,
 ) -> Result<Report> {
@@ -144,7 +144,7 @@ pub fn client_round_on(
 }
 
 pub fn client_round_on_excluding(
-    io: &mut (impl std::io::Read + std::io::Write),
+    io: &mut (impl std::io::Read + std::io::Write + Send),
     root: &str,
     store: &mut impl ManagedClient,
     skipped: &std::collections::BTreeSet<String>,

@@ -788,6 +788,7 @@ class FolderAccess(private val context: Context) {
             val changed = dirtyPaths.remove(shareId)?.toSet().orEmpty()
             Triple(if (deep) emptyMap() else scanCache[shareId].orEmpty(), changed, full)
         }
+        if (!focusedScan) PerformanceTrace.event("scheduled_audit", shareId)
         val nextCache = HashMap<String, ScanEntry>()
         val nextUris = HashMap<String, String>()
         val nextDirectories = HashMap<String, String>()
@@ -929,7 +930,6 @@ class FolderAccess(private val context: Context) {
             val (hash, size) = FileOutputStream(staged).use { output ->
                 val input = traced("saf_open", path) { resolver.openInputStream(source.uri) ?: error("STALE_SOURCE: $path") }
                 val result = traced("saf_copy", path) { digest(input, output, deadline) }
-                traced("snapshot_fsync", path) { output.fd.sync() }
                 result
             }
             PerformanceTrace.event("snapshot_end", share, path, size, traceStarted)
@@ -990,10 +990,16 @@ class FolderAccess(private val context: Context) {
             traced("journal_persist", path) { persist(journalFile, journal) }
             error("STALE_TARGET: $path")
         }
-        val (directory, name) = parent(path)
-        val target = old ?: directory.createFile("application/octet-stream", name)
-            ?: error("Não foi possível criar $path")
-        check(target.name == name) { "O provedor alterou o nome do arquivo; sincronização interrompida." }
+        val target = old ?: run {
+            val (directory, name) = traced("saf_parent", path) { parent(path) }
+            traced("saf_create", path) {
+                directory.createFile("application/octet-stream", name)
+                    ?: error("Não foi possível criar $path")
+            }
+        }
+        traced("target_name", path) {
+            check(target.name == path.substringAfterLast('/')) { "O provedor alterou o nome do arquivo; sincronização interrompida." }
+        }
         traced("saf_write", path) { writeDocument(incoming, target) }
         check(traced("target_verify", path) { hash(target) } == newHash) { "Falha na gravação. Cópias preservadas para recuperação." }
         journal.put("finished", true)

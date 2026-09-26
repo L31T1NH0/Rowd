@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MANIFEST_CHUNK_FILES: usize = 1024;
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -104,6 +104,7 @@ pub enum Message {
         entry: Entry,
         expected: Option<String>,
     },
+    PutBatchEnd,
     Accept,
     Done {
         transferred: usize,

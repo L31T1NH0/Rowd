@@ -338,8 +338,8 @@ fn watcher_defers_offline_hashing_until_connection() {
     let runtime: serde_json::Value =
         serde_json::from_slice(&fs::read(home.join(".rowd/device-runtime.json")).unwrap()).unwrap();
     let metrics = &runtime["last_round"]["per_share"][&id];
-    assert_eq!(metrics["full_scans"], 2);
-    assert_eq!(metrics["files_enumerated"], 2);
+    assert_eq!(metrics["full_scans"], 1);
+    assert_eq!(metrics["files_enumerated"], 1);
     assert_eq!(metrics["manifest_entries"], 1);
 }
 
@@ -718,6 +718,16 @@ fn persistent_connection_wakes_a_focused_share_and_reuses_auth_for_two_shares() 
     assert!(!phone.join("Second/new.txt").exists());
     fs::write(first.join("new.txt"), b"wake again").unwrap();
     fs::write(second.join("new.txt"), b"second").unwrap();
+    let mut woken = std::collections::BTreeSet::new();
+    while woken.len() < 2 {
+        match protocol::receive(&mut io).unwrap() {
+            Message::WakeShare { share_id } => {
+                assert!(share_id == first_id || share_id == second_id);
+                woken.insert(share_id);
+            }
+            _ => panic!("expected watcher wake"),
+        }
+    }
     device.focus(vec![first_id, second_id.clone()]);
     assert_eq!(
         rowd_core::managed::client_round_on(&mut io, &device_id, &mut device)

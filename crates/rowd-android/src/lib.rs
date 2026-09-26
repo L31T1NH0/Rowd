@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use jni::{
     objects::{JObject, JString, JValue},
     sys::{jboolean, jstring},
@@ -165,6 +165,7 @@ impl Store for AndroidStore<'_, '_, '_> {
         let file = std::fs::File::open(&owned)?;
         let hash = staged["hash"].as_str().context("snapshot hash missing")?;
         let size = staged["size"].as_u64().context("snapshot size missing")?;
+        ensure!(file.metadata()?.len() == size, "STALE_SOURCE: {path}");
         rowd_core::trace::event(
             "storage",
             "snapshot_verify_start",
@@ -175,6 +176,7 @@ impl Store for AndroidStore<'_, '_, '_> {
             None,
         );
         let verifying = Instant::now();
+        // Transfer ownership of the private Kotlin temp; no second Rust staging copy.
         let verified =
             VerifiedStaged::from_digest(NamedTempFile::from_parts(file, owned), entry, hash, size)
                 .with_context(|| format!("STALE_SOURCE: {path}"))?;

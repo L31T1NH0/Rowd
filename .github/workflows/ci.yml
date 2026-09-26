@@ -42,4 +42,4 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.9'
-      - run: gradle -p android :app:assembleDebug --console=plain
+      - run: gradle -p android :app:assembleRelease --console=plain

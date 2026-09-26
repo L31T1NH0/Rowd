@@ -1,7 +1,7 @@
 # <img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="40"> Rowd
 
 > [!WARNING]
-> **Unstable alpha (0.5.1).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+> **Unstable alpha (0.5.2).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
 
 Rowd syncs folders between one Linux PC and one Android phone on the same local network. You choose which folders connect and whether files travel both ways, to Android, or to the PC. The devices transfer files over TLS without a cloud account or relay.
 
@@ -9,20 +9,20 @@ The Rust test suite and Android build pass, and the app has seen use on a real d
 
 ## Get Rowd
 
-Download both files from the [0.5.1 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.5.1):
+Download both files from the [0.5.2 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.5.2-alpha):
 
 | Device | File |
 | --- | --- |
-| Linux x86_64 | `rowd-v0.5.1-linux-x86_64` |
-| Android 8 or newer, ARM64 | `rowd-v0.5.1-android-arm64.apk` |
+| Linux x86_64 | `rowd-v0.5.2-alpha-linux-x86_64` |
+| Android 8 or newer, ARM64 | `rowd-v0.5.2-alpha-android-arm64.apk` |
 
-The release includes `rowd-v0.5.1-SHA256SUMS` so you can check both downloads. The Android release APK is signed with the debug key. Update the PC binary and APK together: version 0.5.1 uses network protocol V8 and rejects older peers.
+The release includes `rowd-v0.5.2-alpha-SHA256SUMS` so you can check both downloads. The Android release APK is signed with the debug key. Update the PC binary and APK together: version 0.5.2-alpha uses network protocol V9 and rejects older peers.
 
 On Linux, make the downloaded binary executable and start it:
 
 ```bash
-chmod +x rowd-v0.5.1-linux-x86_64
-./rowd-v0.5.1-linux-x86_64
+chmod +x rowd-v0.5.2-alpha-linux-x86_64
+./rowd-v0.5.2-alpha-linux-x86_64
 ```
 
 Keep both devices on the same LAN. The phone must reach TCP port `43821` on the PC.
@@ -65,7 +65,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked
 ```
 
-The Android build needs JDK 17, Android SDK 35, NDK 27.2, and Gradle 8.9. `scripts/build-android.sh` uses the repository's local `.toolchain/` directory. GitHub Actions builds the ARM64 JNI library and a debug APK on each push and pull request.
+The Android build needs JDK 17, Android SDK 35, NDK 27.2, and Gradle 8.9. `scripts/build-android.sh` uses the repository's local `.toolchain/` directory. Local and GitHub Actions builds produce a release APK; the debug variant is disabled because it has serious performance costs.
 
 ## Documentation
 

@@ -56,7 +56,8 @@ pub struct StoreMetrics {
     pub full_scans: u64,
 }
 pub trait Store {
-    /// Hints only. Returning None always selects the full audit.
+    /// Hints only. Returning None selects a full manifest; scan() decides whether
+    /// its cache is trusted or a physical audit is required.
     fn delta_paths(&mut self) -> Result<Option<std::collections::BTreeSet<String>>> {
         Ok(None)
     }

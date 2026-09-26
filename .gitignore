@@ -9,3 +9,5 @@
 **/jniLibs/
 *.apk
 .DS_Store
+analysis/rowd-linux-release.asm
+analysis/rowd-linux-release-symbols.txt

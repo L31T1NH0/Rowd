@@ -19,6 +19,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     path::PathBuf,
+    sync::mpsc::sync_channel,
     sync::{Mutex, OnceLock},
     time::Instant,
 };
@@ -90,7 +91,7 @@ pub struct State {
 }
 impl State {
     pub fn load(path: &Path, pair_id: &str, share_id: &str) -> Result<Self> {
-        let state: Self = if path.try_exists()? {
+        let mut state: Self = if path.try_exists()? {
             serde_json::from_reader(File::open(path)?)?
         } else {
             Self {
@@ -108,6 +109,23 @@ impl State {
             state.version == VERSION && state.pair_id == pair_id && state.share_id == share_id,
             "state belongs to another Share/pair"
         );
+        if path.with_extension("pending").try_exists()? {
+            // An interrupted round may have installed files after the last State write.
+            // An unknown base makes divergent physical versions conflict instead of
+            // treating a user's later edit as the old version.
+            state.files.clear();
+            state.last_sync = None;
+            session_tokens().lock().unwrap().remove(path);
+            trace::event(
+                "sync",
+                "state_base_discarded",
+                Some(&state.share_id),
+                None,
+                None,
+                None,
+                Some("incomplete_round"),
+            );
+        }
         Ok(state)
     }
 }
@@ -263,6 +281,7 @@ fn remote_install(
         Some(sending),
         None,
     );
+    protocol::send_for(io, share_id, Message::PutBatchEnd)?;
     ensure!(
         matches!(protocol::receive_for(io, share_id)?, Message::Accept),
         "expected file confirmation"
@@ -294,14 +313,129 @@ struct PendingGet {
     expected: Option<String>,
 }
 
+struct IncomingPut {
+    path: String,
+    entry: Entry,
+    expected: Option<String>,
+}
+
+fn receive_put_batch(
+    io: &mut (impl Read + Write + Send),
+    store: &mut impl Store,
+    share_id: &str,
+    first: IncomingPut,
+) -> Result<Vec<String>> {
+    let (sender, receiver) = sync_channel::<(IncomingPut, Snapshot)>(1);
+    let mut installed = Vec::new();
+    std::thread::scope(|scope| -> Result<()> {
+        let reader = scope.spawn(move || -> Result<()> {
+            let mut next = first;
+            let mut count = 0;
+            let mut bytes = 0u64;
+            loop {
+                crate::model::validate_path(&next.path)?;
+                crate::model::validate_hash(&next.entry.hash)?;
+                ensure!(next.entry.size <= crate::model::MAX_FILE, "file too large");
+                ensure!(count < MAX_IN_FLIGHT_FILES, "too many staged files");
+                ensure!(
+                    count == 0 || bytes.saturating_add(next.entry.size) <= MAX_STAGED_BYTES,
+                    "too many staged bytes"
+                );
+                count += 1;
+                bytes = bytes.saturating_add(next.entry.size);
+                trace::event(
+                    "sync",
+                    "blob_receive_start",
+                    Some(share_id),
+                    Some(&next.path),
+                    Some(next.entry.size),
+                    None,
+                    None,
+                );
+                let receiving = Instant::now();
+                let staged = receive_blob(io, &next.entry)?;
+                trace::event(
+                    "sync",
+                    "blob_receive_end",
+                    Some(share_id),
+                    Some(&next.path),
+                    Some(next.entry.size),
+                    Some(receiving),
+                    None,
+                );
+                sender
+                    .send((next, staged))
+                    .map_err(|_| anyhow::anyhow!("install worker stopped"))?;
+                next = match protocol::receive_for(io, share_id)? {
+                    Message::Put {
+                        path,
+                        entry,
+                        expected,
+                    } => IncomingPut {
+                        path,
+                        entry,
+                        expected,
+                    },
+                    Message::PutBatchEnd => break,
+                    _ => anyhow::bail!("expected Put or PutBatchEnd"),
+                };
+            }
+            Ok(())
+        });
+        let mut install_error = None;
+        for (job, staged) in receiver {
+            if install_error.is_some() {
+                continue;
+            }
+            trace::event(
+                "sync",
+                "install_start",
+                Some(share_id),
+                Some(&job.path),
+                Some(job.entry.size),
+                None,
+                None,
+            );
+            let installing = Instant::now();
+            match store.install(&job.path, job.expected.as_deref(), &job.entry, &staged) {
+                Ok(()) => {
+                    trace::event(
+                        "sync",
+                        "install_end",
+                        Some(share_id),
+                        Some(&job.path),
+                        Some(job.entry.size),
+                        Some(installing),
+                        None,
+                    );
+                    installed.push(job.path);
+                }
+                Err(error) => install_error = Some(error),
+            }
+        }
+        let read_result = reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("network receiver panicked"))?;
+        if let Some(error) = install_error {
+            return Err(error);
+        }
+        read_result
+    })?;
+    Ok(installed)
+}
+
 fn drain_puts(
     io: &mut (impl Read + Write),
     store: &mut impl Store,
     state: &mut State,
-    state_path: &Path,
+    _state_path: &Path,
     pending: &mut Vec<PendingPut>,
     report: &mut Report,
 ) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    protocol::send_for(io, &state.share_id, Message::PutBatchEnd)?;
     for job in pending.drain(..) {
         let waiting = Instant::now();
         trace::event(
@@ -338,7 +472,6 @@ fn drain_puts(
         );
         state.files.insert(job.path.clone(), job.entry.hash.clone());
         store.acknowledge(&job.path, &job.entry)?;
-        persist_state(state_path, state, &mut report.metrics, Some(&job.path))?;
         report.metrics.bytes_transferred += job.entry.size;
         report.metrics.control_messages += 2;
         report.transferred += 1;
@@ -351,7 +484,7 @@ fn drain_gets(
     io: &mut (impl Read + Write),
     store: &mut impl Store,
     state: &mut State,
-    state_path: &Path,
+    _state_path: &Path,
     pending: &mut Vec<PendingGet>,
     ack_batch: &mut crate::model::Manifest,
     report: &mut Report,
@@ -437,7 +570,6 @@ fn drain_gets(
             flush_ack_batch(io, &state.share_id, ack_batch, &mut report.metrics)?;
         }
         state.files.insert(job.path.clone(), job.entry.hash);
-        persist_state(state_path, state, &mut report.metrics, Some(&job.path))?;
         report.metrics.bytes_transferred += job.entry.size;
         report.metrics.control_messages += 2;
         report.transferred += 1;
@@ -511,6 +643,8 @@ pub fn coordinate_with_progress(
 ) -> Result<Report> {
     let started = Instant::now();
     let share_id = state.share_id.clone();
+    let pending_state = state_path.with_extension("pending");
+    atomic_write(&pending_state, b"round in progress")?;
     trace::event(
         "sync",
         "round_start",
@@ -544,9 +678,27 @@ pub fn coordinate_with_progress(
         None,
     );
     let mut delta = None;
+    let mut fallback_reason = if remap.is_some() {
+        Some("scheduled_audit")
+    } else if state.last_sync.is_none() {
+        Some("no_last_sync")
+    } else if !session_matches {
+        Some("no_session_token")
+    } else {
+        None
+    };
     if remap.is_none() && state.last_sync.is_some() && session_matches {
-        if let Some(dirty) = store.delta_paths()? {
-            if dirty.len() <= 1024 && dirty.iter().all(|p| crate::model::validate_path(p).is_ok()) {
+        match store.delta_paths()? {
+            None => fallback_reason = Some("cache_untrusted"),
+            Some(dirty) if dirty.len() > 1024 => fallback_reason = Some("too_many_dirty_paths"),
+            Some(dirty)
+                if dirty
+                    .iter()
+                    .any(|p| crate::model::validate_path(p).is_err()) =>
+            {
+                fallback_reason = Some("invalid_dirty_paths")
+            }
+            Some(dirty) => {
                 let request = Message::Scoped {
                     share_id: share_id.clone(),
                     message: Box::new(Message::DeltaScan {
@@ -556,7 +708,26 @@ pub fn coordinate_with_progress(
                 };
                 let request_bytes = serde_json::to_vec(&request)?.len() as u64 + 4;
                 protocol::send(io, &request)?;
+                let remote_started = Instant::now();
+                trace::event(
+                    "sync",
+                    "remote_scan_wait_start",
+                    Some(&share_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
                 let response = protocol::receive_for(io, &share_id)?;
+                trace::event(
+                    "sync",
+                    "remote_scan_wait_end",
+                    Some(&share_id),
+                    None,
+                    None,
+                    Some(remote_started),
+                    None,
+                );
                 let bytes = serde_json::to_vec(&Message::Scoped {
                     share_id: share_id.clone(),
                     message: Box::new(match &response {
@@ -586,16 +757,44 @@ pub fn coordinate_with_progress(
                         && files.keys().all(|p| paths.contains(p))
                         && validate_manifest(&files).is_ok()
                     {
-                        if let Some(pc) = store.scan_paths(&paths).ok().flatten() {
+                        fallback_reason = Some("scan_paths_failed");
+                        let local_started = Instant::now();
+                        trace::event(
+                            "sync",
+                            "local_scan_start",
+                            Some(&share_id),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        let scanned = store.scan_paths(&paths).ok().flatten();
+                        trace::event(
+                            "sync",
+                            "local_scan_end",
+                            Some(&share_id),
+                            None,
+                            None,
+                            Some(local_started),
+                            None,
+                        );
+                        if let Some(pc) = scanned {
                             let missing_known = paths.iter().any(|p| {
                                 state.files.contains_key(p)
                                     && (!pc.contains_key(p) || !files.contains_key(p))
                             });
                             if !missing_known {
                                 delta = Some((pc, files, paths, metrics, bytes));
+                                fallback_reason = None;
+                            } else {
+                                fallback_reason = Some("missing_known_path");
                             }
                         }
+                    } else {
+                        fallback_reason = Some("invalid_delta_manifest");
                     }
+                } else {
+                    fallback_reason = Some("peer_need_full_scan");
                 }
             }
         }
@@ -604,9 +803,27 @@ pub fn coordinate_with_progress(
     let (pc, android, paths, peer_scan_metrics, manifest_bytes) = if let Some(delta) = delta {
         delta
     } else {
-        store.require_full_scan()?;
         protocol::send_for(io, &share_id, Message::Scan)?;
+        let local_started = Instant::now();
+        trace::event(
+            "sync",
+            "local_scan_start",
+            Some(&share_id),
+            None,
+            None,
+            None,
+            None,
+        );
         let pc = store.scan()?;
+        trace::event(
+            "sync",
+            "local_scan_end",
+            Some(&share_id),
+            None,
+            None,
+            Some(local_started),
+            None,
+        );
         let (android, metrics, bytes) = protocol::receive_manifest_with_metrics(io, &share_id)?;
         let paths = pc
             .keys()
@@ -616,6 +833,25 @@ pub fn coordinate_with_progress(
             .collect();
         (pc, android, paths, metrics, bytes)
     };
+    if !used_delta {
+        let local_audits = store
+            .metrics()
+            .full_scans
+            .saturating_sub(store_metrics_before.full_scans);
+        trace::event(
+            "sync",
+            "manifest_source",
+            Some(&share_id),
+            None,
+            None,
+            None,
+            Some(if local_audits + peer_scan_metrics.full_scans > 0 {
+                "physical_audit"
+            } else {
+                "full_manifest"
+            }),
+        );
+    }
     let android_count = android.len();
     trace::event(
         "sync",
@@ -627,7 +863,7 @@ pub fn coordinate_with_progress(
         if used_delta {
             Some("delta")
         } else {
-            Some("full")
+            fallback_reason
         },
     );
     trace::event(
@@ -775,7 +1011,6 @@ pub fn coordinate_with_progress(
         if prohibited {
             state.conflicts.insert(path.clone());
             report.conflicts += 1;
-            persist_state(state_path, state, &mut report.metrics, Some(&path))?;
             continue;
         }
         if action != Action::Conflict && !path.starts_with("Rowd Conflicts/") {
@@ -1029,10 +1264,6 @@ pub fn coordinate_with_progress(
                 report.metrics.control_messages += 6;
             }
         }
-        // An unchanged scan should not rewrite the entire state once per file.
-        if state.files.get(&path) != previous_base.as_ref() {
-            persist_state(state_path, state, &mut report.metrics, Some(&path))?;
-        }
     }
     drain_puts(io, store, state, state_path, &mut pending_puts, &mut report)?;
     drain_gets(
@@ -1056,16 +1287,14 @@ pub fn coordinate_with_progress(
         None,
     );
     progress("", total, total);
-    let first_sync = state.last_sync.is_none();
     state.last_sync = Some(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
     );
     let new_token = crate::random_id()?;
-    if first_sync {
-        persist_state(state_path, state, &mut report.metrics, None)?;
-    }
+    persist_state(state_path, state, &mut report.metrics, None)?;
+    std::fs::remove_file(&pending_state)?;
     let store_metrics = store.metrics();
     report.metrics.files_hashed = store_metrics
         .files_hashed
@@ -1105,12 +1334,12 @@ pub fn coordinate_with_progress(
     Ok(report)
 }
 
-pub fn respond(io: &mut (impl Read + Write), store: &mut impl Store) -> Result<Report> {
+pub fn respond(io: &mut (impl Read + Write + Send), store: &mut impl Store) -> Result<Report> {
     respond_share(io, store, None)
 }
 
 pub fn respond_share(
-    io: &mut (impl Read + Write),
+    io: &mut (impl Read + Write + Send),
     store: &mut impl Store,
     expected_share: Option<&str>,
 ) -> Result<Report> {
@@ -1167,9 +1396,27 @@ pub fn respond_share(
                         None,
                     );
                     store.set_base_token(None);
-                    store.require_full_scan()?;
                     let before = store.metrics();
+                    let local_started = Instant::now();
+                    trace::event(
+                        "sync",
+                        "local_scan_start",
+                        Some(&share_id),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
                     let files = store.scan()?;
+                    trace::event(
+                        "sync",
+                        "local_scan_end",
+                        Some(&share_id),
+                        None,
+                        None,
+                        Some(local_started),
+                        None,
+                    );
                     trace::event(
                         "sync",
                         "scan_end",
@@ -1180,6 +1427,19 @@ pub fn respond_share(
                         None,
                     );
                     let after = store.metrics();
+                    trace::event(
+                        "sync",
+                        "manifest_source",
+                        Some(&share_id),
+                        None,
+                        None,
+                        None,
+                        Some(if after.full_scans > before.full_scans {
+                            "physical_audit"
+                        } else {
+                            "full_manifest"
+                        }),
+                    );
                     trace::event(
                         "sync",
                         "manifest_start",
@@ -1218,6 +1478,18 @@ pub fn respond_share(
                     let old = store.base_token();
                     store.set_base_token(None);
                     let before = store.metrics();
+                    let mut fallback_reason = if old.as_deref() != Some(&base_token) {
+                        Some("no_session_token")
+                    } else if paths.len() > 1024 {
+                        Some("too_many_dirty_paths")
+                    } else if paths
+                        .iter()
+                        .any(|p| crate::model::validate_path(p).is_err())
+                    {
+                        Some("invalid_dirty_paths")
+                    } else {
+                        None
+                    };
                     let candidate = if old.as_deref() == Some(&base_token)
                         && paths.len() <= 1024
                         && paths.iter().all(|p| crate::model::validate_path(p).is_ok())
@@ -1226,16 +1498,32 @@ pub fn respond_share(
                             Ok(Some(dirty)) if dirty.len() <= 1024 => {
                                 let union: BTreeSet<_> = paths.union(&dirty).cloned().collect();
                                 if union.len() <= 1024 {
-                                    store
+                                    let scanned = store
                                         .scan_paths(&union)
                                         .ok()
                                         .flatten()
-                                        .map(|files| (union, files))
+                                        .map(|files| (union, files));
+                                    if scanned.is_none() {
+                                        fallback_reason = Some("scan_paths_failed");
+                                    }
+                                    scanned
                                 } else {
+                                    fallback_reason = Some("too_many_dirty_paths");
                                     None
                                 }
                             }
-                            _ => None,
+                            Ok(Some(_)) => {
+                                fallback_reason = Some("too_many_dirty_paths");
+                                None
+                            }
+                            Ok(None) => {
+                                fallback_reason = Some("dirty_unavailable");
+                                None
+                            }
+                            Err(_) => {
+                                fallback_reason = Some("dirty_unavailable");
+                                None
+                            }
                         }
                     } else {
                         None
@@ -1264,6 +1552,15 @@ pub fn respond_share(
                         )?;
                     } else {
                         protocol::send_for(io, &share_id, Message::NeedFullScan)?;
+                        trace::event(
+                            "sync",
+                            "delta_fallback",
+                            Some(&share_id),
+                            None,
+                            None,
+                            None,
+                            fallback_reason.or(Some("cache_untrusted")),
+                        );
                     }
                 }
                 Message::Get { path, entry } => {
@@ -1330,67 +1627,28 @@ pub fn respond_share(
                     entry,
                     expected,
                 } => {
-                    crate::model::validate_path(&path)?;
-                    crate::model::validate_hash(&entry.hash)?;
-                    trace::event(
-                        "sync",
-                        "put_received",
-                        Some(&share_id),
-                        Some(&path),
-                        Some(entry.size),
-                        None,
-                        None,
-                    );
-                    trace::event(
-                        "sync",
-                        "blob_receive_start",
-                        Some(&share_id),
-                        Some(&path),
-                        Some(entry.size),
-                        None,
-                        None,
-                    );
-                    let receiving = Instant::now();
-                    let temp = receive_blob(io, &entry)?;
-                    trace::event(
-                        "sync",
-                        "blob_receive_end",
-                        Some(&share_id),
-                        Some(&path),
-                        Some(entry.size),
-                        Some(receiving),
-                        None,
-                    );
-                    trace::event(
-                        "sync",
-                        "install_start",
-                        Some(&share_id),
-                        Some(&path),
-                        Some(entry.size),
-                        None,
-                        None,
-                    );
-                    let installing = Instant::now();
-                    store.install(&path, expected.as_deref(), &entry, &temp)?;
-                    trace::event(
-                        "sync",
-                        "install_end",
-                        Some(&share_id),
-                        Some(&path),
-                        Some(entry.size),
-                        Some(installing),
-                        None,
-                    );
-                    protocol::send_for(io, &share_id, Message::Accept)?;
-                    trace::event(
-                        "sync",
-                        "accept_sent",
-                        Some(&share_id),
-                        Some(&path),
-                        None,
-                        None,
-                        None,
-                    );
+                    let installed = receive_put_batch(
+                        io,
+                        store,
+                        &share_id,
+                        IncomingPut {
+                            path,
+                            entry,
+                            expected,
+                        },
+                    )?;
+                    for path in installed {
+                        protocol::send_for(io, &share_id, Message::Accept)?;
+                        trace::event(
+                            "sync",
+                            "accept_sent",
+                            Some(&share_id),
+                            Some(&path),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
                 }
                 Message::Done {
                     transferred,
@@ -1557,6 +1815,28 @@ mod tests {
         atomic_json(&path, &State::load(&path, "pair", "folder").unwrap()).unwrap();
         assert!(State::load(&path, "other", "folder").is_err());
         assert!(State::load(&path, "pair", "other").is_err());
+    }
+
+    #[test]
+    fn interrupted_round_discards_stale_reconciliation_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = State::load(&path, "pair", "share").unwrap();
+        state.files.insert("a".into(), "old".into());
+        state.last_sync = Some(1);
+        atomic_json(&path, &state).unwrap();
+        atomic_write(&path.with_extension("pending"), b"round in progress").unwrap();
+        let recovered = State::load(&path, "pair", "share").unwrap();
+        assert!(recovered.files.is_empty());
+        assert!(recovered.last_sync.is_none());
+        assert_eq!(
+            reconcile(
+                recovered.files.get("a").map(String::as_str),
+                Some("new"),
+                Some("old")
+            ),
+            Action::Conflict
+        );
     }
 
     #[test]
@@ -1808,7 +2088,8 @@ mod v2_tests {
             }
             let remap = (scenario == "remap").then_some(RemapPolicy::Compare);
             let report = local_round(&mut p, &mut a, &mut state, &path, remap);
-            assert_eq!(report.metrics.full_scans, 2, "{scenario}");
+            let expected_audits = u64::from(matches!(scenario, "cache" | "ignore"));
+            assert_eq!(report.metrics.full_scans, expected_audits, "{scenario}");
         }
     }
     #[test]
@@ -1970,7 +2251,7 @@ mod v2_tests {
         }
     }
     #[test]
-    fn interrupted_base_token_exchange_forces_full_scan() {
+    fn interrupted_base_token_exchange_uses_full_manifest() {
         for needle in [b"\"delta_scan\"".as_slice(), b"\"done\"".as_slice()] {
             let pc = tempfile::tempdir().unwrap();
             let phone = tempfile::tempdir().unwrap();
@@ -1996,7 +2277,7 @@ mod v2_tests {
                 local_round(&mut p, &mut a, &mut state, &path, None)
                     .metrics
                     .full_scans,
-                2
+                0
             );
         }
     }
@@ -2020,6 +2301,7 @@ mod v2_tests {
                 MAX_IN_FLIGHT_FILES as u64
             );
             assert!(report.metrics.peak_staged_bytes <= MAX_STAGED_BYTES);
+            assert_eq!(report.metrics.state_persist_count, 1);
             assert_eq!(p.scan().unwrap(), a.scan().unwrap());
         }
     }

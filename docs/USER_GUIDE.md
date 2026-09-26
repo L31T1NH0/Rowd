@@ -191,4 +191,4 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked
 ```
 
-Android requires JDK 17, SDK 35, NDK 27.2, and Gradle 8.9. `scripts/build-android.sh` builds the ARM64 Rust library and a release APK signed with the debug key using the local `.toolchain/` directory. GitHub Actions runs the Rust and Android debug compilation paths on pushes and pull requests.
+Android requires JDK 17, SDK 35, NDK 27.2, and Gradle 8.9. `scripts/build-android.sh` builds the ARM64 Rust library and a release APK signed with the debug key using the local `.toolchain/` directory. GitHub Actions also builds the Android release variant on pushes and pull requests; the debug variant is disabled.
