@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use tempfile::NamedTempFile;
@@ -56,6 +56,18 @@ pub struct StoreMetrics {
     pub full_scans: u64,
 }
 pub trait Store {
+    fn scan_is_staged(&self) -> bool {
+        false
+    }
+    fn scan_with_control(&mut self, _io: &mut (impl Read + Write)) -> Result<Manifest> {
+        self.scan()
+    }
+    fn commit_scan(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn discard_scan(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Hints only. Returning None selects a full manifest; scan() decides whether
     /// its cache is trusted or a physical audit is required.
     fn delta_paths(&mut self) -> Result<Option<std::collections::BTreeSet<String>>> {

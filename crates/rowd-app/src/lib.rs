@@ -1524,6 +1524,7 @@ fn session(
     incremental_allowed: bool,
     wakes: mpsc::Receiver<String>,
     urgent: &Mutex<BTreeMap<String, bool>>,
+    audit_events: &Mutex<(u64, BTreeMap<String, u64>)>,
     stop: &AtomicBool,
     once: bool,
     event: &impl Fn(String),
@@ -1596,12 +1597,15 @@ fn session(
                 matches!(message, Message::StartRound),
                 "expected round start"
             );
+            let scan_socket = io.sock.try_clone()?;
             let result = session_round(
                 home,
                 &mut io,
+                &scan_socket,
                 &device,
                 incremental_allowed,
                 urgent,
+                audit_events,
                 &mut audit_preempted,
                 event,
             );
@@ -1643,13 +1647,16 @@ fn session(
 fn session_round(
     home: &Path,
     mut io: &mut (impl std::io::Read + std::io::Write),
+    scan_socket: &TcpStream,
     device: &str,
     incremental_allowed: bool,
     urgent: &Mutex<BTreeMap<String, bool>>,
+    audit_events: &Mutex<(u64, BTreeMap<String, u64>)>,
     audit_preempted: &mut bool,
     event: &impl Fn(String),
 ) -> Result<()> {
     let started = Instant::now();
+    let audit_generation = audit_events.lock().unwrap().0;
     let _session = session_guard(home)?;
     event(format!(
         "round_started_at={}",
@@ -1913,7 +1920,8 @@ fn session_round(
                     "Share not ready"
                 );
                 let mut last_progress = Instant::now() - Duration::from_secs(1);
-                sync::coordinate_with_progress(
+                let preempt_scan = audit && !*audit_preempted;
+                sync::coordinate_with_progress_and_audit_control(
                     &mut io,
                     &mut store,
                     &mut state,
@@ -1926,6 +1934,31 @@ fn session_round(
                             event(format!("{}: {done}/{total} caminhos · {path}", share.name));
                             last_progress = Instant::now();
                         }
+                    },
+                    |phase| {
+                        match phase {
+                            sync::AuditWait::Start if preempt_scan => {
+                                let _ =
+                                    scan_socket.set_read_timeout(Some(Duration::from_millis(50)));
+                            }
+                            sync::AuditWait::Tick if preempt_scan => {
+                                let events = audit_events.lock().unwrap();
+                                let shares = events
+                                    .1
+                                    .iter()
+                                    .filter(|(_, generation)| **generation > audit_generation)
+                                    .map(|(id, _)| id.clone())
+                                    .collect::<Vec<_>>();
+                                if !shares.is_empty() {
+                                    return Some(shares);
+                                }
+                            }
+                            sync::AuditWait::End if preempt_scan => {
+                                let _ = scan_socket.set_read_timeout(Some(Duration::from_secs(90)));
+                            }
+                            _ => {}
+                        }
+                        None
                     },
                 )
             })()
@@ -1948,8 +1981,19 @@ fn session_round(
                 }
             };
             if report.round_deferred {
+                let mut shares: BTreeSet<String> = report.pending_wakes.into_iter().collect();
+                shares.extend(
+                    audit_events
+                        .lock()
+                        .unwrap()
+                        .1
+                        .iter()
+                        .filter(|(_, generation)| **generation > audit_generation)
+                        .map(|(id, _)| id.clone()),
+                );
                 let mut pending = urgent.lock().unwrap();
-                deferred_shares = pending.keys().cloned().collect();
+                shares.extend(pending.keys().cloned());
+                deferred_shares = shares.into_iter().collect();
                 for delivered in pending.values_mut() {
                     *delivered = true;
                 }
@@ -2073,6 +2117,7 @@ fn serve(
     let mut last_full = Instant::now();
     let mut last_config = Instant::now() - Duration::from_secs(2);
     let urgent = Mutex::new(BTreeMap::new());
+    let audit_events = Mutex::new((0u64, BTreeMap::new()));
     std::thread::scope(|scope| -> Result<()> {
         let mut connected = None;
         let mut connected_socket: Option<TcpStream> = None;
@@ -2162,6 +2207,12 @@ fn serve(
                                         || relative == ".rowdignore"
                                         || !ignore.matches(&relative, path.is_dir())
                                     {
+                                        {
+                                            let mut events = audit_events.lock().unwrap();
+                                            events.0 += 1;
+                                            let generation = events.0;
+                                            events.1.insert(share.share_id.clone(), generation);
+                                        }
                                         if !dirty.contains_key(&share.share_id) {
                                             event(format!(
                                                 "change_detected_at={} share={}",
@@ -2271,6 +2322,7 @@ fn serve(
                     wake_tx = Some(tx);
                     connected_socket = Some(socket.try_clone()?);
                     let urgent = &urgent;
+                    let audit_events = &audit_events;
                     let stop = &stop;
                     let event = &event;
                     let handle = scope.spawn(move || {
@@ -2280,6 +2332,7 @@ fn serve(
                             !watcher_untrusted,
                             wakes,
                             &urgent,
+                            audit_events,
                             stop,
                             once,
                             event,

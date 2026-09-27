@@ -8,7 +8,8 @@ use rowd_core::{
     model::{Entry, Invitation, Manifest},
     storage::{Store, VerifiedStaged},
 };
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -45,8 +46,25 @@ struct AndroidStore<'a, 'b, 'c> {
     metrics: rowd_core::storage::StoreMetrics,
     token_key: Option<String>,
     share_id: Option<String>,
+    scan_socket: Option<TcpStream>,
 }
 impl AndroidStore<'_, '_, '_> {
+    fn scan_result(&mut self, result: &str) -> Result<Manifest> {
+        let result: serde_json::Value = serde_json::from_str(result)?;
+        if result["deferred"] == true {
+            return Err(rowd_core::sync::ScanDeferred.into());
+        }
+        self.metrics.files_enumerated += result["enumerated"]
+            .as_u64()
+            .context("scan count missing")?;
+        self.metrics.files_hashed += result["hashed"].as_u64().context("hash count missing")?;
+        self.metrics.bytes_hashed += result["bytes_hashed"]
+            .as_u64()
+            .context("hash bytes missing")?;
+        self.metrics.full_scans +=
+            u64::from(result["full"].as_bool().context("scan mode missing")?);
+        Ok(serde_json::from_value(result["files"].clone())?)
+    }
     fn request_records(&mut self) -> Result<Vec<serde_json::Value>> {
         let requests: Vec<serde_json::Value> =
             serde_json::from_str(&self.call("pendingShareRequests", &[])?)?;
@@ -93,6 +111,9 @@ impl AndroidStore<'_, '_, '_> {
     }
 }
 impl Store for AndroidStore<'_, '_, '_> {
+    fn scan_is_staged(&self) -> bool {
+        true
+    }
     fn delta_paths(&mut self) -> Result<Option<std::collections::BTreeSet<String>>> {
         check_cancelled()?;
         Ok(serde_json::from_str(&self.call("deltaPathsJson", &[])?)?)
@@ -145,20 +166,79 @@ impl Store for AndroidStore<'_, '_, '_> {
     }
     fn scan(&mut self) -> Result<Manifest> {
         check_cancelled()?;
-        let result: serde_json::Value = serde_json::from_str(&self.call("scanJson", &[])?)?;
-        if result["deferred"] == true {
-            return Err(rowd_core::sync::ScanDeferred.into());
+        self.call("discardScanJson", &[])?;
+        let result = self.call("scanJson", &[])?;
+        let files = self.scan_result(&result)?;
+        self.call("commitScanJson", &[])?;
+        Ok(files)
+    }
+    fn scan_with_control(&mut self, io: &mut (impl Read + Write)) -> Result<Manifest> {
+        let socket = self
+            .scan_socket
+            .as_ref()
+            .context("scan socket missing")?
+            .try_clone()?;
+        let share_id = self.share_id.clone().context("Share not selected")?;
+        self.call("startScanJson", &[])?;
+        let mut preempted = false;
+        let result = (|| -> Result<Manifest> {
+            loop {
+                check_cancelled()?;
+                let status = self.call("pollScanJson", &[])?;
+                if !status.is_empty() {
+                    if preempted {
+                        self.call("discardScanJson", &[])?;
+                        return Err(rowd_core::sync::ScanDeferred.into());
+                    }
+                    return self.scan_result(&status);
+                }
+                socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+                let mut byte = [0];
+                match socket.peek(&mut byte) {
+                    Ok(0) => anyhow::bail!("peer disconnected during SAF scan"),
+                    Ok(_) => {
+                        socket.set_read_timeout(Some(Duration::from_secs(90)))?;
+                        match rowd_core::protocol::receive_for(io, &share_id)? {
+                            rowd_core::protocol::Message::AuditPreempt { shares } => {
+                                for id in shares {
+                                    rowd_core::model::validate_hash(&id)?;
+                                }
+                                preempted = true;
+                                self.call("deferScanJson", &[])?;
+                            }
+                            _ => anyhow::bail!("unexpected message during SAF scan"),
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })();
+        let _ = socket.set_read_timeout(Some(Duration::from_secs(90)));
+        if result.is_err() {
+            let _ = self.call("deferScanJson", &[]);
+            // The SAF worker must finish before another Share can be selected.
+            while self
+                .call("pollScanJson", &[])
+                .is_ok_and(|status| status.is_empty())
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = self.call("discardScanJson", &[]);
         }
-        self.metrics.files_enumerated += result["enumerated"]
-            .as_u64()
-            .context("scan count missing")?;
-        self.metrics.files_hashed += result["hashed"].as_u64().context("hash count missing")?;
-        self.metrics.bytes_hashed += result["bytes_hashed"]
-            .as_u64()
-            .context("hash bytes missing")?;
-        self.metrics.full_scans +=
-            u64::from(result["full"].as_bool().context("scan mode missing")?);
-        Ok(serde_json::from_value(result["files"].clone())?)
+        result
+    }
+    fn commit_scan(&mut self) -> Result<()> {
+        self.call("commitScanJson", &[])?;
+        Ok(())
+    }
+    fn discard_scan(&mut self) -> Result<()> {
+        self.call("discardScanJson", &[])?;
+        Ok(())
     }
     fn snapshot(&mut self, path: &str, entry: &Entry) -> Result<VerifiedStaged> {
         check_cancelled()?;
@@ -289,6 +369,7 @@ impl rowd_core::managed::ManagedClient for AndroidStore<'_, '_, '_> {
         };
         Ok(rowd_core::managed::ClientState {
             focus_shares: self.focus.clone(),
+            audit: self.call("auditRound", &[])? == "true",
             available_shares: serde_json::from_str(&json)?,
             share_requests,
             cancel_intents,
@@ -357,6 +438,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
             metrics: Default::default(),
             token_key: None,
             share_id: None,
+            scan_socket: None,
         };
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
@@ -381,6 +463,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                 )?;
                 *connection = Some((key.clone(), io));
             }
+            store.scan_socket = Some(connection.as_ref().unwrap().1.sock.try_clone()?);
             let mut failed = None;
             let result = rowd_core::managed::client_round_on_excluding(
                 &mut connection.as_mut().unwrap().1,

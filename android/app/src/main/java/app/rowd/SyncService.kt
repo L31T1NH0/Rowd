@@ -168,6 +168,7 @@ class SyncService : Service() {
                             else -> ""
                         }
                         access.setFocusedScan(focus.isNotEmpty())
+                        access.setAuditRound(full)
                         publish(RowdStatus.Kind.Working,
                             if (full) "Verificando arquivos" else "Sincronizando alterações",
                             if (full) "Auditoria periódica dos Shares." else "Verificando os Shares alterados.")

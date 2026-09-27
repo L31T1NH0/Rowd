@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MANIFEST_CHUNK_FILES: usize = 1024;
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -73,6 +73,11 @@ pub enum Message {
     },
     Ready,
     Scan,
+    AuditPreempt {
+        shares: Vec<String>,
+    },
+    ScanReady,
+    ScanContinue,
     ScanDeferred,
     DeltaScan {
         base_token: String,

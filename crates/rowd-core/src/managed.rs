@@ -18,6 +18,7 @@ use std::time::Instant;
 
 pub struct ClientState {
     pub focus_shares: Option<Vec<String>>,
+    pub audit: bool,
     pub available_shares: Vec<String>,
     pub share_requests: Vec<ShareRequest>,
     pub cancel_intents: Vec<String>,
@@ -38,6 +39,9 @@ pub trait ManagedClient: Store {
     fn finish_unlink(&mut self) -> Result<()>;
 }
 impl<S: Store> Store for &mut S {
+    fn scan_is_staged(&self) -> bool {
+        (**self).scan_is_staged()
+    }
     fn delta_paths(&mut self) -> Result<Option<std::collections::BTreeSet<String>>> {
         (**self).delta_paths()
     }
@@ -64,6 +68,18 @@ impl<S: Store> Store for &mut S {
     }
     fn scan(&mut self) -> Result<crate::model::Manifest> {
         (**self).scan()
+    }
+    fn scan_with_control(
+        &mut self,
+        io: &mut (impl std::io::Read + std::io::Write),
+    ) -> Result<crate::model::Manifest> {
+        (**self).scan_with_control(io)
+    }
+    fn commit_scan(&mut self) -> Result<()> {
+        (**self).commit_scan()
+    }
+    fn discard_scan(&mut self) -> Result<()> {
+        (**self).discard_scan()
     }
     fn snapshot(&mut self, p: &str, e: &crate::model::Entry) -> Result<crate::storage::Snapshot> {
         (**self).snapshot(p, e)
@@ -231,7 +247,7 @@ pub fn client_round_on_excluding(
                     cancel_intents: client_state.cancel_intents,
                     available_shares,
                     requested_share_ids: wanted.clone(),
-                    audit: client_state.focus_shares.is_none(),
+                    audit: client_state.audit,
                     unlink_requested: client_state.unlink_requested,
                 },
             )?;
@@ -255,6 +271,7 @@ pub fn client_round_on_excluding(
             };
             store.acknowledge_share_requests(&accepted, &rejected, &cancelled)?;
             let mut report = Report::default();
+            let mut deferred_share = None;
             loop {
                 match protocol::receive(io)? {
                     Message::ShareSkipped { share_id, reason } => {
@@ -274,11 +291,25 @@ pub fn client_round_on_excluding(
                         store.select(&share_id)?;
                         protocol::send(io, &Message::Ready)?;
                         let result = sync::respond_share(io, &mut *store, Some(&share_id))?;
+                        if result.round_deferred {
+                            deferred_share = Some(share_id.clone());
+                        }
                         report.transferred += result.transferred;
                         report.conflicts += result.conflicts;
                         report.shares_processed += result.shares_processed;
                         queue.as_mut().expect("queue initialized").pop_front();
                         *failed = None;
+                    }
+                    Message::Scoped { share_id, message }
+                        if deferred_share.as_deref() == Some(share_id.as_str())
+                            && matches!(&*message, Message::AuditPreempt { .. }) =>
+                    {
+                        if let Message::AuditPreempt { shares } = *message {
+                            for id in shares {
+                                crate::model::validate_hash(&id)?;
+                                pending_wakes.insert(id);
+                            }
+                        }
                     }
                     Message::SessionDone => {
                         queue.as_mut().expect("queue initialized").clear();
@@ -391,6 +422,7 @@ impl ManagedClient for LocalDevice {
             .collect();
         Ok(ClientState {
             focus_shares: self.focus.clone(),
+            audit: self.focus.is_none(),
             available_shares,
             share_requests: self.pending_requests()?,
             cancel_intents: Vec::new(),

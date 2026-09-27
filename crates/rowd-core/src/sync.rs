@@ -21,7 +21,7 @@ use std::{
     path::PathBuf,
     sync::mpsc::sync_channel,
     sync::{Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
 
@@ -654,7 +654,122 @@ pub fn coordinate_with_progress(
     state_path: &Path,
     mode: crate::config::SyncMode,
     remap: Option<crate::config::RemapPolicy>,
+    progress: impl FnMut(&str, usize, usize),
+) -> Result<Report> {
+    coordinate_with_progress_and_audit_control(
+        io,
+        store,
+        state,
+        state_path,
+        mode,
+        remap,
+        progress,
+        |_| None,
+    )
+}
+
+#[derive(Clone, Copy)]
+pub enum AuditWait {
+    Start,
+    Tick,
+    End,
+}
+
+fn receive_scan_gate(
+    io: &mut (impl Read + Write),
+    share_id: &str,
+    audit_control: &mut impl FnMut(AuditWait) -> Option<Vec<String>>,
+) -> Result<Option<Vec<String>>> {
+    struct Waiting<'a, T, F> {
+        io: &'a mut T,
+        share_id: &'a str,
+        control: &'a mut F,
+        sent: Vec<String>,
+        started: Instant,
+    }
+    impl<T: Read + Write, F: FnMut(AuditWait) -> Option<Vec<String>>> Read for Waiting<'_, T, F> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                match self.io.read(buf) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        if self.started.elapsed() >= Duration::from_secs(90) {
+                            return Err(error);
+                        }
+                        if self.sent.is_empty() {
+                            if let Some(shares) =
+                                (self.control)(AuditWait::Tick).filter(|s| !s.is_empty())
+                            {
+                                protocol::send_for(
+                                    self.io,
+                                    self.share_id,
+                                    Message::AuditPreempt {
+                                        shares: shares.clone(),
+                                    },
+                                )
+                                .map_err(std::io::Error::other)?;
+                                self.sent = shares;
+                            }
+                        }
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
+    let mut waiting = Waiting {
+        io,
+        share_id,
+        control: audit_control,
+        sent: Vec::new(),
+        started: Instant::now(),
+    };
+    match protocol::receive_for(&mut waiting, share_id)? {
+        Message::ScanDeferred => Ok(Some(waiting.sent)),
+        Message::ScanReady => {
+            if waiting.sent.is_empty() {
+                if let Some(shares) = (waiting.control)(AuditWait::Tick).filter(|s| !s.is_empty()) {
+                    protocol::send_for(
+                        waiting.io,
+                        share_id,
+                        Message::AuditPreempt {
+                            shares: shares.clone(),
+                        },
+                    )?;
+                    waiting.sent = shares;
+                }
+            }
+            if !waiting.sent.is_empty() {
+                ensure!(
+                    matches!(
+                        protocol::receive_for(&mut waiting, share_id)?,
+                        Message::ScanDeferred
+                    ),
+                    "expected deferred scan"
+                );
+                Ok(Some(waiting.sent))
+            } else {
+                protocol::send_for(waiting.io, share_id, Message::ScanContinue)?;
+                Ok(None)
+            }
+        }
+        _ => anyhow::bail!("expected scan readiness"),
+    }
+}
+
+pub fn coordinate_with_progress_and_audit_control(
+    io: &mut (impl Read + Write),
+    store: &mut impl Store,
+    state: &mut State,
+    state_path: &Path,
+    mode: crate::config::SyncMode,
+    remap: Option<crate::config::RemapPolicy>,
     mut progress: impl FnMut(&str, usize, usize),
+    mut audit_control: impl FnMut(AuditWait) -> Option<Vec<String>>,
 ) -> Result<Report> {
     let started = Instant::now();
     let share_id = state.share_id.clone();
@@ -831,6 +946,16 @@ pub fn coordinate_with_progress(
         delta
     } else {
         protocol::send_for(io, &share_id, Message::Scan)?;
+        audit_control(AuditWait::Start);
+        let gate = receive_scan_gate(io, &share_id, &mut audit_control);
+        audit_control(AuditWait::End);
+        if let Some(shares) = gate? {
+            return Ok(Report {
+                pending_wakes: shares,
+                round_deferred: true,
+                ..Report::default()
+            });
+        }
         let (android, metrics, bytes) = match protocol::receive_manifest_with_metrics(io, &share_id)
         {
             Ok(manifest) => manifest,
@@ -1455,9 +1580,10 @@ pub fn respond_share(
                         None,
                         None,
                     );
-                    let files = match store.scan() {
+                    let files = match store.scan_with_control(io) {
                         Ok(files) => files,
                         Err(error) if error.is::<ScanDeferred>() => {
+                            store.discard_scan()?;
                             protocol::send_for(io, &share_id, Message::ScanDeferred)?;
                             return Ok(Report {
                                 round_deferred: true,
@@ -1465,10 +1591,47 @@ pub fn respond_share(
                             });
                         }
                         Err(error) => {
-                            store.set_base_token(None);
+                            let _ = store.discard_scan();
+                            if !store.scan_is_staged() {
+                                store.set_base_token(None);
+                            }
                             return Err(error);
                         }
                     };
+                    let gate = (|| -> Result<Message> {
+                        protocol::send_for(io, &share_id, Message::ScanReady)?;
+                        protocol::receive_for(io, &share_id)
+                    })();
+                    match gate {
+                        Ok(Message::ScanContinue) => {
+                            if let Err(error) = store.commit_scan() {
+                                let _ = store.discard_scan();
+                                store.set_base_token(None);
+                                return Err(error);
+                            }
+                        }
+                        Ok(Message::AuditPreempt { shares }) => {
+                            for id in shares {
+                                crate::model::validate_hash(&id)?;
+                            }
+                            store.discard_scan()?;
+                            protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                            return Ok(Report {
+                                round_deferred: true,
+                                ..Report::default()
+                            });
+                        }
+                        Ok(_) => {
+                            store.discard_scan()?;
+                            anyhow::bail!("unexpected scan gate")
+                        }
+                        Err(error) => {
+                            let _ = store.discard_scan();
+                            return Err(error);
+                        }
+                    }
+                    // A completed full scan replaces the peer cache before Done;
+                    // a deferred scan leaves the committed token untouched.
                     store.set_base_token(None);
                     trace::event(
                         "sync",

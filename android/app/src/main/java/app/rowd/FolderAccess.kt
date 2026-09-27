@@ -59,8 +59,61 @@ class FolderAccess(private val context: Context) {
     private val deepScanShares = mutableSetOf<String>()
     private val scheduledFullScanShares = mutableSetOf<String>()
     private val scheduledDeepScanShares = mutableSetOf<String>()
+    private val scanAbort = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var scanTask: java.util.concurrent.FutureTask<String>? = null
+    private data class PendingScan(val shareId: String, val tree: String,
+        val cache: MutableMap<String, ScanEntry>, val uris: MutableMap<String, String>,
+        val directories: Map<String, String>, val dirty: Set<String>,
+        val flaggedFull: Boolean, val scheduledFull: Boolean,
+        val deepAudit: Boolean, val scheduledDeep: Boolean)
+    private var pendingScan: PendingScan? = null
     private var focusedScan = false
+    private var roundIsAudit = false
+
+    fun startScanJson(): String {
+        check(scanTask == null) { "Scan SAF já em andamento." }
+        scanAbort.set(false)
+        discardScanJson()
+        val task = java.util.concurrent.FutureTask<String> { scanJson() }
+        scanTask = task
+        Thread(task, "Rowd SAF scan").start()
+        return "ok"
+    }
+
+    fun pollScanJson(): String {
+        val task = scanTask ?: error("Nenhum scan SAF em andamento.")
+        if (!task.isDone) return ""
+        return try { task.get() } finally { scanTask = null }
+    }
+
+    fun deferScanJson(): String { scanAbort.set(true); return "ok" }
+
+    fun commitScanJson(): String = synchronized(scanLock) {
+        val next = pendingScan ?: error("Nenhum scan SAF pronto para confirmar.")
+        check(active?.optString("share_id") == next.shareId && activeTree.toString() == next.tree) {
+            "Binding SAF mudou durante o scan."
+        }
+        scanCache[next.shareId] = next.cache
+        uriPaths[next.shareId] = next.uris
+        directoryUris[next.shareId] = next.directories
+        scanReady.add(next.shareId)
+        pendingScan = null
+        "ok"
+    }
+
+    fun discardScanJson(): String = synchronized(scanLock) {
+        pendingScan?.let { scan ->
+            dirtyPaths.getOrPut(scan.shareId) { mutableSetOf() }.addAll(scan.dirty)
+            if (scan.flaggedFull && !scan.scheduledFull) fullScanShares.add(scan.shareId)
+            if (scan.deepAudit && !scan.scheduledDeep) deepScanShares.add(scan.shareId)
+        }
+        pendingScan = null
+        "ok"
+    }
+
     fun setFocusedScan(focused: Boolean) { focusedScan = focused }
+    fun setAuditRound(audit: Boolean) { roundIsAudit = audit }
+    fun auditRound(): String = roundIsAudit.toString()
 
     fun bindingIdentity(): String = "${activeTree}|${active?.optLong("binding_revision", 0L)}|${ignoreText()}"
 
@@ -892,7 +945,7 @@ class FolderAccess(private val context: Context) {
         }
         fun walk(directory: DocumentFile, prefix: String) {
             checkLocalDeadline(deadline)
-            if (auditScan && SyncService.changeGeneration() != changeGeneration) throw AuditDeferred()
+            if (auditScan && (scanAbort.get() || SyncService.changeGeneration() != changeGeneration)) throw AuditDeferred()
             nextDirectories[directory.uri.toString()] = prefix
             val children = directory.listFiles()
             val names = HashSet<String>()
@@ -979,10 +1032,8 @@ class FolderAccess(private val context: Context) {
             }
             synchronized(scanLock) {
                 if (auditScan && (scanAbort.get() || SyncService.changeGeneration() != changeGeneration)) throw AuditDeferred()
-                scanCache[shareId] = nextCache
-                uriPaths[shareId] = nextUris
-                directoryUris[shareId] = nextDirectories
-                scanReady.add(shareId)
+                pendingScan = PendingScan(shareId, tree, nextCache, nextUris, nextDirectories,
+                    dirty, flaggedFull, scheduledFull, deepAudit, scheduledDeep)
             }
         } catch (error: Exception) {
             synchronized(scanLock) {
