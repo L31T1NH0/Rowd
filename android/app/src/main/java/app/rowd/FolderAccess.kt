@@ -699,6 +699,50 @@ class FolderAccess(private val context: Context) {
         return doc
     }
 
+    private data class ResolvedTarget(
+        val directory: DocumentFile, val missingDirectories: List<String>,
+        val name: String, val target: DocumentFile?
+    )
+
+    private fun resolveTarget(path: String): ResolvedTarget {
+        val segments = parts(path)
+        var directory = root
+        for ((index, part) in segments.dropLast(1).withIndex()) {
+            check(directory.isDirectory) { "Um arquivo ocupa o lugar da pasta: $path" }
+            val matches = directory.listFiles().filter { it.name == part }
+            check(matches.size <= 1) { "O provedor contém nomes duplicados: $part" }
+            val child = matches.singleOrNull()
+                ?: return ResolvedTarget(directory, segments.subList(index, segments.size - 1), segments.last(), null)
+            check(child.isDirectory) { "Um arquivo ocupa o lugar da pasta: $path" }
+            directory = child
+        }
+        check(directory.isDirectory) { "Um arquivo ocupa o lugar da pasta: $path" }
+        val name = segments.last()
+        val matches = directory.listFiles().filter { it.name == name }
+        check(matches.size <= 1) { "O provedor contém nomes duplicados: $name" }
+        val target = matches.singleOrNull()
+        if (target != null) check(target.isFile) { "O caminho já é uma pasta: $path" }
+        return ResolvedTarget(directory, emptyList(), name, target)
+    }
+
+    private fun cachedTarget(path: String, shareId: String): DocumentFile? {
+        val treeUri = activeTree
+        val entry = synchronized(scanLock) {
+            if (shareId !in scanReady || shareId in fullScanShares || shareId in deepScanShares) null
+            else scanCache[shareId]?.get(path)?.takeIf {
+                it.tree == treeUri.toString() && uriPaths[shareId]?.get(it.uri) == path
+            }
+        } ?: return null
+        return try {
+            val uri = Uri.parse(entry.uri)
+            if (!DocumentsContract.isDocumentUri(context, uri) ||
+                DocumentsContract.getTreeDocumentId(uri) != DocumentsContract.getTreeDocumentId(treeUri)) return null
+            DocumentFile.fromSingleUri(context, uri)?.takeIf {
+                it.uri == uri && it.name == path.substringAfterLast('/') && it.isFile && !it.isVirtual
+            }
+        } catch (_: Exception) { null }
+    }
+
     private fun findDirectory(path: String): DocumentFile? {
         var doc = root
         for (part in parts(path)) {
@@ -709,16 +753,6 @@ class FolderAccess(private val context: Context) {
             check(doc.isDirectory) { "O caminho já é um arquivo: $path" }
         }
         return doc
-    }
-
-    private fun parent(path: String): Pair<DocumentFile, String> {
-        val parts = parts(path)
-        var doc = root
-        for (part in parts.dropLast(1)) {
-            doc = doc.findFile(part) ?: doc.createDirectory(part) ?: error("Não foi possível criar $part")
-            check(doc.isDirectory) { "Um arquivo ocupa o lugar da pasta $part" }
-        }
-        return doc to parts.last()
     }
 
     private fun persist(file: File, json: JSONObject) {
@@ -944,13 +978,24 @@ class FolderAccess(private val context: Context) {
         val share = active?.optString("share_id")
         PerformanceTrace.event("install_start", share, path)
         check(!ignored(path,false,ignoreRules())) { "Caminho ignorado: $path" }
+        parts(path)
         active?.optString("share_id")?.takeIf(String::isNotEmpty)?.let { id ->
             synchronized(scanLock) { dirtyPaths.getOrPut(id) { mutableSetOf() }.add(path) }
         }
         val source = File(sourcePath)
-        val old = traced("saf_find", path) { find(path) }
-        val actual = traced("target_hash", path) { old?.let { hash(it) } ?: "" }
-        if (actual == newHash) {
+        val shareId = active?.optString("share_id").orEmpty()
+        val hinted = if (expectedHash.isNotEmpty()) cachedTarget(path, shareId) else null
+        val hintedHash = hinted?.let {
+            try { traced("target_hash", path) { hash(it) } } catch (_: Exception) { null }
+        }
+        val old = if (expectedHash.isEmpty()) null else if (hintedHash == expectedHash) hinted
+            else traced("saf_find", path) { find(path) }
+        val actual = if (old === hinted && hintedHash == expectedHash) hintedHash
+            else if (expectedHash.isEmpty()) ""
+            else traced("target_hash", path) { old?.let { hash(it) } ?: "" }
+        if (expectedHash.isNotEmpty() && actual == newHash) {
+            val current = if (old === hinted) traced("saf_find", path) { find(path) } else old
+            check(traced("target_hash", path) { current?.let { hash(it) } ?: "" } == newHash) { "STALE_TARGET: $path" }
             check(digest(source.inputStream()).first == newHash) { "SHA-256 não confere." }
             android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} replay=true")
             PerformanceTrace.event("install_end", share, path, start = traceStarted)
@@ -984,16 +1029,35 @@ class FolderAccess(private val context: Context) {
             .put("share_id", active?.optString("share_id") ?: "").put("oldHash", expectedHash).put("newHash", newHash).put("finished", false)
         traced("journal_persist", path) { persist(journalFile, journal) }
         // SAF lacks atomic compare-and-replace. Recheck immediately and retain both snapshots.
-        if (traced("target_recheck", path) { find(path)?.let { hash(it) } ?: "" } != expectedHash) {
+        val (resolved, recheckedHash) = traced("target_recheck", path) {
+            val location = resolveTarget(path)
+            location to (location.target?.let { hash(it) } ?: "")
+        }
+        if (expectedHash.isEmpty() && recheckedHash == newHash) {
+            journal.put("finished", true)
+            traced("journal_persist", path) { persist(journalFile, journal) }
+            PerformanceTrace.event("install_end", share, path, start = traceStarted)
+            android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} replay=true")
+            return "ok"
+        }
+        if (recheckedHash != expectedHash) {
             // No shared document was touched; this is an aborted operation, not a crash.
             journal.put("finished", true)
             traced("journal_persist", path) { persist(journalFile, journal) }
             error("STALE_TARGET: $path")
         }
-        val target = old ?: run {
-            val (directory, name) = traced("saf_parent", path) { parent(path) }
+        val target = resolved.target ?: run {
+            val directory = if (resolved.missingDirectories.isEmpty()) resolved.directory else traced("saf_parent", path) {
+                resolved.missingDirectories.fold(resolved.directory) { parent, part ->
+                    val matches = parent.listFiles().filter { it.name == part }
+                    check(matches.size <= 1) { "O provedor contém nomes duplicados: $part" }
+                    val child = matches.singleOrNull() ?: parent.createDirectory(part) ?: error("Não foi possível criar $part")
+                    check(child.isDirectory) { "Um arquivo ocupa o lugar da pasta $part" }
+                    child
+                }
+            }
             traced("saf_create", path) {
-                directory.createFile("application/octet-stream", name)
+                directory.createFile("application/octet-stream", resolved.name)
                     ?: error("Não foi possível criar $path")
             }
         }
@@ -1004,6 +1068,21 @@ class FolderAccess(private val context: Context) {
         check(traced("target_verify", path) { hash(target) } == newHash) { "Falha na gravação. Cópias preservadas para recuperação." }
         journal.put("finished", true)
         traced("journal_persist", path) { persist(journalFile, journal) }
+        if (shareId.isNotEmpty()) {
+            try {
+                val entry = ScanEntry(activeTree.toString(), target.uri.toString(), target.lastModified(),
+                    target.length(), newHash, incoming.length())
+                synchronized(scanLock) {
+                    val paths = uriPaths.getOrPut(shareId) { mutableMapOf() }
+                    if (paths[entry.uri]?.let { it != path } == true) deepScanShares.add(shareId)
+                    else {
+                        val cache = scanCache.getOrPut(shareId) { mutableMapOf() }
+                        cache.put(path, entry)?.let { if (paths[it.uri] == path) paths.remove(it.uri) }
+                        paths[entry.uri] = path
+                    }
+                }
+            } catch (_: Exception) { synchronized(scanLock) { deepScanShares.add(shareId) } }
+        }
         PerformanceTrace.event("install_end", share, path, start = traceStarted)
         android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} prepare_ms=$preparedMs")
         return "ok"
