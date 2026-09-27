@@ -15,6 +15,7 @@ import java.util.UUID
 
 /** SAF boundary. Sync I/O uses one worker; administrative file updates share [stateLock]. */
 class FolderAccess(private val context: Context) {
+    private class AuditDeferred : RuntimeException("AUDIT_DEFERRED")
     companion object {
         private val stateLock = Any()
         private const val LOCAL_OP_TIMEOUT_MS = 30L * 60L * 1000L
@@ -56,8 +57,9 @@ class FolderAccess(private val context: Context) {
     private val dirtyPaths = mutableMapOf<String, MutableSet<String>>()
     private val fullScanShares = mutableSetOf<String>()
     private val deepScanShares = mutableSetOf<String>()
+    private val scheduledFullScanShares = mutableSetOf<String>()
+    private val scheduledDeepScanShares = mutableSetOf<String>()
     private var focusedScan = false
-
     fun setFocusedScan(focused: Boolean) { focusedScan = focused }
 
     fun bindingIdentity(): String = "${activeTree}|${active?.optLong("binding_revision", 0L)}|${ignoreText()}"
@@ -72,8 +74,12 @@ class FolderAccess(private val context: Context) {
     }
     fun scheduleAudit(shareId: String, deep: Boolean) {
         synchronized(scanLock) {
+            if (shareId !in fullScanShares) scheduledFullScanShares.add(shareId)
             fullScanShares.add(shareId)
-            if (deep) deepScanShares.add(shareId)
+            if (deep) {
+                if (shareId !in deepScanShares) scheduledDeepScanShares.add(shareId)
+                deepScanShares.add(shareId)
+            }
         }
         PerformanceTrace.event(if (deep) "deep_audit" else "scheduled_audit", shareId)
     }
@@ -211,10 +217,6 @@ class FolderAccess(private val context: Context) {
         }
         return JSONObject().put("files", files).put("enumerated", enumerated)
             .put("hashed", enumerated).put("bytes_hashed", bytesHashed).toString()
-    }
-
-    fun invalidateScans(shareIds: Set<String>) = synchronized(scanLock) {
-        deepScanShares.addAll(shareIds)
     }
 
     /** A provider-wide notification invalidates only its Share. */
@@ -465,6 +467,8 @@ class FolderAccess(private val context: Context) {
             scanCache.clear(); uriPaths.clear(); directoryUris.clear(); pendingUris.clear()
             dirtyDirectories.clear(); scanReady.clear(); dirtyPaths.clear()
             fullScanShares.clear(); deepScanShares.clear()
+            scheduledFullScanShares.clear()
+            scheduledDeepScanShares.clear()
         }
         "ok"
     }
@@ -538,7 +542,9 @@ class FolderAccess(private val context: Context) {
             scanReady.retainAll(currentIds - resetCacheIds)
             dirtyPaths.keys.retainAll(currentIds - resetCacheIds)
             fullScanShares.retainAll(currentIds - resetCacheIds)
+            scheduledFullScanShares.retainAll(currentIds - resetCacheIds)
             deepScanShares.retainAll(currentIds)
+            scheduledDeepScanShares.retainAll(currentIds - resetCacheIds)
             deepScanShares.addAll(resetCacheIds)
         }
         android.util.Log.i("RowdLatency", "configure_ms=${android.os.SystemClock.elapsedRealtime() - started}")
@@ -567,6 +573,8 @@ class FolderAccess(private val context: Context) {
             scanCache.remove(id); uriPaths.remove(id); directoryUris.remove(id)
             pendingUris.remove(id); dirtyDirectories.remove(id); scanReady.remove(id)
             dirtyPaths.remove(id); deepScanShares.add(id)
+            scheduledFullScanShares.remove(id)
+            scheduledDeepScanShares.remove(id)
         }
         releaseUnusedGrants(oldUris)
         "ok"
@@ -838,6 +846,7 @@ class FolderAccess(private val context: Context) {
 
     fun scanJson(): String {
         val started = android.os.SystemClock.elapsedRealtime()
+        val changeGeneration = SyncService.changeGeneration()
         val deadline = android.os.SystemClock.elapsedRealtime() + LOCAL_OP_TIMEOUT_MS
         checkLocalDeadline(deadline)
         recoverPending()
@@ -845,11 +854,19 @@ class FolderAccess(private val context: Context) {
         val shareId = active?.getString("share_id") ?: error("Nenhum Share selecionado.")
         val tree = activeTree.toString()
         var deepAudit = false
+        var flaggedFull = false
+        var scheduledFull = false
+        var scheduledDeep = false
         var hadTrustedCache = false
+        var auditScan = false
         val (previous, dirty, fullScan) = synchronized(scanLock) {
             val flagged = fullScanShares.remove(shareId)
+            flaggedFull = flagged
+            scheduledFull = scheduledFullScanShares.remove(shareId)
             val full = !focusedScan || flagged
             val deep = deepScanShares.remove(shareId)
+            scheduledDeep = scheduledDeepScanShares.remove(shareId)
+            auditScan = !focusedScan || flagged || deep
             deepAudit = deep
             hadTrustedCache = shareId in scanReady
             val changed = dirtyPaths.remove(shareId)?.toSet().orEmpty()
@@ -875,11 +892,13 @@ class FolderAccess(private val context: Context) {
         }
         fun walk(directory: DocumentFile, prefix: String) {
             checkLocalDeadline(deadline)
+            if (auditScan && SyncService.changeGeneration() != changeGeneration) throw AuditDeferred()
             nextDirectories[directory.uri.toString()] = prefix
             val children = directory.listFiles()
             val names = HashSet<String>()
             children.forEach { child ->
                 checkLocalDeadline(deadline)
+                if (auditScan && (scanAbort.get() || SyncService.changeGeneration() != changeGeneration)) throw AuditDeferred()
                 val name = child.name ?: error("Arquivo sem nome no provedor.")
                 check(names.add(name)) { "O provedor contém nomes duplicados: $name" }
                 val path = if (prefix.isEmpty()) name else "$prefix/$name"
@@ -959,6 +978,7 @@ class FolderAccess(private val context: Context) {
                 walk(root, "")
             }
             synchronized(scanLock) {
+                if (auditScan && (scanAbort.get() || SyncService.changeGeneration() != changeGeneration)) throw AuditDeferred()
                 scanCache[shareId] = nextCache
                 uriPaths[shareId] = nextUris
                 directoryUris[shareId] = nextDirectories
@@ -967,8 +987,12 @@ class FolderAccess(private val context: Context) {
         } catch (error: Exception) {
             synchronized(scanLock) {
                 dirtyPaths.getOrPut(shareId) { mutableSetOf() }.addAll(dirty)
-                deepScanShares.add(shareId)
+                if (error is AuditDeferred) {
+                    if (flaggedFull && !scheduledFull) fullScanShares.add(shareId)
+                    if (deepAudit && !scheduledDeep) deepScanShares.add(shareId)
+                } else deepScanShares.add(shareId)
             }
+            if (error is AuditDeferred) return JSONObject().put("deferred", true).toString()
             throw error
         }
         val auditMode = if (deepAudit || !hadTrustedCache) "deep" else if (usedFocused) "focused" else "namespace"
@@ -1063,7 +1087,23 @@ class FolderAccess(private val context: Context) {
         traced("journal_persist", path) { persist(journalFile, journal) }
         // SAF lacks atomic compare-and-replace. Recheck immediately and retain both snapshots.
         val (resolved, recheckedHash) = traced("target_recheck", path) {
-            val location = resolveTarget(path)
+            val current = if (old === hinted && hinted != null) old else null
+            val location = if (current != null &&
+                synchronized(scanLock) {
+                    val parentPath = path.substringBeforeLast('/', "")
+                    val parentUri = if (parentPath.isEmpty()) root.uri.toString()
+                        else directoryUris[shareId]?.entries?.firstOrNull { it.value == parentPath }?.key
+                    parentUri != null && parentPath !in dirtyDirectories[shareId].orEmpty() &&
+                        pendingUris[shareId].isNullOrEmpty()
+                }) {
+                val parentPath = path.substringBeforeLast('/', "")
+                val parent = if (parentPath.isEmpty()) root else findDirectory(parentPath)
+                val matches = parent?.listFiles()?.filter { it.name == path.substringAfterLast('/') }
+                if (parent != null && matches?.size == 1 && matches.single().uri == current.uri && matches.single().isFile)
+                    ResolvedTarget(parent, emptyList(), path.substringAfterLast('/'), current)
+                else resolveTarget(path)
+            }
+                else resolveTarget(path)
             location to (location.target?.let { hash(it) } ?: "")
         }
         if (expectedHash.isEmpty() && recheckedHash == newHash) {

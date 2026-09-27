@@ -146,6 +146,9 @@ impl Store for AndroidStore<'_, '_, '_> {
     fn scan(&mut self) -> Result<Manifest> {
         check_cancelled()?;
         let result: serde_json::Value = serde_json::from_str(&self.call("scanJson", &[])?)?;
+        if result["deferred"] == true {
+            return Err(rowd_core::sync::ScanDeferred.into());
+        }
         self.metrics.files_enumerated += result["enumerated"]
             .as_u64()
             .context("scan count missing")?;

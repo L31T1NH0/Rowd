@@ -25,6 +25,15 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
+#[derive(Debug)]
+pub struct ScanDeferred;
+impl std::fmt::Display for ScanDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "audit deferred")
+    }
+}
+impl std::error::Error for ScanDeferred {}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Report {
     pub transferred: usize,
@@ -116,6 +125,7 @@ impl State {
             state.files.clear();
             state.last_sync = None;
             session_tokens().lock().unwrap().remove(path);
+            retry_paths().lock().unwrap().remove(path);
             trace::event(
                 "sync",
                 "state_base_discarded",
@@ -133,6 +143,11 @@ impl State {
 fn session_tokens() -> &'static Mutex<BTreeMap<PathBuf, String>> {
     static TOKENS: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
     TOKENS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn retry_paths() -> &'static Mutex<BTreeMap<PathBuf, BTreeSet<String>>> {
+    static PATHS: OnceLock<Mutex<BTreeMap<PathBuf, BTreeSet<String>>>> = OnceLock::new();
+    PATHS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn persist_state(
@@ -644,7 +659,6 @@ pub fn coordinate_with_progress(
     let started = Instant::now();
     let share_id = state.share_id.clone();
     let pending_state = state_path.with_extension("pending");
-    atomic_write(&pending_state, b"round in progress")?;
     trace::event(
         "sync",
         "round_start",
@@ -655,7 +669,7 @@ pub fn coordinate_with_progress(
         None,
     );
     let store_metrics_before = store.metrics();
-    let previous_token = session_tokens().lock().unwrap().remove(state_path);
+    let previous_token = session_tokens().lock().unwrap().get(state_path).cloned();
     let session_matches = previous_token.is_some();
     state.base_token = None;
     let manifest_started = Instant::now();
@@ -688,7 +702,16 @@ pub fn coordinate_with_progress(
         None
     };
     if remap.is_none() && state.last_sync.is_some() && session_matches {
-        match store.delta_paths()? {
+        let retry = retry_paths()
+            .lock()
+            .unwrap()
+            .get(state_path)
+            .cloned()
+            .unwrap_or_default();
+        match store.delta_paths()?.map(|mut dirty| {
+            dirty.extend(retry);
+            dirty
+        }) {
             None => fallback_reason = Some("cache_untrusted"),
             Some(dirty) if dirty.len() > 1024 => fallback_reason = Some("too_many_dirty_paths"),
             Some(dirty)
@@ -699,6 +722,10 @@ pub fn coordinate_with_progress(
                 fallback_reason = Some("invalid_dirty_paths")
             }
             Some(dirty) => {
+                retry_paths()
+                    .lock()
+                    .unwrap()
+                    .insert(state_path.to_path_buf(), dirty.clone());
                 let request = Message::Scoped {
                     share_id: share_id.clone(),
                     message: Box::new(Message::DeltaScan {
@@ -804,6 +831,17 @@ pub fn coordinate_with_progress(
         delta
     } else {
         protocol::send_for(io, &share_id, Message::Scan)?;
+        let (android, metrics, bytes) = match protocol::receive_manifest_with_metrics(io, &share_id)
+        {
+            Ok(manifest) => manifest,
+            Err(error) if error.is::<ScanDeferred>() => {
+                return Ok(Report {
+                    round_deferred: true,
+                    ..Report::default()
+                })
+            }
+            Err(error) => return Err(error),
+        };
         let local_started = Instant::now();
         trace::event(
             "sync",
@@ -824,7 +862,6 @@ pub fn coordinate_with_progress(
             Some(local_started),
             None,
         );
-        let (android, metrics, bytes) = protocol::receive_manifest_with_metrics(io, &share_id)?;
         let paths = pc
             .keys()
             .chain(android.keys())
@@ -987,6 +1024,14 @@ pub fn coordinate_with_progress(
                     matches!(action, Action::ToAndroid | Action::Conflict)
                 }
             };
+        // A failed scan or idle round has not changed either side's committed base.
+        // Once a transfer can begin, retain the crash marker until Done succeeds.
+        if !prohibited
+            && matches!(action, Action::ToAndroid | Action::ToPc | Action::Conflict)
+            && !pending_state.try_exists()?
+        {
+            atomic_write(&pending_state, b"round in progress")?;
+        }
         report.metrics.reconcile_ms += reconciling.elapsed().as_millis();
         if !pending_puts.is_empty() && (action != Action::ToAndroid || prohibited) {
             drain_puts(io, store, state, state_path, &mut pending_puts, &mut report)?;
@@ -1293,8 +1338,10 @@ pub fn coordinate_with_progress(
             .as_secs(),
     );
     let new_token = crate::random_id()?;
+    if !pending_state.try_exists()? {
+        atomic_write(&pending_state, b"round in progress")?;
+    }
     persist_state(state_path, state, &mut report.metrics, None)?;
-    std::fs::remove_file(&pending_state)?;
     let store_metrics = store.metrics();
     report.metrics.files_hashed = store_metrics
         .files_hashed
@@ -1318,10 +1365,12 @@ pub fn coordinate_with_progress(
             base_token: new_token.clone(),
         },
     )?;
+    std::fs::remove_file(&pending_state)?;
     session_tokens()
         .lock()
         .unwrap()
         .insert(state_path.to_path_buf(), new_token);
+    retry_paths().lock().unwrap().remove(state_path);
     trace::event(
         "sync",
         "round_end",
@@ -1395,7 +1444,6 @@ pub fn respond_share(
                         None,
                         None,
                     );
-                    store.set_base_token(None);
                     let before = store.metrics();
                     let local_started = Instant::now();
                     trace::event(
@@ -1407,7 +1455,21 @@ pub fn respond_share(
                         None,
                         None,
                     );
-                    let files = store.scan()?;
+                    let files = match store.scan() {
+                        Ok(files) => files,
+                        Err(error) if error.is::<ScanDeferred>() => {
+                            protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                            return Ok(Report {
+                                round_deferred: true,
+                                ..Report::default()
+                            });
+                        }
+                        Err(error) => {
+                            store.set_base_token(None);
+                            return Err(error);
+                        }
+                    };
+                    store.set_base_token(None);
                     trace::event(
                         "sync",
                         "local_scan_end",
@@ -1476,7 +1538,6 @@ pub fn respond_share(
                 }
                 Message::DeltaScan { base_token, paths } => {
                     let old = store.base_token();
-                    store.set_base_token(None);
                     let before = store.metrics();
                     let mut fallback_reason = if old.as_deref() != Some(&base_token) {
                         Some("no_session_token")
@@ -1702,7 +1763,6 @@ pub fn respond_share(
                 "round_failed"
             }),
         );
-        store.set_base_token(None);
         let _ = protocol::send(
             io,
             &Message::Error {

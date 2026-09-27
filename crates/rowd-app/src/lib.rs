@@ -1947,6 +1947,16 @@ fn session_round(
                     continue;
                 }
             };
+            if report.round_deferred {
+                let mut pending = urgent.lock().unwrap();
+                deferred_shares = pending.keys().cloned().collect();
+                for delivered in pending.values_mut() {
+                    *delivered = true;
+                }
+                deferred = true;
+                *audit_preempted = true;
+                break;
+            }
             report.metrics.share_queue_wait_ms = share_started_ms;
             resolve_share_error(home, &share.share_id);
             round_metrics.shares_processed += 1;

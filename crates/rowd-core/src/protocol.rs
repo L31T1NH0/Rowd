@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MANIFEST_CHUNK_FILES: usize = 1024;
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -73,6 +73,7 @@ pub enum Message {
     },
     Ready,
     Scan,
+    ScanDeferred,
     DeltaScan {
         base_token: String,
         paths: std::collections::BTreeSet<String>,
@@ -227,8 +228,10 @@ pub fn receive_manifest_with_metrics(
         }
     }
     let mut io = Counted(io, 0);
-    let Message::ManifestBegin { count } = receive_for(&mut io, share_id)? else {
-        anyhow::bail!("expected manifest begin")
+    let count = match receive_for(&mut io, share_id)? {
+        Message::ManifestBegin { count } => count,
+        Message::ScanDeferred => return Err(crate::sync::ScanDeferred.into()),
+        _ => anyhow::bail!("expected manifest begin"),
     };
     ensure!(count <= crate::model::MAX_FILES, "too many files");
     let mut files = Manifest::new();

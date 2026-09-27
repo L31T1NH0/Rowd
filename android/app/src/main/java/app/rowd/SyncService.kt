@@ -42,6 +42,7 @@ class SyncService : Service() {
         private val changes = Object()
         private var dirty = false
         private var generation = 0L
+        fun changeGeneration(): Long = synchronized(changes) { generation }
         private var dirtyAllGeneration = 0L
         private val dirtyShares = mutableMapOf<String, Long>()
         private val detectedAt = mutableMapOf<String, Long>()
@@ -130,7 +131,6 @@ class SyncService : Service() {
                     observedTrees = current
                 }
                 do {
-                    var attemptedShares = emptySet<String>()
                     try {
                         refreshObservers()
                         var invitation = prefs.getString("invitation", null) ?: error("Importe o convite do PC.")
@@ -167,7 +167,6 @@ class SyncService : Service() {
                             periodic -> JSONArray(listOfNotNull(auditShare)).toString()
                             else -> ""
                         }
-                        if (focus.isNotEmpty()) attemptedShares = if (periodic) setOfNotNull(auditShare) else selected.keys
                         access.setFocusedScan(focus.isNotEmpty())
                         publish(RowdStatus.Kind.Working,
                             if (full) "Verificando arquivos" else "Sincronizando alterações",
@@ -226,7 +225,6 @@ class SyncService : Service() {
                         if (missing == 0 && conflicts > 0) detail += " As versões estão em Rowd Conflicts."
                         publish(if (roundDeferred) RowdStatus.Kind.Working else if (missing > 0 || conflicts > 0) RowdStatus.Kind.NeedsAttention else RowdStatus.Kind.Ready, title, detail)
                     } catch (error: Exception) {
-                        access.invalidateScans(attemptedShares)
                         failures++
                         if (!active.get()) publish(RowdStatus.Kind.Paused, "Sincronização pausada", "A operação foi cancelada em um ponto seguro.")
                         else publish(RowdStatus.Kind.Error,
