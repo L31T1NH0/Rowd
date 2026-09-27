@@ -47,7 +47,7 @@ object PerformanceTrace {
         return bytes.take(8).joinToString("") { "%02x".format(it.toInt() and 255) }
     }
 
-    @Synchronized fun event(name: String, share: String?, path: String? = null, bytes: Long? = null, start: Long? = null) {
+    @Synchronized fun event(name: String, share: String?, path: String? = null, bytes: Long? = null, start: Long? = null, detail: JSONObject? = null) {
         if (!active) return
         try {
             val json = JSONObject().put("wall_ms", System.currentTimeMillis())
@@ -57,6 +57,7 @@ object PerformanceTrace {
             if (share != null && path != null) json.put("file_id", fileId(share, path))
             if (bytes != null) json.put("bytes", bytes)
             if (start != null) json.put("duration_us", (SystemClock.elapsedRealtimeNanos() - start) / 1000)
+            if (detail != null) json.put("detail", detail)
             writer?.write(json.toString() + "\n")
         } catch (_: Exception) {
             active = false

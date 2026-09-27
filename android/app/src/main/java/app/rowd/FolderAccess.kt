@@ -70,19 +70,37 @@ class FolderAccess(private val context: Context) {
         synchronized(scanLock) { deepScanShares.add(active?.getString("share_id") ?: error("Nenhum Share selecionado.")) }
         return "ok"
     }
-    fun scheduleDeepAudit() {
-        val shares = JSONArray(knownShares())
+    fun scheduleAudit(shareId: String, deep: Boolean) {
         synchronized(scanLock) {
-            for (index in 0 until shares.length()) deepScanShares.add(shares.getJSONObject(index).getString("share_id"))
+            fullScanShares.add(shareId)
+            if (deep) deepScanShares.add(shareId)
         }
+        PerformanceTrace.event(if (deep) "deep_audit" else "scheduled_audit", shareId)
     }
 
     fun deltaPathsJson(): String = synchronized(scanLock) {
-        val id = active?.getString("share_id") ?: return@synchronized "null"
-        val cache = scanCache[id] ?: return@synchronized "null"
-        if (!focusedScan || id in fullScanShares || id in deepScanShares || id !in scanReady ||
-            (cache.isNotEmpty() && cache.values.first().tree != activeTree.toString()))
-            return@synchronized "null"
+        val id = active?.getString("share_id")
+        val pendingCount = pendingUris[id]?.size ?: 0
+        val directoryCount = dirtyDirectories[id]?.size ?: 0
+        fun unavailable(reason: String, uri: String? = null): String {
+            if (PerformanceTrace.enabled()) PerformanceTrace.event("delta_unavailable", id, detail = JSONObject()
+                .put("reason", reason).put("focused", focusedScan)
+                .put("fullScan", id in fullScanShares).put("deepScan", id in deepScanShares)
+                .put("scanReady", id in scanReady).put("cache_size", scanCache[id]?.size ?: 0)
+                .put("pendingUris_count", pendingCount)
+                .put("dirtyDirectories_count", directoryCount)
+                .put("dirtyPaths_count", dirtyPaths[id]?.size ?: 0)
+                .apply { if (uri != null && id != null) put("uri_id", PerformanceTrace.fileId(id, uri)) })
+            return "null"
+        }
+        if (id == null) return@synchronized unavailable("share_not_selected")
+        val cache = scanCache[id] ?: return@synchronized unavailable("cache_missing")
+        if (!focusedScan) return@synchronized unavailable("not_focused")
+        if (id in fullScanShares) return@synchronized unavailable("full_scan_flagged")
+        if (id in deepScanShares) return@synchronized unavailable("deep_scan_flagged")
+        if (id !in scanReady) return@synchronized unavailable("scan_not_ready")
+        if (cache.isNotEmpty() && cache.values.first().tree != activeTree.toString())
+            return@synchronized unavailable("tree_mismatch")
         try {
         val unresolved = pendingUris.remove(id).orEmpty()
         for (uri in unresolved) {
@@ -95,17 +113,17 @@ class FolderAccess(private val context: Context) {
                 if (directory.uri.toString() != directoryUri) continue
                 val child = directory.listFiles().firstOrNull { it.uri.toString() == uri }
                 if (child != null) {
-                    val name = child.name ?: return@synchronized "null"
-                    if (!child.isFile || child.isVirtual) return@synchronized "null"
+                    val name = child.name ?: return@synchronized unavailable("pending_uri_invalid", uri)
+                    if (!child.isFile || child.isVirtual) return@synchronized unavailable("pending_uri_invalid", uri)
                     found = if (prefix.isEmpty()) name else "$prefix/$name"
                     break
                 }
             }
-            if (found == null) { fullScanShares.add(id); return@synchronized "null" }
+            if (found == null) { fullScanShares.add(id); return@synchronized unavailable("pending_uri_unresolved", uri) }
             dirtyPaths.getOrPut(id) { mutableSetOf() }.add(found)
         }
         for (prefix in dirtyDirectories.remove(id).orEmpty()) {
-            val directory = if (prefix.isEmpty()) root else findDirectory(prefix) ?: return@synchronized "null"
+            val directory = if (prefix.isEmpty()) root else findDirectory(prefix) ?: return@synchronized unavailable("dirty_directory_unresolved")
             val found = mutableSetOf<String>()
             val seen = mutableSetOf<String>()
             fun walk(directory: DocumentFile, prefix: String) {
@@ -134,9 +152,9 @@ class FolderAccess(private val context: Context) {
         }
         } catch (_: Exception) {
             deepScanShares.add(id)
-            return@synchronized "null"
+            return@synchronized unavailable("resolution_error")
         }
-        if (dirtyPaths[id].orEmpty().size > 1024) return@synchronized "null"
+        if (dirtyPaths[id].orEmpty().size > 1024) return@synchronized unavailable("too_many_dirty_paths")
         JSONArray(dirtyPaths[id].orEmpty().toList()).toString()
     }
 
@@ -199,10 +217,25 @@ class FolderAccess(private val context: Context) {
         deepScanShares.addAll(shareIds)
     }
 
-    /** A provider-wide notification invalidates only its Share; the periodic audit still covers all Shares. */
-    fun noteChange(shareId: String?, changedUri: Uri?): Boolean = synchronized(scanLock) {
-        if (shareId == null) return@synchronized false
+    /** A provider-wide notification invalidates only its Share. */
+    fun noteChange(shareId: String?, changedUri: Uri?, selfChange: Boolean = false): Boolean = synchronized(scanLock) {
+        if (shareId == null) {
+            if (PerformanceTrace.enabled()) PerformanceTrace.event("observer_change", null, detail = JSONObject()
+                .put("selfChange", selfChange).put("uri_present", changedUri != null)
+                .put("classification", if (changedUri == null) "full_scan_null_uri" else "pending_uri")
+                .apply { if (changedUri != null) put("uri_id", PerformanceTrace.fileId("", changedUri.toString())) })
+            return@synchronized false
+        }
         val path = changedUri?.let { uriPaths[shareId]?.get(it.toString()) }
+        if (PerformanceTrace.enabled()) PerformanceTrace.event("observer_change", shareId, detail = JSONObject()
+            .put("selfChange", selfChange)
+            .put("uri_present", changedUri != null)
+            .put("classification", when {
+                path != null -> "known_path"
+                changedUri == null -> "full_scan_null_uri"
+                directoryUris[shareId]?.containsKey(changedUri.toString()) == true -> "known_directory"
+                else -> "pending_uri"
+            }).apply { if (changedUri != null) put("uri_id", PerformanceTrace.fileId(shareId, changedUri.toString())) })
         if (path == null) {
             if (changedUri == null) fullScanShares.add(shareId)
             else if (directoryUris[shareId]?.containsKey(changedUri.toString()) == true)

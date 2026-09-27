@@ -103,6 +103,8 @@ class SyncService : Service() {
             var lastAudit = 0L
             var lastDeepAudit = 0L
             var auditDeferred = false
+            var auditCursor = 0
+            var deepAuditCursor = 0
             var completedAllGeneration = 0L
             try {
                 val access = FolderAccess(this)
@@ -114,10 +116,10 @@ class SyncService : Service() {
                     current.forEach { (tree, shareId) ->
                         val observer = object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
                             override fun onChange(selfChange: Boolean) {
-                                if (access.noteChange(shareId, null)) wake(shareId) else wake()
+                                if (access.noteChange(shareId, null, selfChange)) wake(shareId) else wake()
                             }
                             override fun onChange(selfChange: Boolean, uri: Uri?) {
-                                if (access.noteChange(shareId, uri)) wake(shareId) else wake()
+                                if (access.noteChange(shareId, uri, selfChange)) wake(shareId) else wake()
                             }
                         }
                         try {
@@ -152,13 +154,21 @@ class SyncService : Service() {
                             Triple(dirtyAllGeneration != completedAllGeneration || (auditDue && !focusedFirst),
                                 dirtyAllGeneration, selected)
                         }
-                        val focus = if (full) "" else JSONArray(selected.keys.toList()).toString()
-                        if (!full) attemptedShares = selected.keys
-                        if (full && (lastDeepAudit == 0L || now - lastDeepAudit >= 15 * 60_000L)) {
-                            access.scheduleDeepAudit()
-                            lastDeepAudit = now
+                        val periodic = full && dirtyAllGeneration == completedAllGeneration
+                        val eligible = if (periodic) JSONArray(access.availableShares()).let { shares ->
+                            (0 until shares.length()).map(shares::getString).sorted()
+                        } else emptyList()
+                        val auditShare = eligible.takeIf { it.isNotEmpty() }?.let { it[auditCursor % it.size] }
+                        val deep = auditShare != null && eligible[deepAuditCursor % eligible.size] == auditShare &&
+                            (lastDeepAudit == 0L || now - lastDeepAudit >= 15 * 60_000L)
+                        if (auditShare != null) access.scheduleAudit(auditShare, deep)
+                        val focus = when {
+                            !full -> JSONArray(selected.keys.toList()).toString()
+                            periodic -> JSONArray(listOfNotNull(auditShare)).toString()
+                            else -> ""
                         }
-                        access.setFocusedScan(!full)
+                        if (focus.isNotEmpty()) attemptedShares = if (periodic) setOfNotNull(auditShare) else selected.keys
+                        access.setFocusedScan(focus.isNotEmpty())
                         publish(RowdStatus.Kind.Working,
                             if (full) "Verificando arquivos" else "Sincronizando alterações",
                             if (full) "Auditoria periódica dos Shares." else "Verificando os Shares alterados.")
@@ -184,6 +194,13 @@ class SyncService : Service() {
                             } else if (full) {
                                 lastAudit = android.os.SystemClock.elapsedRealtime()
                                 auditDeferred = false
+                                if (auditShare != null) {
+                                    auditCursor++
+                                    if (deep) {
+                                        deepAuditCursor++
+                                        lastDeepAudit = lastAudit
+                                    }
+                                }
                                 if (dirtyAllGeneration == allVersion) completedAllGeneration = allVersion
                             }
                             if (!roundDeferred) {

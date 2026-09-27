@@ -1521,6 +1521,15 @@ pub fn respond_share(
                                 None
                             }
                             Err(_) => {
+                                trace::event(
+                                    "sync",
+                                    "delta_unavailable",
+                                    Some(&share_id),
+                                    None,
+                                    None,
+                                    None,
+                                    Some("jni_or_store_error"),
+                                );
                                 fallback_reason = Some("dirty_unavailable");
                                 None
                             }
