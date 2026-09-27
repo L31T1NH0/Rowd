@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver android:name=".DiagnosticReceiver" android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="app.rowd.diagnostic.COMMAND" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

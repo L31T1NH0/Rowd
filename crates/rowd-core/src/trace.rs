@@ -116,6 +116,9 @@ pub fn event(
     };
     if serde_json::to_writer(&mut session.writer, &value).is_ok() {
         let _ = session.writer.write_all(b"\n");
+        if name == "round_end" {
+            let _ = session.writer.flush();
+        }
     }
 }
 

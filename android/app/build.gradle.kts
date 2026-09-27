@@ -15,6 +15,11 @@ android {
     buildFeatures { viewBinding = true }
     buildTypes {
         release { signingConfig = signingConfigs.getByName("debug") }
+        create("diagnostic") {
+            initWith(getByName("release"))
+            matchingFallbacks += listOf("release")
+            isDebuggable = false
+        }
     }
 }
 androidComponents {
