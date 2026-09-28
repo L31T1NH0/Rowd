@@ -51,6 +51,7 @@ class FolderAccess(private val context: Context) {
     private val scanCache = mutableMapOf<String, MutableMap<String, ScanEntry>>()
     private val uriPaths = mutableMapOf<String, MutableMap<String, String>>()
     private val directoryUris = mutableMapOf<String, Map<String, String>>()
+    private val directoryPaths = mutableMapOf<String, Map<String, String>>()
     private val pendingUris = mutableMapOf<String, MutableSet<String>>()
     private val dirtyDirectories = mutableMapOf<String, MutableSet<String>>()
     private val scanReady = mutableSetOf<String>()
@@ -63,7 +64,7 @@ class FolderAccess(private val context: Context) {
     @Volatile private var scanTask: java.util.concurrent.FutureTask<String>? = null
     private data class PendingScan(val shareId: String, val tree: String,
         val cache: MutableMap<String, ScanEntry>, val uris: MutableMap<String, String>,
-        val directories: Map<String, String>, val dirty: Set<String>,
+        val directories: Map<String, String>, val directoryPaths: Map<String, String>, val dirty: Set<String>,
         val flaggedFull: Boolean, val scheduledFull: Boolean,
         val deepAudit: Boolean, val scheduledDeep: Boolean)
     private var pendingScan: PendingScan? = null
@@ -96,6 +97,7 @@ class FolderAccess(private val context: Context) {
         scanCache[next.shareId] = next.cache
         uriPaths[next.shareId] = next.uris
         directoryUris[next.shareId] = next.directories
+        directoryPaths[next.shareId] = next.directoryPaths
         scanReady.add(next.shareId)
         pendingScan = null
         "ok"
@@ -517,7 +519,7 @@ class FolderAccess(private val context: Context) {
         selectedTree = null
         recoveryTree = null
         synchronized(scanLock) {
-            scanCache.clear(); uriPaths.clear(); directoryUris.clear(); pendingUris.clear()
+            scanCache.clear(); uriPaths.clear(); directoryUris.clear(); directoryPaths.clear(); pendingUris.clear()
             dirtyDirectories.clear(); scanReady.clear(); dirtyPaths.clear()
             fullScanShares.clear(); deepScanShares.clear()
             scheduledFullScanShares.clear()
@@ -590,6 +592,7 @@ class FolderAccess(private val context: Context) {
             scanCache.keys.retainAll(currentIds - resetCacheIds)
             uriPaths.keys.retainAll(currentIds - resetCacheIds)
             directoryUris.keys.retainAll(currentIds - resetCacheIds)
+            directoryPaths.keys.retainAll(currentIds - resetCacheIds)
             pendingUris.keys.retainAll(currentIds - resetCacheIds)
             dirtyDirectories.keys.retainAll(currentIds - resetCacheIds)
             scanReady.retainAll(currentIds - resetCacheIds)
@@ -623,7 +626,7 @@ class FolderAccess(private val context: Context) {
             throw error
         }
         synchronized(scanLock) {
-            scanCache.remove(id); uriPaths.remove(id); directoryUris.remove(id)
+            scanCache.remove(id); uriPaths.remove(id); directoryUris.remove(id); directoryPaths.remove(id)
             pendingUris.remove(id); dirtyDirectories.remove(id); scanReady.remove(id)
             dirtyPaths.remove(id); deepScanShares.add(id)
             scheduledFullScanShares.remove(id)
@@ -837,6 +840,64 @@ class FolderAccess(private val context: Context) {
         } catch (_: Exception) { null }
     }
 
+    private fun cachedResolvedTarget(path: String, shareId: String): ResolvedTarget? {
+        val parentPath = path.substringBeforeLast('/', "")
+        val parentNames = if (parentPath.isEmpty()) emptyList() else parentPath.split('/')
+        val name = path.substringAfterLast('/')
+        val treeUri = activeTree
+        val pair = synchronized(scanLock) {
+            val dirty = dirtyDirectories[shareId].orEmpty()
+            if (shareId !in scanReady || shareId in fullScanShares || shareId in deepScanShares ||
+                scanTask != null || pendingScan?.shareId == shareId ||
+                !pendingUris[shareId].isNullOrEmpty() ||
+                dirty.any { it.isEmpty() || parentPath == it || parentPath.startsWith("$it/") }) null
+            else {
+                val parentUri = directoryPaths[shareId]?.get(parentPath)
+                val target = scanCache[shareId]?.get(path)
+                if (parentUri == null || directoryUris[shareId]?.get(parentUri) != parentPath ||
+                    target == null || target.tree != treeUri.toString() ||
+                    uriPaths[shareId]?.get(target.uri) != path) null
+                else parentUri to target.uri
+            }
+        } ?: return null
+        return try {
+            val parentUri = Uri.parse(pair.first)
+            val targetUri = Uri.parse(pair.second)
+            val treeId = DocumentsContract.getTreeDocumentId(treeUri)
+            if (!DocumentsContract.isDocumentUri(context, parentUri) ||
+                !DocumentsContract.isDocumentUri(context, targetUri) ||
+                parentUri.authority != treeUri.authority || targetUri.authority != treeUri.authority ||
+                DocumentsContract.getTreeDocumentId(parentUri) != treeId ||
+                DocumentsContract.getTreeDocumentId(targetUri) != treeId) return null
+            val parentId = DocumentsContract.getDocumentId(parentUri)
+            val targetId = DocumentsContract.getDocumentId(targetUri)
+            val documentPath = DocumentsContract.findDocumentPath(resolver, targetUri).path
+            val ancestors = synchronized(scanLock) {
+                val paths = directoryPaths[shareId].orEmpty()
+                (0..parentNames.size).map { count ->
+                    paths[parentNames.take(count).joinToString("/")]
+                }
+            }
+            if (documentPath.size != ancestors.size + 1 || documentPath.last() != targetId ||
+                documentPath[documentPath.size - 2] != parentId) return null
+            val ancestorDocs = ancestors.mapIndexed { index, cached ->
+                val uri = cached?.let(Uri::parse) ?: return null
+                if (!DocumentsContract.isDocumentUri(context, uri) || uri.authority != treeUri.authority ||
+                    DocumentsContract.getTreeDocumentId(uri) != treeId ||
+                    DocumentsContract.getDocumentId(uri) != documentPath[index]) return null
+                val doc = if (index == 0) root else DocumentFile.fromSingleUri(context, uri)
+                if (doc == null || doc.uri != uri || !doc.isDirectory ||
+                    (index > 0 && doc.name != parentNames[index - 1])) return null
+                doc
+            }
+            val parent = ancestorDocs.last()
+            val target = DocumentFile.fromSingleUri(context, targetUri)
+            if (parent.uri != parentUri || target == null || target.uri != targetUri || target.name != name ||
+                !target.isFile || target.isVirtual) null
+            else ResolvedTarget(parent, emptyList(), name, target)
+        } catch (_: Exception) { null }
+    }
+
     private fun findDirectory(path: String): DocumentFile? {
         var doc = root
         for (part in parts(path)) {
@@ -929,6 +990,7 @@ class FolderAccess(private val context: Context) {
         val nextCache = HashMap<String, ScanEntry>()
         val nextUris = HashMap<String, String>()
         val nextDirectories = HashMap<String, String>()
+        val nextDirectoryPaths = HashMap<String, String>()
         val ambiguousUris = HashSet<String>()
         val manifest = JSONObject()
         val rules = ignoreRules()
@@ -947,6 +1009,7 @@ class FolderAccess(private val context: Context) {
             checkLocalDeadline(deadline)
             if (auditScan && (scanAbort.get() || SyncService.changeGeneration() != changeGeneration)) throw AuditDeferred()
             nextDirectories[directory.uri.toString()] = prefix
+            nextDirectoryPaths[prefix] = directory.uri.toString()
             val children = directory.listFiles()
             val names = HashSet<String>()
             children.forEach { child ->
@@ -1022,7 +1085,10 @@ class FolderAccess(private val context: Context) {
                     rememberUri(entry.uri, path)
                     manifest.put(path, JSONObject().put("hash", entry.hash).put("size", entry.size))
                 }
-                nextDirectories.putAll(directoryUris[shareId].orEmpty())
+                synchronized(scanLock) {
+                    nextDirectories.putAll(directoryUris[shareId].orEmpty())
+                    nextDirectoryPaths.putAll(directoryPaths[shareId].orEmpty())
+                }
             } else {
                 nextCache.clear()
                 enumerated = 0
@@ -1032,7 +1098,11 @@ class FolderAccess(private val context: Context) {
             }
             synchronized(scanLock) {
                 if (auditScan && (scanAbort.get() || SyncService.changeGeneration() != changeGeneration)) throw AuditDeferred()
-                pendingScan = PendingScan(shareId, tree, nextCache, nextUris, nextDirectories,
+                check(nextDirectories.size == nextDirectoryPaths.size &&
+                    nextDirectories.all { (uri, path) -> nextDirectoryPaths[path] == uri }) {
+                    "Índice de diretórios SAF ambíguo."
+                }
+                pendingScan = PendingScan(shareId, tree, nextCache, nextUris, nextDirectories, nextDirectoryPaths,
                     dirty, flaggedFull, scheduledFull, deepAudit, scheduledDeep)
             }
         } catch (error: Exception) {
@@ -1138,23 +1208,9 @@ class FolderAccess(private val context: Context) {
         traced("journal_persist", path) { persist(journalFile, journal) }
         // SAF lacks atomic compare-and-replace. Recheck immediately and retain both snapshots.
         val (resolved, recheckedHash) = traced("target_recheck", path) {
-            val current = if (old === hinted && hinted != null) old else null
-            val location = if (current != null &&
-                synchronized(scanLock) {
-                    val parentPath = path.substringBeforeLast('/', "")
-                    val parentUri = if (parentPath.isEmpty()) root.uri.toString()
-                        else directoryUris[shareId]?.entries?.firstOrNull { it.value == parentPath }?.key
-                    parentUri != null && parentPath !in dirtyDirectories[shareId].orEmpty() &&
-                        pendingUris[shareId].isNullOrEmpty()
-                }) {
-                val parentPath = path.substringBeforeLast('/', "")
-                val parent = if (parentPath.isEmpty()) root else findDirectory(parentPath)
-                val matches = parent?.listFiles()?.filter { it.name == path.substringAfterLast('/') }
-                if (parent != null && matches?.size == 1 && matches.single().uri == current.uri && matches.single().isFile)
-                    ResolvedTarget(parent, emptyList(), path.substringAfterLast('/'), current)
-                else resolveTarget(path)
-            }
-                else resolveTarget(path)
+            val location = if (old === hinted && hinted != null)
+                cachedResolvedTarget(path, shareId) ?: resolveTarget(path)
+            else resolveTarget(path)
             location to (location.target?.let { hash(it) } ?: "")
         }
         if (expectedHash.isEmpty() && recheckedHash == newHash) {
@@ -1172,11 +1228,24 @@ class FolderAccess(private val context: Context) {
         }
         val target = resolved.target ?: run {
             val directory = if (resolved.missingDirectories.isEmpty()) resolved.directory else traced("saf_parent", path) {
+                var prefix = path.split('/').dropLast(1 + resolved.missingDirectories.size).joinToString("/")
                 resolved.missingDirectories.fold(resolved.directory) { parent, part ->
                     val matches = parent.listFiles().filter { it.name == part }
                     check(matches.size <= 1) { "O provedor contém nomes duplicados: $part" }
                     val child = matches.singleOrNull() ?: parent.createDirectory(part) ?: error("Não foi possível criar $part")
                     check(child.isDirectory) { "Um arquivo ocupa o lugar da pasta $part" }
+                    prefix = if (prefix.isEmpty()) part else "$prefix/$part"
+                    synchronized(scanLock) {
+                        val uri = child.uri.toString()
+                        val byUri = directoryUris[shareId].orEmpty()
+                        val byPath = directoryPaths[shareId].orEmpty()
+                        if (byUri[uri]?.let { it != prefix } == true ||
+                            byPath[prefix]?.let { it != uri } == true) deepScanShares.add(shareId)
+                        else {
+                            directoryUris[shareId] = byUri + (uri to prefix)
+                            directoryPaths[shareId] = byPath + (prefix to uri)
+                        }
+                    }
                     child
                 }
             }

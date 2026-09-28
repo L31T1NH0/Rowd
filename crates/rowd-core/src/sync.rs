@@ -83,7 +83,7 @@ pub struct ShareMetrics {
     pub peak_staged_bytes: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub conflicts: BTreeSet<String>,
@@ -98,6 +98,8 @@ pub struct State {
     #[serde(default, skip_serializing)]
     pub base_token: Option<String>,
 }
+const COMMITTED_BASE_PENDING: &[u8] = b"committed base preserved";
+
 impl State {
     pub fn load(path: &Path, pair_id: &str, share_id: &str) -> Result<Self> {
         let mut state: Self = if path.try_exists()? {
@@ -118,23 +120,14 @@ impl State {
             state.version == VERSION && state.pair_id == pair_id && state.share_id == share_id,
             "state belongs to another Share/pair"
         );
-        if path.with_extension("pending").try_exists()? {
-            // An interrupted round may have installed files after the last State write.
-            // An unknown base makes divergent physical versions conflict instead of
-            // treating a user's later edit as the old version.
+        if path.with_extension("pending").try_exists()?
+            && std::fs::read(path.with_extension("pending"))? != COMMITTED_BASE_PENDING
+        {
+            // Older versions wrote the candidate directly into state.json.
             state.files.clear();
             state.last_sync = None;
             session_tokens().lock().unwrap().remove(path);
             retry_paths().lock().unwrap().remove(path);
-            trace::event(
-                "sync",
-                "state_base_discarded",
-                Some(&state.share_id),
-                None,
-                None,
-                None,
-                Some("incomplete_round"),
-            );
         }
         Ok(state)
     }
@@ -771,6 +764,35 @@ pub fn coordinate_with_progress_and_audit_control(
     mut progress: impl FnMut(&str, usize, usize),
     mut audit_control: impl FnMut(AuditWait) -> Option<Vec<String>>,
 ) -> Result<Report> {
+    let mut candidate = state.clone();
+    let result = coordinate_candidate(
+        io,
+        store,
+        &mut candidate,
+        state_path,
+        mode,
+        remap,
+        &mut progress,
+        &mut audit_control,
+    );
+    if result.as_ref().is_ok_and(|report| !report.round_deferred) {
+        *state = candidate;
+    } else {
+        let _ = std::fs::remove_file(state_path.with_extension("next"));
+    }
+    result
+}
+
+fn coordinate_candidate(
+    io: &mut (impl Read + Write),
+    store: &mut impl Store,
+    state: &mut State,
+    state_path: &Path,
+    mode: crate::config::SyncMode,
+    remap: Option<crate::config::RemapPolicy>,
+    mut progress: impl FnMut(&str, usize, usize),
+    mut audit_control: impl FnMut(AuditWait) -> Option<Vec<String>>,
+) -> Result<Report> {
     let started = Instant::now();
     let share_id = state.share_id.clone();
     let pending_state = state_path.with_extension("pending");
@@ -926,6 +948,10 @@ pub fn coordinate_with_progress_and_audit_control(
                                     && (!pc.contains_key(p) || !files.contains_key(p))
                             });
                             if !missing_known {
+                                retry_paths()
+                                    .lock()
+                                    .unwrap()
+                                    .insert(state_path.to_path_buf(), paths.clone());
                                 delta = Some((pc, files, paths, metrics, bytes));
                                 fallback_reason = None;
                             } else {
@@ -1155,7 +1181,7 @@ pub fn coordinate_with_progress_and_audit_control(
             && matches!(action, Action::ToAndroid | Action::ToPc | Action::Conflict)
             && !pending_state.try_exists()?
         {
-            atomic_write(&pending_state, b"round in progress")?;
+            atomic_write(&pending_state, COMMITTED_BASE_PENDING)?;
         }
         report.metrics.reconcile_ms += reconciling.elapsed().as_millis();
         if !pending_puts.is_empty() && (action != Action::ToAndroid || prohibited) {
@@ -1464,9 +1490,10 @@ pub fn coordinate_with_progress_and_audit_control(
     );
     let new_token = crate::random_id()?;
     if !pending_state.try_exists()? {
-        atomic_write(&pending_state, b"round in progress")?;
+        atomic_write(&pending_state, COMMITTED_BASE_PENDING)?;
     }
-    persist_state(state_path, state, &mut report.metrics, None)?;
+    let candidate_path = state_path.with_extension("next");
+    persist_state(&candidate_path, state, &mut report.metrics, None)?;
     let store_metrics = store.metrics();
     report.metrics.files_hashed = store_metrics
         .files_hashed
@@ -1490,6 +1517,7 @@ pub fn coordinate_with_progress_and_audit_control(
             base_token: new_token.clone(),
         },
     )?;
+    std::fs::rename(&candidate_path, state_path)?;
     std::fs::remove_file(&pending_state)?;
     session_tokens()
         .lock()
@@ -2050,24 +2078,24 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_round_discards_stale_reconciliation_base() {
+    fn interrupted_round_keeps_committed_reconciliation_base() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let mut state = State::load(&path, "pair", "share").unwrap();
         state.files.insert("a".into(), "old".into());
         state.last_sync = Some(1);
         atomic_json(&path, &state).unwrap();
-        atomic_write(&path.with_extension("pending"), b"round in progress").unwrap();
+        atomic_write(&path.with_extension("pending"), COMMITTED_BASE_PENDING).unwrap();
         let recovered = State::load(&path, "pair", "share").unwrap();
-        assert!(recovered.files.is_empty());
-        assert!(recovered.last_sync.is_none());
+        assert_eq!(recovered.files["a"], "old");
+        assert_eq!(recovered.last_sync, Some(1));
         assert_eq!(
             reconcile(
                 recovered.files.get("a").map(String::as_str),
                 Some("new"),
                 Some("old")
             ),
-            Action::Conflict
+            Action::ToAndroid
         );
     }
 
