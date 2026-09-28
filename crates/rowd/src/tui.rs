@@ -1,10 +1,3 @@
-// THESIS: Rowd is a route desk: every Share has a visible route, state, and next action.
-// OWN-WORLD: charcoal operations console, cyan route markers, amber maintenance signals.
-// STORY: global health -> category -> selected route -> safe contextual action.
-// FIRST VIEWPORT: device trust and sync health stay visible above five focused work areas.
-// FORM: responsive master/detail desk; concept candidate 3, seed a0e162b2.
-// FINISH: keyboard, empty/error/loading states, compact QR, and narrow layouts ship together.
-
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -15,15 +8,14 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::Span,
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame, Terminal,
 };
-use rowd_app::{App, AppSnapshot, ConnectionTest, PairingInfo, RecoveryItem, Status};
+use rowd_app::{App, AppSnapshot, ConnectionTest, DeviceConfig, PairingInfo, RecoveryItem, Status};
 use rowd_core::config::{RemapPolicy, ShareRequest, SyncMode};
 use rowd_core::trace;
 use std::{
-    collections::BTreeMap,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     sync::{
@@ -52,13 +44,12 @@ impl Drop for Screen {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Shares,
-    Requests,
-    Recovery,
     Device,
+    Advanced,
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [Self::Shares, Self::Requests, Self::Recovery, Self::Device];
+    const ALL: [Self; 3] = [Self::Shares, Self::Device, Self::Advanced];
 
     fn index(self) -> usize {
         Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
@@ -67,9 +58,8 @@ impl Tab {
     fn title(self) -> &'static str {
         match self {
             Self::Shares => "Shares",
-            Self::Requests => "Solicitações",
-            Self::Recovery => "Recovery",
             Self::Device => "Dispositivo",
+            Self::Advanced => "Avançado",
         }
     }
 
@@ -97,10 +87,7 @@ enum UiAction {
     RestoreRecovery,
     KeepRecovery,
     ExportRecovery,
-    CleanupRecovery,
-    FilterRecovery,
     Pair,
-    ShowQr,
     TestConnection,
     ToggleTrace,
     ToggleGlobalPause,
@@ -116,10 +103,7 @@ enum UiAction {
 
 impl UiAction {
     fn mutates(self) -> bool {
-        !matches!(
-            self,
-            Self::FilterRecovery | Self::ShowQr | Self::TestConnection | Self::ToggleTrace
-        )
+        !matches!(self, Self::TestConnection | Self::ToggleTrace)
     }
 }
 
@@ -141,37 +125,37 @@ const BINDINGS: &[BindingDef] = &[
     BindingDef {
         action: UiAction::EditShare,
         tab: Tab::Shares,
-        label: "Editar Share",
+        label: "Editar",
         default: "e",
     },
     BindingDef {
         action: UiAction::ToggleShare,
         tab: Tab::Shares,
-        label: "Pausar/retomar Share",
+        label: "Pausar / Retomar",
         default: "space",
     },
     BindingDef {
         action: UiAction::SyncShare,
         tab: Tab::Shares,
-        label: "Sincronizar Share",
+        label: "Sincronizar agora",
         default: "s",
     },
     BindingDef {
         action: UiAction::ReindexShare,
         tab: Tab::Shares,
-        label: "Reindexar Share",
+        label: "Reparar Share",
         default: "x",
     },
     BindingDef {
         action: UiAction::RemapShare,
         tab: Tab::Shares,
-        label: "Remapear Android",
+        label: "Trocar pasta no celular",
         default: "m",
     },
     BindingDef {
         action: UiAction::EditIgnore,
         tab: Tab::Shares,
-        label: "Editar .rowdignore",
+        label: "Arquivos ignorados",
         default: "i",
     },
     BindingDef {
@@ -182,125 +166,126 @@ const BINDINGS: &[BindingDef] = &[
     },
     BindingDef {
         action: UiAction::AcceptRequest,
-        tab: Tab::Requests,
-        label: "Aceitar solicitação",
-        default: "a",
+        tab: Tab::Shares,
+        label: "Aceitar",
+        default: "enter",
     },
     BindingDef {
         action: UiAction::RejectRequest,
-        tab: Tab::Requests,
-        label: "Rejeitar solicitação",
+        tab: Tab::Shares,
+        label: "Recusar",
         default: "r",
     },
     BindingDef {
         action: UiAction::RestoreRecovery,
-        tab: Tab::Recovery,
-        label: "Restaurar versão",
-        default: "enter",
+        tab: Tab::Shares,
+        label: "Usar versão anterior",
+        default: "v",
     },
     BindingDef {
         action: UiAction::KeepRecovery,
-        tab: Tab::Recovery,
+        tab: Tab::Shares,
         label: "Manter versão atual",
         default: "k",
     },
     BindingDef {
         action: UiAction::ExportRecovery,
-        tab: Tab::Recovery,
+        tab: Tab::Shares,
         label: "Exportar versão",
-        default: "e",
-    },
-    BindingDef {
-        action: UiAction::CleanupRecovery,
-        tab: Tab::Recovery,
-        label: "Limpar registro resolvido",
-        default: "d",
-    },
-    BindingDef {
-        action: UiAction::FilterRecovery,
-        tab: Tab::Recovery,
-        label: "Filtrar por Share",
-        default: "f",
+        default: "E",
     },
     BindingDef {
         action: UiAction::Pair,
         tab: Tab::Device,
-        label: "Configurar endereço",
+        label: "Conectar celular",
         default: "p",
     },
     BindingDef {
-        action: UiAction::ShowQr,
-        tab: Tab::Device,
-        label: "Exibir QR",
-        default: "o",
-    },
-    BindingDef {
         action: UiAction::TestConnection,
-        tab: Tab::Device,
+        tab: Tab::Advanced,
         label: "Testar conexão",
         default: "T",
     },
     BindingDef {
         action: UiAction::ToggleTrace,
-        tab: Tab::Device,
+        tab: Tab::Advanced,
         label: "Trace de desempenho",
         default: "t",
     },
     BindingDef {
         action: UiAction::ToggleGlobalPause,
         tab: Tab::Device,
-        label: "Pausar/retomar tudo",
+        label: "Pausar tudo / Retomar tudo",
         default: "space",
     },
     BindingDef {
         action: UiAction::Unlink,
         tab: Tab::Device,
-        label: "Desvincular",
+        label: "Desvincular celular",
         default: "u",
     },
     BindingDef {
         action: UiAction::ExportProfile,
-        tab: Tab::Device,
-        label: "Exportar perfil",
+        tab: Tab::Advanced,
+        label: "Exportar configuração",
         default: "x",
     },
     BindingDef {
         action: UiAction::ImportProfile,
-        tab: Tab::Device,
-        label: "Importar perfil",
+        tab: Tab::Advanced,
+        label: "Importar configuração",
         default: "i",
     },
     BindingDef {
         action: UiAction::ExportBackup,
-        tab: Tab::Device,
-        label: "Exportar backup",
+        tab: Tab::Advanced,
+        label: "Exportar backup completo",
         default: "b",
     },
     BindingDef {
         action: UiAction::ImportBackup,
-        tab: Tab::Device,
-        label: "Importar backup",
+        tab: Tab::Advanced,
+        label: "Restaurar backup completo",
         default: "n",
     },
     BindingDef {
         action: UiAction::ExportDiagnostic,
-        tab: Tab::Device,
+        tab: Tab::Advanced,
         label: "Exportar diagnóstico",
         default: "d",
     },
     BindingDef {
         action: UiAction::ResetInitial,
-        tab: Tab::Device,
-        label: "Configuração inicial",
+        tab: Tab::Advanced,
+        label: "Redefinir Rowd",
         default: "f",
     },
     BindingDef {
         action: UiAction::ResetAll,
-        tab: Tab::Device,
+        tab: Tab::Advanced,
         label: "Apagar dados internos",
         default: "X",
     },
 ];
+
+const ADVANCED_ACTIONS: [UiAction; 9] = [
+    UiAction::ExportProfile,
+    UiAction::ImportProfile,
+    UiAction::ExportBackup,
+    UiAction::ImportBackup,
+    UiAction::TestConnection,
+    UiAction::ExportDiagnostic,
+    UiAction::ToggleTrace,
+    UiAction::ResetInitial,
+    UiAction::ResetAll,
+];
+
+fn binding(action: UiAction) -> &'static BindingDef {
+    BINDINGS
+        .iter()
+        .find(|item| item.action == action)
+        .expect("ação cadastrada")
+}
 
 struct KeyMap;
 
@@ -309,14 +294,20 @@ impl KeyMap {
         let fixed = match key.code {
             KeyCode::Char('q') => Some(KeyCommand::Quit),
             KeyCode::Char('?') => Some(KeyCommand::Help),
-            KeyCode::Char('1') => Some(KeyCommand::OpenTab(Tab::Shares)),
-            KeyCode::Char('2') => Some(KeyCommand::OpenTab(Tab::Requests)),
-            KeyCode::Char('3') => Some(KeyCommand::OpenTab(Tab::Recovery)),
-            KeyCode::Char('4') => Some(KeyCommand::OpenTab(Tab::Device)),
+            KeyCode::Char('1'..='3') if tab == Tab::Shares => {
+                let KeyCode::Char(digit) = key.code else {
+                    unreachable!()
+                };
+                Some(KeyCommand::ShareSection(digit as usize - '1' as usize))
+            }
             KeyCode::Tab => Some(KeyCommand::NextTab),
             KeyCode::BackTab => Some(KeyCommand::PreviousTab),
             KeyCode::Up => Some(KeyCommand::MoveUp),
             KeyCode::Down => Some(KeyCommand::MoveDown),
+            KeyCode::Left | KeyCode::Right if tab == Tab::Shares => {
+                Some(KeyCommand::MoveRecovery(key.code == KeyCode::Right))
+            }
+            KeyCode::Enter if tab == Tab::Advanced => Some(KeyCommand::AdvancedAction),
             KeyCode::Esc => Some(KeyCommand::Close),
             _ => None,
         };
@@ -345,11 +336,13 @@ fn key_matches(code: KeyCode, configured: &str) -> bool {
 enum KeyCommand {
     Quit,
     Help,
-    OpenTab(Tab),
     NextTab,
     PreviousTab,
     MoveUp,
     MoveDown,
+    MoveRecovery(bool),
+    ShareSection(usize),
+    AdvancedAction,
     Close,
     Action(UiAction),
 }
@@ -367,7 +360,6 @@ enum Submit {
     RestoreRecovery(String, String),
     KeepRecovery(String, String),
     ExportRecovery(String, String),
-    CleanupRecovery(String, String),
     Unlink,
     ExportProfile,
     ImportProfile,
@@ -386,7 +378,29 @@ struct InputDialog {
     value: String,
     submit: Submit,
     secret: bool,
+    share: Option<ShareDraft>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShareStep {
+    Name,
+    Folder,
+    Direction,
+}
+
+struct ShareDraft {
+    step: ShareStep,
+    name: String,
+    folder: String,
+    direction: usize,
+    error: Option<String>,
+}
+
+const SHARE_DIRECTIONS: [(&str, SyncMode); 3] = [
+    ("Computador ↔ celular", SyncMode::Bidirectional),
+    ("Computador → celular", SyncMode::ToAndroid),
+    ("Celular → computador", SyncMode::ToPc),
+];
 
 enum Modal {
     Help,
@@ -402,9 +416,9 @@ enum UiEvent {
 struct Ui {
     tab: Tab,
     shares_index: usize,
-    requests_index: usize,
+    share_section: usize,
     recovery_index: usize,
-    recovery_filter: Option<String>,
+    advanced_index: usize,
     snapshot: AppSnapshot,
     modal: Option<Modal>,
     notice: String,
@@ -419,9 +433,9 @@ impl Ui {
         let mut ui = Self {
             tab: Tab::Shares,
             shares_index: 0,
-            requests_index: 0,
+            share_section: 0,
             recovery_index: 0,
-            recovery_filter: None,
+            advanced_index: 0,
             snapshot: AppSnapshot::default(),
             modal: None,
             notice: "Pronto. Use ? para consultar todas as ações.".into(),
@@ -441,67 +455,63 @@ impl Ui {
         if let Ok(snapshot) = app.snapshot() {
             self.snapshot = snapshot;
         }
-        self.shares_index = clamp_index(self.shares_index, self.snapshot.shares.len());
-        self.requests_index = clamp_index(self.requests_index, self.snapshot.requests.len());
-        if self.recovery_filter.as_ref().is_some_and(|share_id| {
-            !self
-                .snapshot
-                .recovery
-                .iter()
-                .any(|item| &item.share_id == share_id)
-        }) {
-            self.recovery_filter = None;
-        }
+        self.shares_index = clamp_index(
+            self.shares_index,
+            self.snapshot.requests.len() + self.snapshot.shares.len(),
+        );
         self.recovery_index = clamp_index(self.recovery_index, self.recovery_len());
         self.last_refresh = Instant::now();
         self.dirty = false;
     }
 
     fn selected_share(&self) -> Option<&Status> {
-        self.snapshot.shares.get(self.shares_index)
+        self.snapshot.shares.get(
+            self.shares_index
+                .checked_sub(self.snapshot.requests.len())?,
+        )
     }
 
     fn selected_request(&self) -> Option<&ShareRequest> {
-        self.snapshot.requests.get(self.requests_index)
+        self.snapshot.requests.get(self.shares_index)
     }
 
     fn selected_recovery(&self) -> Option<&RecoveryItem> {
+        let share_id = &self.selected_share()?.share.share_id;
         self.snapshot
             .recovery
             .iter()
-            .filter(|item| {
-                self.recovery_filter
-                    .as_ref()
-                    .is_none_or(|share_id| &item.share_id == share_id)
-            })
+            .filter(|item| &item.share_id == share_id && !item.finished)
             .nth(self.recovery_index)
     }
 
     fn recovery_len(&self) -> usize {
+        let Some(share) = self.selected_share() else {
+            return 0;
+        };
         self.snapshot
             .recovery
             .iter()
-            .filter(|item| {
-                self.recovery_filter
-                    .as_ref()
-                    .is_none_or(|share_id| &item.share_id == share_id)
-            })
+            .filter(|item| item.share_id == share.share.share_id && !item.finished)
             .count()
     }
 
     fn move_selection(&mut self, down: bool) {
-        let recovery_len = self.recovery_len();
         let (index, len) = match self.tab {
-            Tab::Shares => (&mut self.shares_index, self.snapshot.shares.len()),
-            Tab::Requests => (&mut self.requests_index, self.snapshot.requests.len()),
-            Tab::Recovery => (&mut self.recovery_index, recovery_len),
+            Tab::Shares => (
+                &mut self.shares_index,
+                self.snapshot.requests.len() + self.snapshot.shares.len(),
+            ),
             Tab::Device => return,
+            Tab::Advanced => (&mut self.advanced_index, ADVANCED_ACTIONS.len()),
         };
         *index = if down {
             (*index + 1).min(len.saturating_sub(1))
         } else {
             index.saturating_sub(1)
         };
+        if self.tab == Tab::Shares {
+            self.recovery_index = 0;
+        }
     }
 
     fn open_input(
@@ -517,6 +527,7 @@ impl Ui {
             value: value.into(),
             submit,
             secret: false,
+            share: None,
         }));
     }
 
@@ -527,6 +538,7 @@ impl Ui {
             value: String::new(),
             submit,
             secret: true,
+            share: None,
         }));
     }
 
@@ -539,6 +551,7 @@ impl Ui {
         };
         let blocked_by_job = match command {
             KeyCommand::Action(action) => action.mutates(),
+            KeyCommand::AdvancedAction => ADVANCED_ACTIONS[self.advanced_index].mutates(),
             _ => false,
         };
         if self.job.is_some() && blocked_by_job {
@@ -549,21 +562,90 @@ impl Ui {
         match command {
             KeyCommand::Quit => return Ok(true),
             KeyCommand::Help => self.modal = Some(Modal::Help),
-            KeyCommand::OpenTab(tab) => self.tab = tab,
             KeyCommand::NextTab => self.tab = self.tab.next(),
             KeyCommand::PreviousTab => self.tab = self.tab.previous(),
             KeyCommand::MoveUp => self.move_selection(false),
             KeyCommand::MoveDown => self.move_selection(true),
+            KeyCommand::MoveRecovery(down) => {
+                self.recovery_index = if down {
+                    (self.recovery_index + 1).min(self.recovery_len().saturating_sub(1))
+                } else {
+                    self.recovery_index.saturating_sub(1)
+                };
+            }
+            KeyCommand::ShareSection(index) => self.share_section = index,
+            KeyCommand::AdvancedAction => {
+                self.begin_action(ADVANCED_ACTIONS[self.advanced_index], app)?
+            }
             KeyCommand::Close => {}
-            KeyCommand::Action(action) => self.begin_action(action, app)?,
+            KeyCommand::Action(action) => {
+                if self.action_available(action) {
+                    if self.tab == Tab::Advanced {
+                        self.advanced_index = ADVANCED_ACTIONS
+                            .iter()
+                            .position(|item| *item == action)
+                            .unwrap_or(self.advanced_index);
+                    }
+                    self.begin_action(action, app)?;
+                }
+            }
         }
         Ok(false)
+    }
+
+    fn action_available(&self, action: UiAction) -> bool {
+        match self.tab {
+            Tab::Shares => match action {
+                UiAction::AddShare => true,
+                UiAction::AcceptRequest | UiAction::RejectRequest => {
+                    self.selected_request().is_some()
+                }
+                UiAction::RestoreRecovery | UiAction::KeepRecovery | UiAction::ExportRecovery => {
+                    self.selected_recovery().is_some()
+                }
+                UiAction::SyncShare | UiAction::ToggleShare => {
+                    self.selected_share().is_some() && self.share_section == 0
+                }
+                UiAction::EditShare | UiAction::RemapShare | UiAction::EditIgnore => {
+                    self.selected_share().is_some() && self.share_section == 1
+                }
+                UiAction::ReindexShare | UiAction::RemoveShare => {
+                    self.selected_share().is_some() && self.share_section == 2
+                }
+                _ => false,
+            },
+            Tab::Device => match action {
+                UiAction::Pair => !self.snapshot.device.paired,
+                UiAction::Unlink => self.snapshot.device.paired,
+                UiAction::ToggleGlobalPause => self.snapshot.device.configured,
+                _ => false,
+            },
+            Tab::Advanced => ADVANCED_ACTIONS.contains(&action),
+        }
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent, app: &App, tx: &Sender<UiEvent>) -> Result<()> {
         if key.code == KeyCode::Esc {
             self.modal = None;
             return Ok(());
+        }
+        if let Some(Modal::Input(input)) = self.modal.as_mut() {
+            if input.share.is_some() {
+                if let Some((name, folder, mode)) = handle_share_form_key(input, key, app) {
+                    match app.add_share(name, folder, mode) {
+                        Ok(_) => {
+                            self.modal = None;
+                            self.notice = "Share adicionado.".into();
+                            self.dirty = true;
+                        }
+                        Err(error) => {
+                            input.share.as_mut().unwrap().error =
+                                Some(format!("Não foi possível criar o Share: {error:#}"));
+                        }
+                    }
+                }
+                return Ok(());
+            }
         }
         match self.modal.as_mut() {
             Some(Modal::Input(input)) => match key.code {
@@ -597,8 +679,8 @@ impl Ui {
             "0.0.0.0:43821".into()
         };
         self.open_input(
-            "Endereço publicado do PC",
-            "Use IP:porta alcançável pelo Android; 0.0.0.0 descobre o IP local.",
+            "Conectar celular · endereço do computador",
+            "Use IP:porta alcançável pelo celular; 0.0.0.0 descobre o IP local. O QR aparece em seguida.",
             current,
             Submit::Pair,
         );
@@ -606,17 +688,25 @@ impl Ui {
 
     fn begin_action(&mut self, action: UiAction, app: &App) -> Result<()> {
         match action {
-            UiAction::AddShare => self.open_input(
-                "Novo Share",
-                "nome | pasta absoluta no PC | bidirectional/to_android/to_pc",
-                "",
-                Submit::AddShare,
-            ),
+            UiAction::AddShare => self.modal = Some(Modal::Input(InputDialog {
+                title: "Novo Share".into(),
+                hint: String::new(),
+                value: String::new(),
+                submit: Submit::AddShare,
+                secret: false,
+                share: Some(ShareDraft {
+                    step: ShareStep::Name,
+                    name: String::new(),
+                    folder: String::new(),
+                    direction: 0,
+                    error: None,
+                }),
+            })),
             UiAction::EditShare => {
                 if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
                     self.open_input(
                         format!("Editar · {}", share.name),
-                        "nome | pasta absoluta no PC | bidirectional/to_android/to_pc",
+                        "nome | pasta absoluta no computador | ambos/para_celular/para_computador",
                         format!(
                             "{} | {} | {}",
                             share.name,
@@ -647,8 +737,8 @@ impl Ui {
             UiAction::ReindexShare => {
                 if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
                     self.open_input(
-                        format!("Reindexar · {}", share.name),
-                        "Reconstrói estado derivado e preserva arquivos/recovery. Digite REINDEXAR.",
+                        format!("Reparar Share · {}", share.name),
+                        "Reconstrói o estado de sincronização sem apagar arquivos. Versões preservadas continuam disponíveis. Digite REINDEXAR.",
                         "",
                         Submit::ReindexShare(share.share_id),
                     );
@@ -657,9 +747,9 @@ impl Ui {
             UiAction::RemapShare => {
                 if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
                     self.open_input(
-                        format!("Remapear Android · {}", share.name),
-                        "pc/android/compare; a pasta SAF será escolhida no Android",
-                        "compare",
+                        format!("Trocar pasta no celular · {}", share.name),
+                        "pc/celular/comparar; a nova pasta será escolhida no celular",
+                        "comparar",
                         Submit::RemapShare(share.share_id),
                     );
                 }
@@ -669,7 +759,7 @@ impl Ui {
                     let id = share.share_id;
                     let text = app.ignore_text(&id)?;
                     self.open_input(
-                        format!(".rowdignore · {}", share.name),
+                        format!("Arquivos ignorados · {}", share.name),
                         "Enter aplica; Shift+Enter cria linha. Regras inválidas são recusadas.",
                         text,
                         Submit::Ignore(id),
@@ -680,7 +770,7 @@ impl Ui {
                 if let Some(share) = self.selected_share().map(|status| status.share.clone()) {
                     self.open_input(
                         format!("Remover · {}", share.name),
-                        "Remove a rota, preservando os arquivos. Digite REMOVER.",
+                        "Remove o Share do Rowd e preserva os arquivos locais. Digite REMOVER.",
                         "",
                         Submit::RemoveShare(share.share_id),
                     );
@@ -700,7 +790,7 @@ impl Ui {
                 if let Some(request) = self.selected_request().cloned() {
                     self.open_input(
                         format!("Rejeitar · {}", request.name),
-                        "A decisão será enviada ao Android. Digite REJEITAR.",
+                        "A decisão será enviada ao celular. Digite REJEITAR.",
                         "",
                         Submit::RejectRequest(request.request_id.clone()),
                     );
@@ -711,48 +801,18 @@ impl Ui {
             UiAction::ExportRecovery => {
                 if let Some(item) = self.selected_recovery().cloned() {
                     self.open_input(
-                        format!("Exportar recovery · {}", item.path),
+                        format!("Exportar versão · {}", item.path),
                         "Destino novo para a versão recuperada.",
                         "",
                         Submit::ExportRecovery(item.share_id.clone(), item.id.clone()),
                     );
                 }
             }
-            UiAction::CleanupRecovery => self.begin_recovery("LIMPAR", Submit::CleanupRecovery),
-            UiAction::FilterRecovery => {
-                let shares = self
-                    .snapshot
-                    .recovery
-                    .iter()
-                    .map(|item| (item.share_id.clone(), item.share_name.clone()))
-                    .collect::<BTreeMap<_, _>>();
-                let ids = shares.keys().cloned().collect::<Vec<_>>();
-                self.recovery_filter = match &self.recovery_filter {
-                    None => ids.first().cloned(),
-                    Some(current) => ids
-                        .iter()
-                        .position(|id| id == current)
-                        .and_then(|index| ids.get(index + 1))
-                        .cloned(),
-                };
-                self.recovery_index = 0;
-                self.notice = match &self.recovery_filter {
-                    Some(id) => format!(
-                        "Recovery filtrado por {}.",
-                        shares.get(id).map(String::as_str).unwrap_or("Share")
-                    ),
-                    None => "Recovery exibindo todos os Shares.".into(),
-                };
-            }
             UiAction::Pair => self.open_pair_input(),
-            UiAction::ShowQr => match app.pairing_info() {
-                Ok(info) => self.modal = Some(Modal::Qr(info)),
-                Err(_) => self.open_pair_input(),
-            },
             UiAction::TestConnection => {
                 self.connection = Some(app.connection_test()?);
                 self.notice =
-                    "Teste concluído; detalhes atualizados no painel do dispositivo.".into();
+                    "Teste concluído; detalhes atualizados em Avançado.".into();
             }
             UiAction::ToggleTrace => {
                 if trace::enabled() {
@@ -775,19 +835,19 @@ impl Ui {
                 self.dirty = true;
             }
             UiAction::Unlink => self.open_input(
-                "Desvincular Android",
-                "Aguarda confirmação do Android antes de revogar. Digite DESVINCULAR.",
+                "Desvincular celular",
+                "Aguarda confirmação do celular antes de revogar. Digite DESVINCULAR.",
                 "",
                 Submit::Unlink,
             ),
             UiAction::ExportProfile => self.open_input(
-                "Exportar perfil sem segredos",
+                "Exportar configuração",
                 "Caminho de destino novo, por exemplo /tmp/rowd-profile.json",
                 "",
                 Submit::ExportProfile,
             ),
             UiAction::ImportProfile => self.open_input(
-                "Importar perfil sem segredos",
+                "Importar configuração",
                 "Caminho do perfil. A configuração atual terá backup automático.",
                 "",
                 Submit::ImportProfile,
@@ -799,7 +859,7 @@ impl Ui {
                 Submit::ExportBackupPath,
             ),
             UiAction::ImportBackup => self.open_input(
-                "Importar backup completo criptografado",
+                "Restaurar backup completo",
                 "Caminho do backup. A configuração atual será preservada antes da troca.",
                 "",
                 Submit::ImportBackupPath,
@@ -811,14 +871,14 @@ impl Ui {
                 Submit::ExportDiagnostic,
             ),
             UiAction::ResetInitial => self.open_input(
-                "Restaurar configuração inicial",
-                "Arquiva o estado administrativo e preserva arquivos. Digite INICIAL.",
+                "Redefinir Rowd",
+                "Nova identidade de pareamento; remove celular e Shares ativos, arquiva o estado administrativo e preserva arquivos pessoais. Digite INICIAL.",
                 "",
                 Submit::ResetInitial,
             ),
             UiAction::ResetAll => self.open_input(
                 "Apagar dados internos do Rowd",
-                "Move .rowd para um arquivo recuperável. Digite APAGAR TUDO.",
+                "Arquiva .rowd; Rowd inicia sem configuração ativa. Arquivos pessoais nas pastas sincronizadas são preservados. Digite APAGAR TUDO.",
                 "",
                 Submit::ResetAll,
             ),
@@ -829,7 +889,7 @@ impl Ui {
     fn begin_recovery(&mut self, token: &'static str, constructor: fn(String, String) -> Submit) {
         if let Some(item) = self.selected_recovery().cloned() {
             self.open_input(
-                format!("Recovery · {}", item.path),
+                format!("Versão preservada · {}", item.path),
                 format!("Digite {token} para confirmar."),
                 "",
                 constructor(item.share_id.clone(), item.id.clone()),
@@ -848,13 +908,9 @@ impl Ui {
             Submit::Pair => {
                 app.pair(value.trim())?;
                 self.modal = Some(Modal::Qr(app.pairing_info()?));
-                self.notice = "QR pronto para leitura pelo Android.".into();
+                self.notice = "QR pronto para leitura pelo celular.".into();
             }
-            Submit::AddShare => {
-                let (name, root, mode) = share_form(&value)?;
-                app.add_share(name, root, mode)?;
-                self.notice = "Share adicionado.".into();
-            }
+            Submit::AddShare => unreachable!("novo Share usa o formulário em etapas"),
             Submit::EditShare(id) => {
                 let (name, root, mode) = share_form(&value)?;
                 app.edit_share(&id, name, root, mode)?;
@@ -881,7 +937,7 @@ impl Ui {
                 start_job(self, tx, "Rejeitando solicitação", move || {
                     app.reject_share_request(&id)?;
                     Ok(
-                        "Solicitação rejeitada; o Android receberá a decisão na próxima conexão."
+                        "Solicitação rejeitada; o celular receberá a decisão na próxima conexão."
                             .into(),
                     )
                 })?;
@@ -897,14 +953,14 @@ impl Ui {
             Submit::RemapShare(id) => {
                 let policy = match value.trim() {
                     "pc" => RemapPolicy::Pc,
-                    "android" => RemapPolicy::Android,
-                    "compare" => RemapPolicy::Compare,
-                    _ => anyhow::bail!("política deve ser pc, android ou compare"),
+                    "celular" | "android" => RemapPolicy::Android,
+                    "comparar" | "compare" => RemapPolicy::Compare,
+                    _ => anyhow::bail!("política deve ser pc, celular ou comparar"),
                 };
                 let app = app.clone();
                 start_job(self, tx, "Remapeando Share", move || {
                     app.remap_share(&id, policy)?;
-                    Ok("Vínculo Android invalidado; escolha a nova pasta SAF no aparelho.".into())
+                    Ok("Pasta anterior desvinculada; escolha a nova pasta no celular.".into())
                 })?;
             }
             Submit::Ignore(id) => {
@@ -939,20 +995,12 @@ impl Ui {
                     Ok("Versão exportada.".into())
                 })?;
             }
-            Submit::CleanupRecovery(share, id) => {
-                require_token(&value, "LIMPAR")?;
-                let app = app.clone();
-                start_job(self, tx, "Limpando recovery", move || {
-                    app.cleanup_recovery(&share, &id)?;
-                    Ok("Registro resolvido removido manualmente.".into())
-                })?;
-            }
             Submit::Unlink => {
                 require_token(&value, "DESVINCULAR")?;
                 let app = app.clone();
                 start_job(self, tx, "Desvinculando dispositivo", move || {
                     app.unlink_device()?;
-                    Ok("Desvinculação pendente até o Android confirmar; arquivos e recovery preservados.".into())
+                    Ok("Desvinculação pendente até o celular confirmar; arquivos e versões preservados.".into())
                 })?;
             }
             Submit::ExportProfile => {
@@ -1026,84 +1074,74 @@ impl Ui {
         let area = frame.area();
         frame.render_widget(Clear, area);
         let regions = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(2),
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(6),
             Constraint::Length(3),
         ])
         .split(area);
         self.render_header(frame, regions[0]);
         self.render_tabs(frame, regions[1]);
-        self.render_body(frame, regions[2]);
-        self.render_footer(frame, regions[3]);
+        let work = self.job.as_deref().unwrap_or(&self.notice);
+        frame.render_widget(
+            Paragraph::new(truncate(work, regions[2].width as usize))
+                .style(Style::default().fg(if self.job.is_some() { WARNING } else { MUTED })),
+            regions[2],
+        );
+        self.render_body(frame, regions[3]);
+        self.render_footer(frame, regions[4]);
         if let Some(modal) = &self.modal {
             render_modal(frame, area, modal);
         }
     }
 
     fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let paused = self.snapshot.device.sync_paused;
-        let paired = self.snapshot.device.paired;
-        let conflicts: usize = self
-            .snapshot
-            .shares
-            .iter()
-            .map(|status| status.conflicts.len())
-            .sum();
-        let line_one = Line::from(vec![
-            Span::styled(
+        frame.render_widget(
+            Paragraph::new(Span::styled(
                 " ROWD ",
                 Style::default()
                     .fg(Color::Black)
                     .bg(ACCENT)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" v{}  ", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(MUTED),
-            ),
-            Span::styled(
-                if paused { "SYNC PAUSADO" } else { "SYNC ATIVO" },
-                Style::default()
-                    .fg(if paused { WARNING } else { SUCCESS })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                if paired {
-                    "ANDROID VINCULADO"
+            )),
+            area,
+        );
+        let connected = self.cell_connected();
+        let label = if connected {
+            "● Celular conectado"
+        } else {
+            "○ Celular desconectado"
+        };
+        let width = label.chars().count() as u16;
+        if area.width > width + 7 {
+            frame.render_widget(
+                Paragraph::new(label).style(Style::default().fg(if connected {
+                    SUCCESS
                 } else {
-                    "ANDROID AGUARDANDO"
-                },
-                Style::default().fg(if paired { SUCCESS } else { MUTED }),
-            ),
-        ]);
-        let work = self.job.as_deref().unwrap_or(&self.notice);
-        let line_two = Line::from(vec![
-            Span::styled(
-                format!(
-                    " {} Shares  ·  {conflicts} conflitos  ",
-                    self.snapshot.shares.len()
-                ),
-                Style::default().fg(MUTED),
-            ),
-            Span::styled(
-                truncate(work, area.width.saturating_sub(45) as usize),
-                Style::default().fg(if self.job.is_some() {
-                    WARNING
-                } else {
-                    Color::White
-                }),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(Text::from(vec![line_one, line_two])), area);
+                    MUTED
+                })),
+                Rect::new(area.right() - width, area.y, width, 1),
+            );
+        }
+    }
+
+    fn cell_connected(&self) -> bool {
+        self.snapshot.device.paired
+            && self.snapshot.device.last_connection.is_some_and(|at| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(at)
+                    < 60
+            })
     }
 
     fn render_tabs(&self, frame: &mut Frame<'_>, area: Rect) {
         let titles = Tab::ALL
             .iter()
-            .enumerate()
-            .map(|(index, tab)| format!(" {} {} ", index + 1, tab.title()))
+            .map(|tab| format!(" {} ", tab.title()))
             .collect::<Vec<_>>();
         frame.render_widget(
             Tabs::new(titles)
@@ -1111,7 +1149,7 @@ impl Ui {
                 .block(Block::default().borders(Borders::BOTTOM))
                 .style(Style::default().fg(MUTED))
                 .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
-                .divider(" "),
+                .divider(" | "),
             area,
         );
     }
@@ -1120,235 +1158,325 @@ impl Ui {
         let panels = body_panels(area);
         match self.tab {
             Tab::Shares => self.render_shares(frame, panels),
-            Tab::Requests => self.render_requests(frame, panels),
-            Tab::Recovery => self.render_recovery(frame, panels),
             Tab::Device => self.render_device(frame, panels),
+            Tab::Advanced => self.render_advanced(frame, panels),
         }
     }
 
     fn render_shares(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
+        let request_count = self.snapshot.requests.len();
+        let shares_area = if request_count > 0 {
+            let height = (request_count as u16 + 2).min(panels[0].height.saturating_sub(3));
+            let areas =
+                Layout::vertical([Constraint::Length(height), Constraint::Min(3)]).split(panels[0]);
+            let requests = self
+                .snapshot
+                .requests
+                .iter()
+                .map(|request| ListItem::new(format!("{}    Solicitação do celular", request.name)))
+                .collect();
+            render_list(
+                frame,
+                areas[0],
+                "Solicitações",
+                requests,
+                (self.shares_index < request_count).then_some(self.shares_index),
+            );
+            areas[1]
+        } else {
+            panels[0]
+        };
         let items = if self.snapshot.shares.is_empty() {
-            vec![
-                ListItem::new("Nenhum Share\nUse a para criar a primeira rota.")
-                    .style(Style::default().fg(MUTED)),
-            ]
+            vec![ListItem::new("Nenhum Share. Use a para adicionar.")
+                .style(Style::default().fg(MUTED))]
         } else {
             self.snapshot
                 .shares
                 .iter()
                 .map(|status| {
-                    let state = if !status.root_available {
-                        "INDISPONÍVEL"
-                    } else if status.share.enabled {
-                        "ATIVO"
+                    let pending = self
+                        .snapshot
+                        .recovery
+                        .iter()
+                        .any(|item| item.share_id == status.share.share_id && !item.finished);
+                    let state = if pending {
+                        "Ação necessária"
+                    } else if !status.root_available
+                        || status.error.is_some()
+                        || status
+                            .last_error
+                            .as_ref()
+                            .is_some_and(|e| e.resolved_at.is_none())
+                    {
+                        "Erro"
+                    } else if !status.share.enabled {
+                        "Pausado"
+                    } else if status.share.remap_policy.is_some() {
+                        "Ação necessária"
                     } else {
-                        "PAUSADO"
+                        ""
                     };
-                    ListItem::new(format!(
-                        "{}\n{} · {} · {} conf.",
-                        status.share.name,
-                        state,
-                        mode_label(status.share.mode),
-                        status.conflicts.len()
-                    ))
+                    ListItem::new(format!("{}    {}", status.share.name, state))
                 })
                 .collect()
         };
         render_list(
             frame,
-            panels[0],
-            "Rotas de sincronização",
+            shares_area,
+            "Shares · a Adicionar Share",
             items,
-            self.shares_index,
+            self.shares_index.checked_sub(request_count),
         );
-        let detail = self.selected_share().map(share_detail).unwrap_or_else(|| {
-            "Cada Share liga uma pasta do PC a uma pasta escolhida no Android.\n\nAdicione uma rota para começar; as validações impedem raízes sobrepostas e caminhos inseguros.".into()
-        });
-        render_detail(frame, panels[1], "Rota selecionada", detail);
-    }
-
-    fn render_requests(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
-        let items = if self.snapshot.requests.is_empty() {
-            vec![ListItem::new("Nenhuma solicitação recebida").style(Style::default().fg(MUTED))]
+        if let Some(request) = self.selected_request() {
+            render_detail(frame, panels[1], "Solicitação selecionada", format!(
+                "Nome          {}\nDireção       {}\n\nO celular solicitou este Share. Ao aceitar, defina a pasta do computador.\n\nEnter Aceitar     r Recusar",
+                request.name, mode_label(request.mode)));
+        } else if let Some(status) = self.selected_share() {
+            render_detail(
+                frame,
+                panels[1],
+                "Share selecionado",
+                share_detail(
+                    status,
+                    self.share_section,
+                    self.selected_recovery(),
+                    self.recovery_index,
+                    self.recovery_len(),
+                ),
+            );
         } else {
-            self.snapshot
-                .requests
-                .iter()
-                .map(|request| {
-                    ListItem::new(format!(
-                        "{}\n{} · {}",
-                        request.name,
-                        "PENDENTE",
-                        mode_label(request.mode)
-                    ))
-                })
-                .collect()
-        };
-        render_list(
-            frame,
-            panels[0],
-            "Recebidas do Android",
-            items,
-            self.requests_index,
-        );
-        let detail = self.selected_request().map(|request| {
-            format!(
-                "Nome\n{}\n\nEstado\n{}\n\nModo\n{}\n\nIdentificador\n{}\n\nSolicitações enviadas pelo Android podem ser canceladas no próprio aparelho. Rejeições ficam registradas até os dois lados convergirem.",
-                request.name,
-                "PENDENTE",
-                mode_label(request.mode),
-                short_id(&request.request_id)
-            )
-        }).unwrap_or_else(|| "Aguardando solicitações.\n\nEnviadas: administradas no Android, onde podem ser canceladas antes da aceitação.".into());
-        render_detail(frame, panels[1], "Ciclo da solicitação", detail);
-    }
-
-    fn render_recovery(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
-        let visible = self
-            .snapshot
-            .recovery
-            .iter()
-            .filter(|item| {
-                self.recovery_filter
-                    .as_ref()
-                    .is_none_or(|share_id| &item.share_id == share_id)
-            })
-            .collect::<Vec<_>>();
-        let items = if visible.is_empty() {
-            vec![ListItem::new("Nenhuma versão neste filtro").style(Style::default().fg(MUTED))]
-        } else {
-            visible
-                .iter()
-                .map(|item| {
-                    ListItem::new(format!(
-                        "{}\n{} · {}",
-                        item.path,
-                        item.share_name,
-                        if item.finished {
-                            "RESOLVIDO"
-                        } else {
-                            "PENDENTE"
-                        }
-                    ))
-                })
-                .collect()
-        };
-        render_list(
-            frame,
-            panels[0],
-            "Versões preservadas",
-            items,
-            self.recovery_index,
-        );
-        let total: u64 = self.snapshot.recovery.iter().map(|item| item.bytes).sum();
-        let filtered_total: u64 = visible.iter().map(|item| item.bytes).sum();
-        let mut by_share = BTreeMap::<&str, (usize, u64)>::new();
-        for item in &self.snapshot.recovery {
-            let aggregate = by_share.entry(&item.share_name).or_default();
-            aggregate.0 += 1;
-            aggregate.1 += item.bytes;
+            render_detail(
+                frame,
+                panels[1],
+                "Share selecionado",
+                "Use a para adicionar um Share ou aceite uma solicitação do celular.".into(),
+            );
         }
-        let aggregate = by_share
-            .iter()
-            .map(|(name, (count, bytes))| {
-                format!("{name}: {count} versões · {}", human_bytes(*bytes))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let filter = self
-            .recovery_filter
-            .as_ref()
-            .and_then(|id| {
-                self.snapshot
-                    .recovery
-                    .iter()
-                    .find(|item| &item.share_id == id)
-            })
-            .map(|item| item.share_name.as_str())
-            .unwrap_or("todos os Shares");
-        let detail = self.selected_recovery().map(|item| {
-            format!(
-                "Filtro\n{} · {} em {} versões\n\nShare\n{}\n\nCaminho\n{}\n\nEstado\n{}\n\nBackup disponível\n{}\n\nTamanho\n{}\n\nID\n{}\n\nUso total do recovery\n{} em {} versões\n\nPor Share\n{}",
-                filter,
-                human_bytes(filtered_total),
-                visible.len(),
-                item.share_name,
-                item.path,
-                if item.finished { "resolvido" } else { "aguardando decisão" },
-                yes_no(item.backup_available),
-                human_bytes(item.bytes),
-                short_id(&item.id),
-                human_bytes(total),
-                self.snapshot.recovery.len(),
-                if aggregate.is_empty() { "nenhum" } else { &aggregate }
-            )
-        }).unwrap_or_else(|| format!("Filtro\n{filter} · {} em {} versões\n\nO Rowd preserva versões quando uma reconciliação exige decisão. A limpeza é sempre manual e só aceita registros resolvidos.\n\nPor Share\n{}", human_bytes(filtered_total), visible.len(), if aggregate.is_empty() { "nenhum" } else { &aggregate }));
-        render_detail(frame, panels[1], "Versão selecionada", detail);
     }
 
     fn render_device(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
         let device = &self.snapshot.device;
-        let left = if device.configured {
-            format!(
-                "Vínculo\n{}\n\nEndereço publicado\n{}\n\nÚltima conexão\n{}\n\nSincronização\n{}\n\nTrace de desempenho\n{}\n\nIdentidade do Android\n{}\n\nFingerprint SHA-256\n{}",
-                if device.paired { "Android vinculado" } else { "aguardando primeiro vínculo" },
-                device.address,
-                timestamp_label(device.last_connection),
-                if device.sync_paused { "pausada" } else { "ativa" },
-                if trace::enabled() { "Ligado" } else { "Desligado" },
-                short_id(&device.identity),
-                device.fingerprint
-            )
+        let status = if self.cell_connected() {
+            "Conectado"
         } else {
-            format!("Dispositivo ainda não configurado.\n\nTrace de desempenho    {}\n\nPressione p, confirme o endereço alcançável na rede local e leia o QR no Android.", if trace::enabled() { "Ligado" } else { "Desligado" })
+            "Desconectado"
         };
-        render_detail(frame, panels[0], "Confiança PC ↔ Android", left);
-        let right = if let Some(test) = &self.connection {
-            let checks = test
-                .checks
-                .iter()
-                .map(|check| {
-                    format!(
-                        "[{}] {}\n    {}",
+        let details = format!(
+            "CELULAR\n\nNome            {}\nStatus          {}\nÚltima conexão  {}\nEndereço        {}\nIdentidade      {}\nFingerprint     {}\n\nSincronização   {}",
+            if device.paired { "Não informado" } else { "Nenhum celular vinculado" },
+            status, timestamp_label(device.last_connection),
+            if device.configured { device.address.as_str() } else { "não configurado" },
+            if device.configured { short_id(&device.identity) } else { "—".into() },
+            if device.configured { device.fingerprint.as_str() } else { "—" },
+            if device.sync_paused { "Pausada" } else { "Ativa" });
+        render_detail(frame, panels[0], "Dispositivo", details);
+        let actions = format!(
+            "{}{}",
+            if device.paired {
+                "u Desvincular celular"
+            } else {
+                "p Conectar celular"
+            },
+            if !device.configured {
+                ""
+            } else if device.sync_paused {
+                "\n\nEspaço Retomar tudo"
+            } else {
+                "\n\nEspaço Pausar tudo"
+            }
+        );
+        render_detail(frame, panels[1], "Ações do dispositivo", actions);
+    }
+
+    fn render_advanced(&self, frame: &mut Frame<'_>, panels: [Rect; 2]) {
+        let mut items = Vec::new();
+        for (index, action) in ADVANCED_ACTIONS.iter().enumerate() {
+            if index == 0 {
+                items.push(
+                    ListItem::new("DADOS")
+                        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                );
+            }
+            if index == 4 {
+                items.push(ListItem::new(""));
+                items.push(
+                    ListItem::new("DIAGNÓSTICO")
+                        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                );
+            }
+            if index == 7 {
+                items.push(ListItem::new(""));
+                items.push(
+                    ListItem::new("SISTEMA")
+                        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                );
+            }
+            let entry = binding(*action);
+            let state = if *action == UiAction::ToggleTrace {
+                if trace::enabled() {
+                    "    Ligado"
+                } else {
+                    "    Desligado"
+                }
+            } else {
+                ""
+            };
+            items.push(ListItem::new(format!("{}{}", entry.label, state)));
+        }
+        let selected = self.advanced_index
+            + if self.advanced_index < 4 {
+                1
+            } else if self.advanced_index < 7 {
+                3
+            } else {
+                5
+            };
+        render_list(frame, panels[0], "Avançado", items, Some(selected));
+        let action = ADVANCED_ACTIONS[self.advanced_index];
+        let mut detail = format!(
+            "{}\n\n{}\n\nEnter executar",
+            binding(action).label,
+            advanced_description(action)
+        );
+        if action == UiAction::TestConnection {
+            if let Some(test) = &self.connection {
+                detail.push_str("\n\nResultado do teste\n");
+                for check in &test.checks {
+                    detail.push_str(&format!(
+                        "[{}] {}: {}\n",
                         if check.ok { "OK" } else { "FALHA" },
                         check.label,
                         check.detail
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "{checks}\n\nShares disponíveis\n{}/{}",
-                test.available_shares, test.total_shares
-            )
-        } else {
-            "Teste por camadas\n\nPC alcançável\nTCP\nTLS\nAutenticação\nDispositivo reconhecido\nShares disponíveis\n\nUse T para testar, t para alternar o trace e o para abrir o QR compacto no terminal.".into()
-        };
-        render_detail(frame, panels[1], "Diagnóstico e pareamento", right);
+                    ));
+                }
+                detail.push_str(&format!(
+                    "Shares disponíveis: {}/{}",
+                    test.available_shares, test.total_shares
+                ));
+            }
+        }
+        render_detail(frame, panels[1], "Opção selecionada", detail);
     }
 
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let actions = BINDINGS
-            .iter()
-            .filter(|binding| binding.tab == self.tab)
-            .map(|binding| {
-                format!(
-                    "{} {}",
-                    display_key(binding.default),
-                    short_action(binding.label)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("  ");
-        let text =
-            format!("{actions}\n1..4 abas  Tab/Shift+Tab navegar  ↑↓ selecionar  ? ajuda  q sair");
+        let text = match self.tab {
+            Tab::Shares => "a Adicionar Share  ·  ↑↓ selecionar  ·  1/2/3 seções",
+            Tab::Device => "",
+            Tab::Advanced => "↑↓ selecionar  ·  Enter executar",
+        };
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let navigation = truncate(
+            "Tab/Shift+Tab abas  ·  ? ajuda  ·  q sair",
+            area.width.saturating_sub(version.len() as u16 + 1) as usize,
+        );
+        let footer = format!("{text}\n{navigation}");
         frame.render_widget(
-            Paragraph::new(text)
+            Paragraph::new(footer)
                 .style(Style::default().fg(MUTED))
-                .wrap(Wrap { trim: true })
                 .block(Block::default().borders(Borders::TOP)),
             area,
         );
+        let width = version.len() as u16;
+        if area.width > width {
+            frame.render_widget(
+                Paragraph::new(version).style(Style::default().fg(MUTED)),
+                Rect::new(area.right() - width, area.bottom() - 1, width, 1),
+            );
+        }
+    }
+}
+
+fn handle_share_form_key(
+    input: &mut InputDialog,
+    key: KeyEvent,
+    app: &App,
+) -> Option<(String, PathBuf, SyncMode)> {
+    let draft = input.share.as_mut().expect("formulário de Share");
+    match (draft.step, key.code) {
+        (ShareStep::Name | ShareStep::Folder, KeyCode::Char(character)) => {
+            input.value.push(character);
+            draft.error = None;
+        }
+        (ShareStep::Name | ShareStep::Folder, KeyCode::Backspace) => {
+            input.value.pop();
+            draft.error = None;
+        }
+        (ShareStep::Name, KeyCode::Enter) => {
+            let name = input.value.trim();
+            if name.is_empty() || name.len() > 120 || name.chars().any(char::is_control) {
+                draft.error = Some("Informe um nome válido e curto, sem quebras de linha.".into());
+            } else {
+                draft.name = name.into();
+                draft.step = ShareStep::Folder;
+                draft.error = None;
+                input.value.clear();
+            }
+        }
+        (ShareStep::Folder, KeyCode::Enter) => {
+            let folder = input.value.trim();
+            match validate_share_folder(app, &draft.name, folder) {
+                Ok(()) => {
+                    draft.folder = folder.into();
+                    draft.step = ShareStep::Direction;
+                    draft.error = None;
+                    input.value.clear();
+                }
+                Err(error) => draft.error = Some(folder_error(&error)),
+            }
+        }
+        (ShareStep::Direction, KeyCode::Up) => {
+            draft.direction =
+                (draft.direction + SHARE_DIRECTIONS.len() - 1) % SHARE_DIRECTIONS.len();
+            draft.error = None;
+        }
+        (ShareStep::Direction, KeyCode::Down) => {
+            draft.direction = (draft.direction + 1) % SHARE_DIRECTIONS.len();
+            draft.error = None;
+        }
+        (ShareStep::Direction, KeyCode::Enter) => {
+            return Some((
+                draft.name.clone(),
+                PathBuf::from(&draft.folder),
+                SHARE_DIRECTIONS[draft.direction].1,
+            ));
+        }
+        _ => {}
+    }
+    None
+}
+
+fn validate_share_folder(app: &App, name: &str, folder: &str) -> Result<()> {
+    let path = Path::new(folder);
+    anyhow::ensure!(
+        path.is_absolute(),
+        "informe o caminho absoluto da pasta no computador"
+    );
+    let mut config = DeviceConfig::load(app.home())?;
+    config.add_share(
+        app.home(),
+        name.into(),
+        path.to_path_buf(),
+        SyncMode::Bidirectional,
+    )?;
+    Ok(())
+}
+
+fn folder_error(error: &anyhow::Error) -> String {
+    let detail = format!("{error:#}");
+    if detail.contains("Share directory does not exist") {
+        "A pasta não existe ou não pode ser acessada.".into()
+    } else if detail.contains("Share root must be a directory") {
+        "O caminho precisa apontar para uma pasta.".into()
+    } else if detail.contains("internal directory cannot be shared") {
+        "A pasta interna .rowd não pode ser compartilhada.".into()
+    } else if detail.contains("Share overlaps Rowd configuration") {
+        "A pasta não pode conter a configuração do Rowd nem estar dentro dela.".into()
+    } else if detail.contains("overlapping Share roots") {
+        "A pasta se sobrepõe à de outro Share.".into()
+    } else if detail.contains("too many Shares") {
+        "O limite de 256 Shares foi atingido.".into()
+    } else {
+        format!("Pasta inválida: {detail}")
     }
 }
 
@@ -1469,10 +1597,10 @@ fn render_list(
     area: Rect,
     title: &str,
     items: Vec<ListItem<'_>>,
-    selected: usize,
+    selected: Option<usize>,
 ) {
     let mut state = ListState::default();
-    state.select(Some(selected));
+    state.select(selected);
     frame.render_stateful_widget(
         List::new(items)
             .block(
@@ -1510,22 +1638,26 @@ fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal) {
             frame.render_widget(Clear, popup);
             let mut lines = vec![
                 "Navegação global".to_string(),
-                "1..4 abre aba · Tab/Shift+Tab alterna · ↑↓ seleciona · Esc fecha · q sai".into(),
+                "Tab/Shift+Tab alterna abas · ↑↓ seleciona · Esc fecha · q sai".into(),
                 String::new(),
+                "SHARES".into(),
+                "a Adicionar Share · 1 Geral · 2 Configuração · 3 Manutenção".into(),
+                "Solicitação: Enter Aceitar · r Recusar".into(),
+                "Versão pendente: ←/→ escolher · v Usar anterior · k Manter atual · E Exportar"
+                    .into(),
+                "Geral: s Sincronizar agora · Espaço Pausar/Retomar".into(),
+                "Configuração: e Editar · m Trocar pasta no celular · i Arquivos ignorados".into(),
+                "Manutenção: x Reparar Share · d Remover Share".into(),
+                String::new(),
+                "DISPOSITIVO".into(),
+                "p Conectar celular · u Desvincular celular · Espaço Pausar/Retomar tudo".into(),
+                String::new(),
+                "AVANÇADO".into(),
+                "↑↓ escolhe opção · Enter executa; atalhos existentes também funcionam".into(),
             ];
-            for tab in Tab::ALL {
-                lines.push(tab.title().to_uppercase());
-                lines.push(
-                    BINDINGS
-                        .iter()
-                        .filter(|binding| binding.tab == tab)
-                        .map(|binding| {
-                            format!("{} {}", display_key(binding.default), binding.label)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("  ·  "),
-                );
-                lines.push(String::new());
+            for action in ADVANCED_ACTIONS {
+                let entry = binding(action);
+                lines.push(format!("{} {}", display_key(entry.default), entry.label));
             }
             frame.render_widget(
                 Paragraph::new(lines.join("\n"))
@@ -1555,7 +1687,7 @@ fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal) {
                 && popup.height >= qr_height.saturating_add(7);
             let body = if fits {
                 format!(
-                    "Leia no Android\n{}\nFingerprint SHA-256\n{}\nSVG privado: {}",
+                    "Leia no celular\n{}\nFingerprint SHA-256\n{}\nSVG privado: {}",
                     info.qr,
                     info.device.fingerprint,
                     info.qr_image.display()
@@ -1580,6 +1712,46 @@ fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal) {
             );
         }
         Modal::Input(input) => {
+            if let Some(draft) = &input.share {
+                let popup = centered(area, 76, 14);
+                frame.render_widget(Clear, popup);
+                let error = draft.error.as_deref().unwrap_or("");
+                let body = match draft.step {
+                    ShareStep::Name => format!("Nome do Share\n\n> {}\n\nEnter avança · Esc cancela\n\n{error}", input.value),
+                    ShareStep::Folder => format!("Nome: {}\n\nPasta no computador (caminho absoluto)\n\n> {}\n\nEnter avança · Esc cancela\n\n{error}", draft.name, input.value),
+                    ShareStep::Direction => format!("Nome: {}\nPasta no computador: {}\n\nDireção\n\n\n\n\n\n{error}\n\n↑↓ seleciona · Enter cria · Esc cancela", draft.name, draft.folder),
+                };
+                frame.render_widget(
+                    Paragraph::new(body).wrap(Wrap { trim: false }).block(
+                        Block::default()
+                            .title(format!(" {} ", input.title))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(WARNING)),
+                    ),
+                    popup,
+                );
+                if draft.step == ShareStep::Direction && popup.height >= 12 && popup.width >= 5 {
+                    let options = SHARE_DIRECTIONS
+                        .iter()
+                        .map(|(label, _)| ListItem::new(*label))
+                        .collect::<Vec<_>>();
+                    let mut selected = ListState::default();
+                    selected.select(Some(draft.direction));
+                    frame.render_stateful_widget(
+                        List::new(options)
+                            .highlight_style(
+                                Style::default()
+                                    .bg(ACCENT_DARK)
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                            .highlight_symbol("› "),
+                        Rect::new(popup.x + 2, popup.y + 6, popup.width.saturating_sub(4), 3),
+                        &mut selected,
+                    );
+                }
+                return;
+            }
             let height = if input.value.contains('\n') { 16 } else { 9 };
             let popup = centered(area, 76, height);
             frame.render_widget(Clear, popup);
@@ -1616,48 +1788,56 @@ fn centered(area: Rect, desired_width: u16, desired_height: u16) -> Rect {
     )
 }
 
-fn share_detail(status: &Status) -> String {
-    let conflicts = if status.conflicts.is_empty() {
-        "nenhum".into()
-    } else {
-        status
-            .conflicts
-            .iter()
-            .take(6)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n  ")
-    };
-    let last_error = status
-        .last_error
-        .as_ref()
-        .map(|error| {
-            format!(
-                "{} · {}\n{}\n{}",
-                timestamp_label(Some(error.at)),
-                error.operation,
-                error.message,
-                error
-                    .resolved_at
-                    .map(|at| format!("resolvido {}", timestamp_label(Some(at))))
-                    .unwrap_or_else(|| "não resolvido".into())
-            )
-        })
-        .or_else(|| status.error.clone())
-        .unwrap_or_else(|| "nenhum".into());
-    format!(
-        "{}\n\nEstado\n{}\n\nRaiz PC\n{} · {}\n\nPasta Android\n{}\n\nModo\n{}\n\nÚltimo sync\n{}\n\nConflitos ({})\n  {}\n\nÚltimo erro\n{}",
-        status.share.name,
-        if status.share.enabled { "ativo" } else { "pausado" },
-        status.share.root.display(),
-        if status.root_available { "disponível" } else { "indisponível" },
-        if status.share.remap_policy.is_some() { "aguardando nova seleção no Android" } else { "definida no aparelho (SAF)" },
-        mode_label(status.share.mode),
-        timestamp_label(status.last_sync),
-        status.conflicts.len(),
-        conflicts,
-        last_error
-    )
+fn share_detail(
+    status: &Status,
+    section: usize,
+    recovery: Option<&RecoveryItem>,
+    recovery_index: usize,
+    recovery_len: usize,
+) -> String {
+    let share = &status.share;
+    let mut text = format!(
+        "{}\n\n{}1 Geral   {}2 Configuração   {}3 Manutenção\n\n",
+        share.name.to_uppercase(),
+        if section == 0 { "› " } else { "" },
+        if section == 1 { "› " } else { "" },
+        if section == 2 { "› " } else { "" }
+    );
+    if let Some(item) = recovery {
+        text.push_str(&format!("AÇÃO NECESSÁRIA  ({}/{})\n{}\n\nO Rowd preservou uma versão anterior deste arquivo e precisa saber qual versão deve permanecer.\n\nv Usar versão anterior   k Manter versão atual   E Exportar versão\n←/→ outro arquivo\n\n", recovery_index + 1, recovery_len, item.path));
+    }
+    match section {
+        0 => {
+            let state = if recovery.is_some() { "Ação necessária" } else if !status.root_available || status.error.is_some() || status.last_error.as_ref().is_some_and(|error| error.resolved_at.is_none()) { "Erro" } else if !share.enabled { "Pausado" } else if share.remap_policy.is_some() { "Ação necessária" } else if status.last_sync.is_none() { "Aguardando sincronização" } else { "Sincronizado" };
+            text.push_str(&format!("Estado       {}\nDireção      {}\nComputador   {}\nCelular      {}\nÚltimo sync  {}\n\ns Sincronizar agora     Espaço {}",
+                state, mode_label(share.mode), share.root.display(),
+                if share.remap_policy.is_some() { "Aguardando escolha no celular" } else { "Escolhida no celular" },
+                timestamp_label(status.last_sync), if share.enabled { "Pausar" } else { "Retomar" }));
+            if let Some(error) = &status.last_error {
+                if error.resolved_at.is_none() { text.push_str(&format!("\n\nÚltimo erro  {}", error.message)); }
+            }
+        }
+        1 => text.push_str(&format!("Nome         {}\nDireção      {}\nComputador   {}\nCelular      {}\n\ne Editar   m Trocar pasta no celular   i Arquivos ignorados",
+            share.name, mode_label(share.mode), share.root.display(),
+            if share.remap_policy.is_some() { "Aguardando escolha no celular" } else { "Escolhida no celular" })),
+        _ => text.push_str("x Reparar Share\nReconstrói o estado de sincronização deste Share sem apagar seus arquivos. Versões preservadas continuam disponíveis.\n\nd Remover Share\nRemove o Share do Rowd e preserva os arquivos locais."),
+    }
+    text
+}
+
+fn advanced_description(action: UiAction) -> &'static str {
+    match action {
+        UiAction::ExportProfile => "Salva Shares, nomes, caminhos, direções, estado habilitado ou pausado, regras de arquivos ignorados e demais configurações públicas do perfil. Não inclui credenciais internas: não é um backup completo.",
+        UiAction::ImportProfile => "Restaura uma configuração anteriormente exportada. A configuração atual recebe um backup automático.",
+        UiAction::ExportBackup => "Cria um backup administrativo completo e criptografado do estado interno do Rowd. Não inclui os arquivos pessoais sincronizados.",
+        UiAction::ImportBackup => "Restaura um backup administrativo completo e criptografado. A configuração atual é preservada antes da troca.",
+        UiAction::TestConnection => "Testa endereço, TCP, TLS, autenticação, reconhecimento do celular e Shares disponíveis. O resultado aparece aqui após o teste.",
+        UiAction::ExportDiagnostic => "Gera um relatório sanitizado para investigar problemas, sem exportar credenciais privadas.",
+        UiAction::ToggleTrace => "Liga ou desliga o registro de desempenho da sincronização.",
+        UiAction::ResetInitial => "Gera nova identidade de pareamento, remove o celular vinculado e os Shares da configuração ativa e arquiva o estado administrativo anterior. Preserva os arquivos pessoais nas pastas.",
+        UiAction::ResetAll => "Arquiva os dados internos atuais (.rowd) e inicia sem configuração ativa. Não apaga os arquivos pessoais contidos nas pastas sincronizadas.",
+        _ => "",
+    }
 }
 
 fn share_form(value: &str) -> Result<(String, PathBuf, SyncMode)> {
@@ -1667,7 +1847,12 @@ fn share_form(value: &str) -> Result<(String, PathBuf, SyncMode)> {
     Ok((
         parts[0].into(),
         PathBuf::from(parts[1]),
-        crate::parse_mode(parts[2])?,
+        match parts[2] {
+            "ambos" => SyncMode::Bidirectional,
+            "para_celular" => SyncMode::ToAndroid,
+            "para_computador" => SyncMode::ToPc,
+            other => crate::parse_mode(other)?,
+        },
     ))
 }
 
@@ -1696,17 +1881,17 @@ fn clamp_index(index: usize, len: usize) -> usize {
 
 fn mode_label(mode: SyncMode) -> &'static str {
     match mode {
-        SyncMode::Bidirectional => "bidirecional",
-        SyncMode::ToAndroid => "PC → Android",
-        SyncMode::ToPc => "Android → PC",
+        SyncMode::Bidirectional => "Computador ↔ celular",
+        SyncMode::ToAndroid => "Computador → celular",
+        SyncMode::ToPc => "Celular → computador",
     }
 }
 
 fn mode_value(mode: SyncMode) -> &'static str {
     match mode {
-        SyncMode::Bidirectional => "bidirectional",
-        SyncMode::ToAndroid => "to_android",
-        SyncMode::ToPc => "to_pc",
+        SyncMode::Bidirectional => "ambos",
+        SyncMode::ToAndroid => "para_celular",
+        SyncMode::ToPc => "para_computador",
     }
 }
 
@@ -1756,26 +1941,6 @@ fn truncate(value: &str, width: usize) -> String {
     }
 }
 
-fn human_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}
-
-fn yes_no(value: bool) -> &'static str {
-    if value {
-        "sim"
-    } else {
-        "não"
-    }
-}
-
 fn display_key(value: &str) -> String {
     match value {
         "space" => "Espaço".into(),
@@ -1784,17 +1949,47 @@ fn display_key(value: &str) -> String {
     }
 }
 
-fn short_action(value: &str) -> &str {
-    value
-        .strip_suffix(" Share")
-        .or_else(|| value.strip_suffix(" solicitação"))
-        .or_else(|| value.strip_suffix(" versão"))
-        .unwrap_or(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn share_fixture() -> (TempDir, App, Ui, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let folder = temp.path().join("Fotos");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let app = App::new(home);
+        app.pair("127.0.0.1:43821").unwrap();
+        let mut ui = Ui::new(&app);
+        ui.begin_action(UiAction::AddShare, &app).unwrap();
+        (temp, app, ui, folder)
+    }
+
+    fn share_input(ui: &mut Ui) -> &mut InputDialog {
+        let Some(Modal::Input(input)) = &mut ui.modal else {
+            panic!("formulário ausente")
+        };
+        input
+    }
+
+    fn press(ui: &mut Ui, app: &App, code: KeyCode) {
+        let (tx, _) = mpsc::channel();
+        ui.handle_modal_key(KeyEvent::new(code, KeyModifiers::NONE), app, &tx)
+            .unwrap();
+    }
+
+    fn reach_direction(ui: &mut Ui, app: &App, folder: &Path) {
+        share_input(ui).value = "Fotos".into();
+        press(ui, app, KeyCode::Enter);
+        share_input(ui).value = folder.display().to_string();
+        press(ui, app, KeyCode::Enter);
+        assert_eq!(
+            share_input(ui).share.as_ref().unwrap().step,
+            ShareStep::Direction
+        );
+    }
 
     #[test]
     fn layout_changes_at_the_two_breakpoints() {
@@ -1814,5 +2009,98 @@ mod tests {
             Some(KeyCommand::Action(UiAction::AddShare))
         ));
         assert!(KeyMap::resolve(key, Tab::Device).is_none());
+    }
+
+    #[test]
+    fn tabs_and_share_sections_have_separate_navigation() {
+        assert_eq!(Tab::ALL, [Tab::Shares, Tab::Device, Tab::Advanced]);
+        assert_eq!(Tab::Advanced.next(), Tab::Shares);
+        assert!(matches!(
+            KeyMap::resolve(
+                KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+                Tab::Shares
+            ),
+            Some(KeyCommand::ShareSection(1))
+        ));
+        assert!(KeyMap::resolve(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            Tab::Device
+        )
+        .is_none());
+        assert!(KeyMap::resolve(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            Tab::Advanced
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn share_form_accepts_cellular_direction() {
+        let (_, _, mode) = share_form("Fotos | /tmp/fotos | para_celular").unwrap();
+        assert_eq!(mode, SyncMode::ToAndroid);
+    }
+
+    #[test]
+    fn add_share_creates_each_direction() {
+        for (steps, mode) in [
+            (0, SyncMode::Bidirectional),
+            (1, SyncMode::ToAndroid),
+            (2, SyncMode::ToPc),
+        ] {
+            let (_temp, app, mut ui, folder) = share_fixture();
+            reach_direction(&mut ui, &app, &folder);
+            for _ in 0..steps {
+                press(&mut ui, &app, KeyCode::Down);
+            }
+            press(&mut ui, &app, KeyCode::Enter);
+            assert!(ui.modal.is_none());
+            let shares = app.snapshot().unwrap().shares;
+            assert_eq!(shares.len(), 1);
+            assert_eq!(shares[0].share.name, "Fotos");
+            assert_eq!(shares[0].share.mode, mode);
+            assert_eq!(shares[0].share.root, folder);
+        }
+    }
+
+    #[test]
+    fn add_share_keeps_name_and_folder_on_validation_errors() {
+        let (_temp, app, mut ui, folder) = share_fixture();
+        press(&mut ui, &app, KeyCode::Enter);
+        assert_eq!(
+            share_input(&mut ui).share.as_ref().unwrap().step,
+            ShareStep::Name
+        );
+        assert!(share_input(&mut ui).share.as_ref().unwrap().error.is_some());
+        share_input(&mut ui).value = "Fotos".into();
+        press(&mut ui, &app, KeyCode::Enter);
+        let invalid = folder.join("inexistente").display().to_string();
+        share_input(&mut ui).value = invalid.clone();
+        press(&mut ui, &app, KeyCode::Enter);
+        let input = share_input(&mut ui);
+        assert_eq!(input.share.as_ref().unwrap().step, ShareStep::Folder);
+        assert_eq!(input.share.as_ref().unwrap().name, "Fotos");
+        assert_eq!(input.value, invalid);
+        assert!(input.share.as_ref().unwrap().error.is_some());
+        assert!(app.snapshot().unwrap().shares.is_empty());
+        share_input(&mut ui).value = folder.display().to_string();
+        press(&mut ui, &app, KeyCode::Enter);
+        press(&mut ui, &app, KeyCode::Enter);
+        assert_eq!(app.snapshot().unwrap().shares[0].share.name, "Fotos");
+    }
+
+    #[test]
+    fn add_share_direction_arrows_and_escape() {
+        let (_temp, app, mut ui, folder) = share_fixture();
+        reach_direction(&mut ui, &app, &folder);
+        press(&mut ui, &app, KeyCode::Down);
+        press(&mut ui, &app, KeyCode::Down);
+        assert_eq!(share_input(&mut ui).share.as_ref().unwrap().direction, 2);
+        press(&mut ui, &app, KeyCode::Up);
+        assert_eq!(share_input(&mut ui).share.as_ref().unwrap().direction, 1);
+        press(&mut ui, &app, KeyCode::Char('3'));
+        assert_eq!(share_input(&mut ui).share.as_ref().unwrap().direction, 1);
+        press(&mut ui, &app, KeyCode::Esc);
+        assert!(ui.modal.is_none());
+        assert!(app.snapshot().unwrap().shares.is_empty());
     }
 }

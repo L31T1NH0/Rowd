@@ -1,9 +1,9 @@
 ---
 name: Rowd
-description: Mesa operacional para rotas de sincronização entre Linux e Android.
+description: Mesa operacional para Shares entre Linux e celular.
 colors:
-  route-cyan: "#4bcfd2"
-  route-cyan-deep: "#184349"
+  share-cyan: "#4bcfd2"
+  share-cyan-deep: "#184349"
   operational-muted: "#94a3aa"
   healthy-green: "#5ccd8a"
   maintenance-amber: "#efb855"
@@ -17,11 +17,11 @@ typography:
     fontWeight: 700
     lineHeight: 1
 components:
-  route-marker:
-    backgroundColor: "{colors.route-cyan}"
+  share-marker:
+    backgroundColor: "{colors.share-cyan}"
     textColor: "#000000"
-  selected-route:
-    backgroundColor: "{colors.route-cyan-deep}"
+  selected-share:
+    backgroundColor: "{colors.share-cyan-deep}"
     textColor: "#ffffff"
   healthy-status:
     textColor: "{colors.healthy-green}"
@@ -33,9 +33,9 @@ components:
 
 ## Overview
 
-**Creative North Star: "Mesa de Rotas"**
+**Creative North Star: "Mesa de Shares"**
 
-O Rowd apresenta sincronização como uma mesa operacional: cada Share é uma rota com origem, destino, estado e próxima ação visíveis. A interface é densa o bastante para administrar várias rotas, mas mantém uma ordem fixa — saúde global, categoria, seleção, detalhe e ação contextual — para que problemas não se escondam em mensagens transitórias.
+O Rowd apresenta sincronização como uma mesa operacional: cada Share tem direção, estado e próxima ação visíveis. A interface mantém uma ordem fixa — aba, seleção, detalhe e ação contextual — para que problemas não se escondam em mensagens transitórias.
 
 A aparência vem do próprio terminal: fundo e fonte são herdados, enquanto ciano marca navegação, verde confirma saúde e âmbar sinaliza manutenção ou espera. Cor nunca é a única evidência de estado; rótulos como ATIVO, PAUSADO, OK e FALHA permanecem obrigatórios.
 
@@ -52,7 +52,7 @@ A paleta é um conjunto pequeno de sinais operacionais sobre o fundo escolhido p
 
 ### Primary
 
-- **Ciano de Rota:** marca a identidade ROWD, a aba ativa e contornos de foco informativo.
+- **Ciano de Share:** marca a identidade ROWD, a aba ativa e contornos de foco informativo.
 - **Ciano Profundo:** sustenta a linha selecionada sem depender de inversão arbitrária do terminal.
 
 ### Secondary
@@ -89,7 +89,7 @@ A paleta é um conjunto pequeno de sinais operacionais sobre o fundo escolhido p
 
 ## Layout
 
-O primeiro bloco tem duas linhas persistentes: identidade/estado do dispositivo e contagens/mensagem de trabalho. Abaixo vêm cinco abas numeradas, corpo e rodapé contextual.
+No topo ficam ROWD e o estado curto do celular. Abaixo vêm Shares, Dispositivo e Avançado, seguidos pela mensagem dinâmica de trabalho. O corpo usa lista e detalhe; a versão aparece no canto inferior direito.
 
 Com 110 colunas ou mais, lista e detalhe usam 38/62 da largura. Entre 80 e 109 colunas usam 44/56. Abaixo de 80 colunas, os painéis empilham em 43/57 da altura. A densidade confortável reserva três linhas ao rodapé; a compacta usa duas.
 
@@ -97,7 +97,7 @@ Modais aparecem no centro apenas para foco protegido: QR, ajuda, entrada de dado
 
 ### Named Rules
 
-**The Route Before Action Rule.** Seleção e detalhes aparecem antes dos comandos; o rodapé nunca oferece ações de outra aba.
+**The Share Before Action Rule.** Seleção e detalhes aparecem antes dos comandos; o rodapé prioriza navegação global.
 
 ## Elevation & Depth
 
@@ -112,18 +112,18 @@ O vocabulário é ortogonal e alinhado à grade de caracteres. Painéis usam bor
 ### Header operacional
 
 - **Identity:** marcador ROWD em ciano com texto preto.
-- **States:** sync e Android escritos por extenso, seguidos por contagens e mensagem corrente.
+- **States:** apenas o estado curto do celular no canto superior direito.
 - **Loading:** o nome da operação em andamento substitui a mensagem transitória, sem bloquear navegação.
 
 ### Navigation
 
-- **Default:** número e nome em cinza operacional.
-- **Active:** ciano de rota com peso forte.
-- **Keyboard:** 1..5 abre diretamente; Tab e Shift+Tab percorrem a sequência.
+- **Default:** nome em cinza operacional.
+- **Active:** ciano de Share com peso forte.
+- **Keyboard:** Tab e Shift+Tab percorrem as três abas; 1, 2 e 3 mudam as seções do Share.
 
 ### Route list
 
-- **Shape:** painel com borda simples e itens de duas linhas.
+- **Shape:** painel com borda simples e itens de uma linha. Solicitações aparecem antes dos Shares.
 - **Selected:** fundo ciano profundo, texto branco, peso forte e marcador textual.
 - **Empty:** explica o estado e nomeia a ação que cria o primeiro item.
 
@@ -147,7 +147,7 @@ O vocabulário é ortogonal e alinhado à grade de caracteres. Painéis usam bor
 
 ### Do:
 
-- **Do** manter saúde global e vínculo visíveis em todas as abas.
+- **Do** manter o estado curto do celular visível em todas as abas.
 - **Do** adaptar master/detail nos limites de 110 e 80 colunas.
 - **Do** nomear problema e recuperação em mensagens de erro.
 - **Do** preservar confirmação textual em ações destrutivas.
