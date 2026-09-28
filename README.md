@@ -1,7 +1,7 @@
 # <img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="40"> Rowd
 
 > [!WARNING]
-> **Unstable alpha (0.5.3).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+> **Unstable alpha (0.6.0).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
 
 Rowd syncs folders between one Linux PC and one Android phone on the same local network. You choose which folders connect and whether files travel both ways, to Android, or to the PC. The devices transfer files over TLS without a cloud account or relay.
 
@@ -9,27 +9,27 @@ The Rust test suite and Android build pass, and the app has seen use on a real d
 
 ## Get Rowd
 
-Download both files from the [0.5.3 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.5.3-alpha):
+Download both files from the [0.6.0 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.6.0-alpha):
 
 | Device | File |
 | --- | --- |
-| Linux x86_64 | `rowd-v0.5.3-alpha-linux-x86_64` |
-| Android 8 or newer, ARM64 | `rowd-v0.5.3-alpha-android-arm64.apk` |
+| Linux x86_64 | `rowd-v0.6.0-alpha-linux-x86_64` |
+| Android 8 or newer, ARM64 | `rowd-v0.6.0-alpha-android-arm64.apk` |
 
-The release includes `rowd-v0.5.3-alpha-SHA256SUMS` so you can check both downloads. The Android release APK is signed with the debug key. Update the PC binary and APK together: version 0.5.3-alpha uses network protocol V12 and rejects older peers.
+The release includes `rowd-v0.6.0-alpha-SHA256SUMS` so you can check both downloads. The Android release APK is signed with the debug key. Update the PC binary and APK together to use LAN discovery; both builds use sync protocol V12.
 
 On Linux, make the downloaded binary executable and start it:
 
 ```bash
-chmod +x rowd-v0.5.3-alpha-linux-x86_64
-./rowd-v0.5.3-alpha-linux-x86_64
+chmod +x rowd-v0.6.0-alpha-linux-x86_64
+./rowd-v0.6.0-alpha-linux-x86_64
 ```
 
-Keep both devices on the same LAN. The phone must reach TCP port `43821` on the PC.
+Keep both devices on the same LAN. The phone must reach TCP port `43821` and multicast UDP `239.255.42.99:43822` on the PC. If multicast is blocked, Rowd tries the address stored in the invitation.
 
 ## Pair and sync a folder
 
-1. Open the **Device** tab in the Linux terminal app and create an invitation with your PC's LAN address, such as `192.168.1.20:43821`.
+1. Open the **Device** tab in the Linux terminal app and select **Conectar celular** to display the QR. The CLI equivalent is `rowd pair`; `--address 192.168.1.20:43821` is available when you want to set a fallback address.
 2. On Android, tap **Parear por QR** and scan the code. Compare the certificate fingerprint shown on both devices before accepting it.
 3. Tap **Escolher pasta para novo Share** on Android. Choose a folder, name the Share, and choose its direction.
 4. Open **Requests** in the Linux app, accept the request, and select the matching PC folder.

@@ -8,6 +8,7 @@ use fs2::FileExt;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rowd_core::{
     config::{RemapPolicy, ShareConfig, ShareRequest, SyncMode},
+    discovery,
     model::{Invitation, INVITATION_VERSION},
     protocol::{self, Message},
     random_id,
@@ -576,10 +577,13 @@ fn published_address(address: &str) -> Result<String> {
         return Ok(address.to_owned());
     }
     let probe = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
-    probe.connect((std::net::Ipv4Addr::new(8, 8, 8, 8), 80))?;
-    let ip = match probe.local_addr()?.ip() {
-        IpAddr::V4(ip) if !ip.is_loopback() => ip,
-        _ => anyhow::bail!("não foi possível descobrir o IP local da rede"),
+    let ip = match probe
+        .connect((std::net::Ipv4Addr::new(8, 8, 8, 8), 80))
+        .and_then(|_| probe.local_addr())
+        .map(|addr| addr.ip())
+    {
+        Ok(IpAddr::V4(ip)) if !ip.is_loopback() => ip,
+        _ => std::net::Ipv4Addr::LOCALHOST,
     };
     Ok(format!("{ip}:{}", socket.port()))
 }
@@ -588,15 +592,21 @@ fn pair(home: &Path, address: &str) -> Result<DeviceConfig> {
     let _lock = config_guard(home)?;
     if home.join(".rowd/device.json").exists() {
         let mut cfg = DeviceConfig::load(home)?;
-        backup_config(home, "pairing-address")?;
-        cfg.address = published_address(address)?;
-        cfg.save(home)?;
+        if !address.is_empty() {
+            backup_config(home, "pairing-address")?;
+            cfg.address = published_address(address)?;
+            cfg.save(home)?;
+        }
         return Ok(cfg);
     }
     let cert = rcgen::generate_simple_self_signed(vec!["rowd.local".into()])?;
     let cfg = DeviceConfig {
         version: CURRENT_DEVICE_VERSION,
-        address: published_address(address)?,
+        address: published_address(if address.is_empty() {
+            "0.0.0.0:43821"
+        } else {
+            address
+        })?,
         listen: "0.0.0.0:43821".into(),
         pair_id: random_id()?,
         cert: hex::encode(cert.cert.der()),
@@ -2083,6 +2093,53 @@ fn serve(
     let listener = TcpListener::bind(listen.unwrap_or(&cfg.listen))?;
     listener.set_nonblocking(true)?;
     event(format!("Rowd ouvindo em {}", listener.local_addr()?));
+    let tcp_port = listener.local_addr()?.port();
+    let discovery_stop = stop.clone();
+    let discovery_home = home.to_path_buf();
+    let responder = std::thread::spawn(move || {
+        while !discovery_stop.load(Ordering::Relaxed) {
+            let result = (|| -> Result<()> {
+                let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, discovery::PORT))?;
+                socket.join_multicast_v4(&discovery::GROUP, &std::net::Ipv4Addr::UNSPECIFIED)?;
+                socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+                let until = Instant::now() + Duration::from_secs(30);
+                let mut packet = [0; 256];
+                while !discovery_stop.load(Ordering::Relaxed) && Instant::now() < until {
+                    match socket.recv_from(&mut packet) {
+                        Ok((len, peer)) => {
+                            if let Ok(cfg) = DeviceConfig::load(&discovery_home) {
+                                if let Ok(fingerprint) = discovery::fingerprint(&cfg.cert) {
+                                    if let Ok(reply) = discovery::announce_packet(
+                                        &packet[..len],
+                                        &fingerprint,
+                                        tcp_port,
+                                    ) {
+                                        let _ = socket.send_to(&reply, peer);
+                                    }
+                                }
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!("Discovery indisponível: {error:#}");
+            }
+            for _ in 0..10 {
+                if discovery_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
     let (tx, rx) = mpsc::sync_channel(1024);
     let overflow = Arc::new(AtomicBool::new(false));
     let watcher_overflow = overflow.clone();
@@ -2106,7 +2163,7 @@ fn serve(
     let mut last_config = Instant::now() - Duration::from_secs(2);
     let urgent = Mutex::new(BTreeMap::new());
     let audit_events = Mutex::new((0u64, BTreeMap::new()));
-    std::thread::scope(|scope| -> Result<()> {
+    let result = std::thread::scope(|scope| -> Result<()> {
         let mut connected = None;
         let mut connected_socket: Option<TcpStream> = None;
         let mut wake_tx: Option<mpsc::Sender<String>> = None;
@@ -2319,7 +2376,7 @@ fn serve(
                             socket,
                             !watcher_untrusted,
                             wakes,
-                            &urgent,
+                            urgent,
                             audit_events,
                             stop,
                             once,
@@ -2342,7 +2399,10 @@ fn serve(
             handle.join().expect("session thread panicked")?;
         }
         Ok(())
-    })
+    });
+    stop.store(true, Ordering::Relaxed);
+    let _ = responder.join();
+    result
 }
 
 fn qr(cfg: &DeviceConfig) -> Result<String> {
@@ -2387,6 +2447,21 @@ mod tests {
         assert_eq!(pairing.device.fingerprint, snapshot.device.fingerprint);
         assert!(!pairing.qr.is_empty());
         assert!(pairing.qr_image.exists());
+    }
+
+    #[test]
+    fn pair_without_address_preserves_existing_fallback_and_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::new(directory.path());
+        app.pair("").unwrap();
+        let first = DeviceConfig::load(directory.path()).unwrap();
+        assert!(!first.address.is_empty());
+        app.pair("").unwrap();
+        let second = DeviceConfig::load(directory.path()).unwrap();
+        assert_eq!(first.address, second.address);
+        assert_eq!(first.pair_id, second.pair_id);
+        assert_eq!(first.secret, second.secret);
+        assert_eq!(first.cert, second.cert);
     }
 
     #[test]

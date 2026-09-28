@@ -348,7 +348,6 @@ enum KeyCommand {
 }
 
 enum Submit {
-    Pair,
     AddShare,
     EditShare(String),
     RemoveShare(String),
@@ -672,20 +671,6 @@ impl Ui {
         Ok(())
     }
 
-    fn open_pair_input(&mut self) {
-        let current = if self.snapshot.device.configured {
-            self.snapshot.device.address.clone()
-        } else {
-            "0.0.0.0:43821".into()
-        };
-        self.open_input(
-            "Conectar celular · endereço do computador",
-            "Use IP:porta alcançável pelo celular; 0.0.0.0 descobre o IP local. O QR aparece em seguida.",
-            current,
-            Submit::Pair,
-        );
-    }
-
     fn begin_action(&mut self, action: UiAction, app: &App) -> Result<()> {
         match action {
             UiAction::AddShare => self.modal = Some(Modal::Input(InputDialog {
@@ -808,7 +793,11 @@ impl Ui {
                     );
                 }
             }
-            UiAction::Pair => self.open_pair_input(),
+            UiAction::Pair => {
+                app.pair("")?;
+                self.modal = Some(Modal::Qr(app.pairing_info()?));
+                self.notice = "QR pronto para leitura pelo celular.".into();
+            },
             UiAction::TestConnection => {
                 self.connection = Some(app.connection_test()?);
                 self.notice =
@@ -905,11 +894,6 @@ impl Ui {
         tx: &Sender<UiEvent>,
     ) -> Result<()> {
         match submit {
-            Submit::Pair => {
-                app.pair(value.trim())?;
-                self.modal = Some(Modal::Qr(app.pairing_info()?));
-                self.notice = "QR pronto para leitura pelo celular.".into();
-            }
             Submit::AddShare => unreachable!("novo Share usa o formulário em etapas"),
             Submit::EditShare(id) => {
                 let (name, root, mode) = share_form(&value)?;

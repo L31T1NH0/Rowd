@@ -20,9 +20,37 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 static BASE_TOKENS: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
 static CONNECTION: OnceLock<Mutex<Option<(String, rowd_core::tls::ClientStream)>>> =
     OnceLock::new();
+static RESOLVER: OnceLock<Mutex<rowd_core::discovery::EndpointResolver>> = OnceLock::new();
+static NETWORK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONNECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACTIVE_SOCKET: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
+
+fn clear_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream)>) {
+    *connection = None;
+    if let Some(socket) = ACTIVE_SOCKET.get() {
+        *socket.lock().unwrap() = None;
+    }
+}
 
 fn connection() -> &'static Mutex<Option<(String, rowd_core::tls::ClientStream)>> {
     CONNECTION.get_or_init(|| Mutex::new(None))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_networkChanged(_env: JNIEnv, _class: JObject) {
+    NETWORK_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if let Some(socket) = ACTIVE_SOCKET.get() {
+        if let Ok(mut socket) = socket.lock() {
+            if let Some(socket) = socket.take() {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+    if let Ok(mut connection) = connection().try_lock() {
+        if let Some((_, io)) = connection.take() {
+            let _ = io.sock.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 fn base_tokens() -> &'static Mutex<std::collections::HashMap<String, String>> {
@@ -439,25 +467,57 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
         let mut connection = connection().lock().unwrap();
-        let key = format!("{text}|{device}");
-        if connection
-            .as_ref()
-            .is_some_and(|(current, _)| current != &key)
-        {
-            *connection = None;
+        let key = format!(
+            "{}|{:?}|{}|{device}",
+            invite.pair_id,
+            rowd_core::discovery::fingerprint(&invite.cert_der)?,
+            invite.secret
+        );
+        if connection.as_ref().is_some_and(|(current, _)| {
+            current != &key
+                || CONNECTION_GENERATION.load(Ordering::Relaxed)
+                    != NETWORK_GENERATION.load(Ordering::Relaxed)
+        }) {
+            clear_connection(&mut connection);
         }
         let mut skipped = std::collections::BTreeSet::new();
         let mut errors = Vec::new();
         loop {
             if connection.is_none() {
-                let mut io = rowd_core::tls::connect(&invite)?;
-                rowd_core::protocol::client_auth(
-                    &mut io,
-                    &invite.pair_id,
-                    &invite.secret,
-                    &device,
-                )?;
+                let generation = NETWORK_GENERATION.load(Ordering::Relaxed);
+                let mut resolver = RESOLVER
+                    .get_or_init(|| Mutex::new(Default::default()))
+                    .lock()
+                    .unwrap();
+                let (io, endpoint) =
+                    resolver.connect(&invite, &device, generation, |fingerprint| {
+                        store.call("acquireMulticast", &[])?;
+                        let result = (|| {
+                            let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                            rowd_core::discovery::collect(
+                                &socket,
+                                (rowd_core::discovery::GROUP, rowd_core::discovery::PORT).into(),
+                                fingerprint,
+                            )
+                        })();
+                        let _ = store.call("releaseMulticast", &[]);
+                        result
+                    })?;
+                anyhow::ensure!(
+                    generation == NETWORK_GENERATION.load(Ordering::Relaxed),
+                    "Rede alterada durante a conexão"
+                );
+                store.call("authenticatedAddress", &[&endpoint])?;
+                CONNECTION_GENERATION.store(generation, Ordering::Relaxed);
+                *ACTIVE_SOCKET
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .unwrap() = Some(io.sock.try_clone()?);
                 *connection = Some((key.clone(), io));
+                if generation != NETWORK_GENERATION.load(Ordering::Relaxed) {
+                    clear_connection(&mut connection);
+                    anyhow::bail!("Rede alterada durante a conexão");
+                }
             }
             store.scan_socket = Some(connection.as_ref().unwrap().1.sock.try_clone()?);
             let mut failed = None;
@@ -479,7 +539,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                     break Ok(serde_json::to_string(&report)?);
                 }
                 Err(error) => {
-                    *connection = None;
+                    clear_connection(&mut connection);
                     match failed {
                         Some(id) if skipped.insert(id.clone()) => {
                             errors.push(format!("{id}: {error:#}"))
@@ -563,7 +623,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
         "!".to_string()
     };
     if result == "!" {
-        *connection = None;
+        clear_connection(&mut connection);
     }
     env.new_string(result)
         .map(|s| s.into_raw())

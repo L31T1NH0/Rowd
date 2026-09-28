@@ -1,4 +1,5 @@
 pub mod config;
+pub mod discovery;
 pub mod ignore;
 pub mod managed;
 pub mod model;

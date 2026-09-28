@@ -68,7 +68,7 @@ class MainActivity : AppCompatActivity() {
                 .setNegativeButton("Cancelar", null).setPositiveButton("Conectar") { _, _ -> safely {
                     check(!SyncService.busy.get()) { "Aguarde a operação atual terminar para trocar o vínculo." }
                     check(prefs.edit().putString("invitation", invite.getString("invitation"))
-                        .putString("peerAddress", invite.getString("address"))
+                        .remove("peerAddress")
                         .remove("unlinkRequested").remove("unlinkPrepared").commit()) {
                         "Não foi possível salvar o novo convite."
                     }
@@ -162,7 +162,7 @@ class MainActivity : AppCompatActivity() {
                     val address = input.text.toString().trim(); check(address.isNotEmpty()) { "Informe o endereço e a porta." }
                     val updated = previewInvitation(current, address)
                     prefs.edit().putString("invitation", updated.getString("invitation"))
-                        .putString("peerAddress", updated.getString("address")).apply()
+                        .remove("peerAddress").apply()
                     SyncService.wake(); refresh()
                 } }.show()
         }

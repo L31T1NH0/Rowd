@@ -30,16 +30,19 @@ pub fn accept(
     Ok(StreamOwned::new(ServerConnection::new(config)?, socket))
 }
 pub fn connect(invite: &Invitation) -> Result<StreamOwned<ClientConnection, TcpStream>> {
+    connect_to(invite, &invite.address, Duration::from_secs(5))
+}
+pub fn connect_to(invite: &Invitation, endpoint: &str, timeout: Duration) -> Result<ClientStream> {
     invite.validate()?;
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(hex::decode(&invite.cert_der)?))?;
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let addresses: Vec<_> = invite.address.to_socket_addrs()?.collect();
+    let addresses: Vec<_> = endpoint.to_socket_addrs()?.collect();
     let socket = addresses
         .iter()
-        .find_map(|addr| TcpStream::connect_timeout(addr, Duration::from_secs(5)).ok())
+        .find_map(|addr| TcpStream::connect_timeout(addr, timeout).ok())
         .context("PC unavailable; check Wi-Fi, address and firewall")?;
     set_timeout(&socket)?;
     let name = ServerName::try_from("rowd.local")?;

@@ -4,6 +4,10 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.LinkProperties
 import android.os.IBinder
 import android.os.Handler
 import android.os.Looper
@@ -59,6 +63,35 @@ class SyncService : Service() {
     }
     private val active = AtomicBoolean(false)
     private var worker: Thread? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkSignature: String? = null
+    private fun observeNetwork() {
+        val manager = getSystemService(ConnectivityManager::class.java)
+        fun signature(): String {
+            val network = manager.activeNetwork ?: return "offline"
+            val links = manager.getLinkProperties(network)
+            val caps = manager.getNetworkCapabilities(network)
+            return "$network|${links?.interfaceName}|${links?.linkAddresses}|${links?.routes}|${caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)}"
+        }
+        networkSignature = signature()
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            private fun changed() {
+                val current = signature()
+                synchronized(this@SyncService) {
+                    if (current == networkSignature) return
+                    networkSignature = current
+                }
+                NativeBridge.networkChanged()
+                wake()
+            }
+            override fun onAvailable(network: Network) = changed()
+            override fun onLost(network: Network) = changed()
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = changed()
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = changed()
+        }
+        networkCallback = callback
+        manager.registerDefaultNetworkCallback(callback)
+    }
     private fun notifyStatus(text: String) {
         if (android.os.Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
@@ -73,6 +106,7 @@ class SyncService : Service() {
     }
     override fun onCreate() {
         super.onCreate()
+        observeNetwork()
         if (getSharedPreferences("rowd", MODE_PRIVATE).getBoolean("performanceTrace", false) && !PerformanceTrace.enabled()) {
             runCatching { PerformanceTrace.enable(this) }
                 .onFailure { android.util.Log.e("RowdTrace", "Não foi possível iniciar o trace", it) }
@@ -139,7 +173,7 @@ class SyncService : Service() {
                             check(!preview.has("error")) { preview.optString("error", "Convite inválido.") }
                             invitation = preview.getString("invitation")
                             prefs.edit().putString("invitation", invitation)
-                                .putString("peerAddress", preview.getString("address")).apply()
+                                .remove("peerAddress").apply()
                         }
                         val device = prefs.getString("deviceId", null) ?: error("Abra o Rowd novamente para criar a identidade do aparelho.")
                         val now = android.os.SystemClock.elapsedRealtime()
@@ -288,6 +322,9 @@ class SyncService : Service() {
             "O limite de execução em segundo plano foi atingido. Abra o Rowd para retomar.")
         worker?.interrupt(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
     }
-    override fun onDestroy() { active.set(false); NativeBridge.cancel(); worker?.interrupt(); super.onDestroy() }
+    override fun onDestroy() {
+        networkCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
+        active.set(false); NativeBridge.cancel(); worker?.interrupt(); super.onDestroy()
+    }
     override fun onBind(intent: Intent?): IBinder? = null
 }

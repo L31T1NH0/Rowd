@@ -24,7 +24,7 @@ struct Cli {
 enum Command {
     Pair {
         #[arg(long)]
-        address: String,
+        address: Option<String>,
         #[arg(long)]
         invite: Option<PathBuf>,
     },
@@ -207,7 +207,7 @@ fn run() -> Result<()> {
     };
     match command {
         Command::Pair { address, invite } => {
-            app.pair(&address)?;
+            app.pair(address.as_deref().unwrap_or(""))?;
             if let Some(path) = invite {
                 app.export_invitation(&path)?;
             }
@@ -348,5 +348,18 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("Rowd: {error:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pair_address_is_optional() {
+        let cli = Cli::try_parse_from(["rowd", "pair"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Pair { address: None, .. })
+        ));
     }
 }

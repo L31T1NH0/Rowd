@@ -15,6 +15,23 @@ import java.util.UUID
 
 /** SAF boundary. Sync I/O uses one worker; administrative file updates share [stateLock]. */
 class FolderAccess(private val context: Context) {
+    private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
+    fun acquireMulticast(): String {
+        releaseMulticast()
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+        val lock = wifi.createMulticastLock("rowd-discovery").apply { setReferenceCounted(false); acquire() }
+        multicastLock = lock
+        return ""
+    }
+    fun releaseMulticast(): String {
+        multicastLock?.release()
+        multicastLock = null
+        return ""
+    }
+    fun authenticatedAddress(address: String): String {
+        context.getSharedPreferences("rowd", Context.MODE_PRIVATE).edit().putString("peerAddress", address).apply()
+        return ""
+    }
     private class AuditDeferred : RuntimeException("AUDIT_DEFERRED")
     companion object {
         private val stateLock = Any()
