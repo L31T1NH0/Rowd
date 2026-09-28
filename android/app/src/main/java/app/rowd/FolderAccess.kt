@@ -871,7 +871,7 @@ class FolderAccess(private val context: Context) {
                 DocumentsContract.getTreeDocumentId(targetUri) != treeId) return null
             val parentId = DocumentsContract.getDocumentId(parentUri)
             val targetId = DocumentsContract.getDocumentId(targetUri)
-            val documentPath = DocumentsContract.findDocumentPath(resolver, targetUri).path
+            val documentPath = DocumentsContract.findDocumentPath(resolver, targetUri)?.path ?: return null
             val ancestors = synchronized(scanLock) {
                 val paths = directoryPaths[shareId].orEmpty()
                 (0..parentNames.size).map { count ->
