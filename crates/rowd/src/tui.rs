@@ -836,7 +836,7 @@ impl Ui {
             }
             UiAction::Unlink => self.open_input(
                 "Desvincular celular",
-                "Aguarda confirmação do celular antes de revogar. Digite DESVINCULAR.",
+                "Revoga o celular imediatamente. Digite DESVINCULAR.",
                 "",
                 Submit::Unlink,
             ),
@@ -1000,7 +1000,7 @@ impl Ui {
                 let app = app.clone();
                 start_job(self, tx, "Desvinculando dispositivo", move || {
                     app.unlink_device()?;
-                    Ok("Desvinculação pendente até o celular confirmar; arquivos e versões preservados.".into())
+                    Ok("Celular revogado; Shares, arquivos e recovery preservados.".into())
                 })?;
             }
             Submit::ExportProfile => {

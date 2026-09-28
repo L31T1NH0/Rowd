@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MANIFEST_CHUNK_FILES: usize = 1024;
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -29,7 +29,6 @@ pub enum Message {
         available_shares: Vec<String>,
         requested_share_ids: Vec<String>,
         audit: bool,
-        #[serde(default)]
         unlink_requested: bool,
     },
     ShareRequestStatus {
@@ -40,8 +39,6 @@ pub enum Message {
         cancelled: Vec<String>,
     },
     DeviceUnlinked,
-    UnlinkAck,
-    UnlinkComplete,
     SelectShare {
         share_id: String,
     },

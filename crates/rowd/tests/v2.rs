@@ -421,11 +421,17 @@ fn android_share_request_waits_for_pc_folder_selection() {
 }
 
 #[test]
-fn interrupted_unlink_keeps_credentials_until_android_acknowledges() {
+fn pc_unlink_revokes_immediately_preserves_shares_and_accepts_reset_phone() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let phone = directory.path().join("phone");
+    let phone_a = directory.path().join("phone-a");
+    let phone_b = directory.path().join("phone-b");
+    let files = directory.path().join("files");
     let invite = directory.path().join("invite.txt");
+    fs::create_dir_all(files.join(".rowd/recovery")).unwrap();
+    fs::write(files.join("personal.txt"), "keep").unwrap();
+    fs::write(files.join(".rowdignore"), "*.tmp\n").unwrap();
+    fs::write(files.join(".rowd/recovery/version"), "keep").unwrap();
     ok(
         &home,
         &[
@@ -436,51 +442,147 @@ fn interrupted_unlink_keeps_credentials_until_android_acknowledges() {
             invite.to_str().unwrap(),
         ],
     );
-    round(&home, &phone, &invite);
+    ok(
+        &home,
+        &[
+            "share",
+            "add",
+            "--name",
+            "Files",
+            "--folder",
+            files.to_str().unwrap(),
+        ],
+    );
+    round(&home, &phone_a, &invite);
     let app = rowd_app::App::new(&home);
     let before = rowd_app::DeviceConfig::load(&home).unwrap();
-    app.unlink_device().unwrap();
-    assert!(rowd_app::DeviceConfig::load(&home).unwrap().pending_unlink);
+    assert!(before.peer_device.is_some());
+    let old_shares = serde_json::to_value(&before.shares).unwrap();
 
-    let mut server = server(&home, &invite, true);
-    let invitation = Invitation::decode(&fs::read_to_string(&invite).unwrap()).unwrap();
-    let device_id: String =
-        serde_json::from_slice(&fs::read(phone.join(".rowd/client-id.json")).unwrap()).unwrap();
-    let mut io = rowd_core::tls::connect(&invitation).unwrap();
-    protocol::client_auth(&mut io, &invitation.pair_id, &invitation.secret, &device_id).unwrap();
-    protocol::send(&mut io, &Message::StartRound).unwrap();
-    assert!(matches!(
-        protocol::receive(&mut io).unwrap(),
-        Message::Shares { .. }
-    ));
-    protocol::send(
-        &mut io,
-        &Message::Capabilities {
-            device_id,
-            share_requests: Vec::new(),
-            cancel_intents: Vec::new(),
-            available_shares: Vec::new(),
-            requested_share_ids: Vec::new(),
-            audit: false,
-            unlink_requested: false,
-        },
+    // A reset phone has a new device ID, so the existing peer rejects it.
+    let mut rejected = server(&home, &invite, true);
+    let old_invitation = Invitation::decode(&fs::read_to_string(&invite).unwrap()).unwrap();
+    assert!(rowd_core::managed::client_round(
+        &old_invitation,
+        &random_id().unwrap(),
+        &mut LocalDevice::open(&phone_b).unwrap(),
     )
-    .unwrap();
-    assert!(matches!(
-        protocol::receive(&mut io).unwrap(),
-        Message::DeviceUnlinked
-    ));
-    drop(io); // Lost ACK: the PC must still accept the old identity.
-    let _ = server.0.wait();
-    let interrupted = rowd_app::DeviceConfig::load(&home).unwrap();
-    assert_eq!(interrupted.pair_id, before.pair_id);
-    assert!(interrupted.pending_unlink);
+    .is_err());
+    assert!(!rejected.0.wait().unwrap().success());
 
-    round(&home, &phone, &invite);
-    let completed = rowd_app::DeviceConfig::load(&home).unwrap();
-    assert_ne!(completed.pair_id, before.pair_id);
-    assert!(!completed.pending_unlink);
-    assert!(completed.peer_device.is_none());
+    app.unlink_device().unwrap();
+    let after = rowd_app::DeviceConfig::load(&home).unwrap();
+    assert!(after.peer_device.is_none());
+    assert_ne!(after.pair_id, before.pair_id);
+    assert_ne!(after.secret, before.secret);
+    assert_ne!(after.cert, before.cert);
+    assert_eq!(serde_json::to_value(&after.shares).unwrap(), old_shares);
+    assert_eq!(fs::read(files.join("personal.txt")).unwrap(), b"keep");
+    assert_eq!(fs::read(files.join(".rowdignore")).unwrap(), b"*.tmp\n");
+    assert_eq!(
+        fs::read(files.join(".rowd/recovery/version")).unwrap(),
+        b"keep"
+    );
+
+    let mut rejected = server(&home, &invite, true);
+    let old_invitation = Invitation::decode(&fs::read_to_string(&invite).unwrap()).unwrap();
+    assert!(rowd_core::managed::client_round(
+        &old_invitation,
+        &random_id().unwrap(),
+        &mut LocalDevice::open(&phone_a).unwrap(),
+    )
+    .is_err());
+    assert!(!rejected.0.wait().unwrap().success());
+
+    let new_invite = directory.path().join("new-invite.txt");
+    app.export_invitation(&new_invite).unwrap();
+    round(&home, &phone_b, &new_invite);
+    let paired_b = rowd_app::DeviceConfig::load(&home).unwrap();
+    assert!(paired_b.peer_device.is_some());
+    assert_ne!(paired_b.peer_device, before.peer_device);
+    assert_eq!(serde_json::to_value(&paired_b.shares).unwrap(), old_shares);
+    round(&home, &phone_b, &new_invite);
+    assert_eq!(
+        rowd_app::DeviceConfig::load(&home).unwrap().peer_device,
+        paired_b.peer_device
+    );
+}
+
+#[test]
+fn phone_unlink_commits_before_notification_and_survives_lost_connection() {
+    for lose_notification in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let phone = directory.path().join("phone");
+        let invite = directory.path().join("invite.txt");
+        ok(
+            &home,
+            &[
+                "pair",
+                "--address",
+                "127.0.0.1:43821",
+                "--invite",
+                invite.to_str().unwrap(),
+            ],
+        );
+        round(&home, &phone, &invite);
+        let before = rowd_app::DeviceConfig::load(&home).unwrap();
+
+        let mut unlink_server = server(&home, &invite, true);
+        let invitation = Invitation::decode(&fs::read_to_string(&invite).unwrap()).unwrap();
+        let device_id: String =
+            serde_json::from_slice(&fs::read(phone.join(".rowd/client-id.json")).unwrap()).unwrap();
+        let mut io = rowd_core::tls::connect(&invitation).unwrap();
+        protocol::client_auth(&mut io, &invitation.pair_id, &invitation.secret, &device_id)
+            .unwrap();
+        protocol::send(&mut io, &Message::StartRound).unwrap();
+        assert!(matches!(
+            protocol::receive(&mut io).unwrap(),
+            Message::Shares { .. }
+        ));
+        protocol::send(
+            &mut io,
+            &Message::Capabilities {
+                device_id: device_id.clone(),
+                share_requests: Vec::new(),
+                cancel_intents: Vec::new(),
+                available_shares: Vec::new(),
+                requested_share_ids: Vec::new(),
+                audit: false,
+                unlink_requested: true,
+            },
+        )
+        .unwrap();
+        if lose_notification {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while rowd_app::DeviceConfig::load(&home).unwrap().pair_id == before.pair_id {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "PC did not revoke the peer"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        } else {
+            assert!(matches!(
+                protocol::receive(&mut io).unwrap(),
+                Message::DeviceUnlinked
+            ));
+        }
+        drop(io); // The PC must not roll back when the phone loses its connection.
+        let _ = unlink_server.0.wait();
+        let revoked = rowd_app::DeviceConfig::load(&home).unwrap();
+        assert_ne!(revoked.pair_id, before.pair_id);
+        assert!(revoked.peer_device.is_none());
+        let mut rejected = server(&home, &invite, true);
+        let invitation = Invitation::decode(&fs::read_to_string(&invite).unwrap()).unwrap();
+        assert!(rowd_core::managed::client_round(
+            &invitation,
+            &device_id,
+            &mut LocalDevice::open(&phone).unwrap(),
+        )
+        .is_err());
+        assert!(!rejected.0.wait().unwrap().success());
+    }
 }
 
 #[test]

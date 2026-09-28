@@ -392,10 +392,6 @@ impl rowd_core::managed::ManagedClient for AndroidStore<'_, '_, '_> {
         )?;
         Ok(())
     }
-    fn prepare_unlink(&mut self) -> Result<()> {
-        self.call("prepareUnlink", &[])?;
-        Ok(())
-    }
     fn finish_unlink(&mut self) -> Result<()> {
         self.call("confirmUnlinked", &[])?;
         Ok(())

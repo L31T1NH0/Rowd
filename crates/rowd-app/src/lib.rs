@@ -223,7 +223,7 @@ impl App {
     }
 
     pub fn revoke_device(&self) -> Result<()> {
-        revoke_device(&self.home)
+        unlink_device(&self.home)
     }
 
     pub fn connection_test(&self) -> Result<ConnectionTest> {
@@ -607,7 +607,6 @@ fn pair(home: &Path, address: &str) -> Result<DeviceConfig> {
         share_requests: vec![],
         rejected_requests: vec![],
         sync_paused: false,
-        pending_unlink: false,
         import_generation: None,
     };
     invitation(&cfg).validate()?;
@@ -636,7 +635,6 @@ fn migrate(home: &Path, folder: &Path, address: &str) -> Result<()> {
         share_requests: vec![],
         rejected_requests: vec![],
         sync_paused: false,
-        pending_unlink: false,
         import_generation: None,
     };
     cfg.put_share(
@@ -845,25 +843,12 @@ fn revoke_device_unlocked(home: &Path) -> Result<()> {
     cfg.key = hex::encode(cert.key_pair.serialize_der());
     cfg.secret = random_id()?;
     cfg.peer_device = None;
-    cfg.pending_unlink = false;
     cfg.share_requests.clear();
     cfg.rejected_requests.clear();
     cfg.save(home)
 }
 
 fn unlink_device(home: &Path) -> Result<()> {
-    let _session = session_guard(home)?;
-    update(home, |cfg| {
-        if cfg.peer_device.is_some() {
-            cfg.pending_unlink = true;
-            Ok(())
-        } else {
-            anyhow::bail!("nenhum Android conectado ainda; use revogação imediata")
-        }
-    })
-}
-
-fn revoke_device(home: &Path) -> Result<()> {
     let _session = session_guard(home)?;
     revoke_device_unlocked(home)
 }
@@ -895,7 +880,6 @@ fn reset_device_configuration(home: &Path) -> Result<()> {
         share_requests: Vec::new(),
         rejected_requests: Vec::new(),
         sync_paused: false,
-        pending_unlink: false,
         import_generation: None,
     }
     .save(home)
@@ -1532,20 +1516,22 @@ fn session(
     let cfg = DeviceConfig::load(home)?;
     let mut io = tls::accept(socket, tls::server_config(&cfg.cert, &cfg.key)?)?;
     let device = protocol::server_auth(&mut io, &cfg.pair_id, &cfg.secret)?;
-    if let Some(peer) = &cfg.peer_device {
-        ensure!(peer == &device, "another Android device is already paired");
-    } else {
-        update_runtime(home, |latest| {
-            ensure!(
-                latest
-                    .peer_device
-                    .as_ref()
-                    .is_none_or(|peer| peer == &device),
-                "another Android device is already paired"
-            );
+    {
+        let _session = session_guard(home)?;
+        let _config = config_guard(home)?;
+        let mut latest = DeviceConfig::load(home)?;
+        ensure!(latest.pair_id == cfg.pair_id, "pairing credentials revoked");
+        ensure!(
+            latest
+                .peer_device
+                .as_ref()
+                .is_none_or(|peer| peer == &device),
+            "another Android device is already paired"
+        );
+        if latest.peer_device.is_none() {
             latest.peer_device = Some(device.clone());
-            Ok(())
-        })?;
+            latest.save(home)?;
+        }
     }
     atomic_json(
         &device_runtime_path(home),
@@ -1603,6 +1589,7 @@ fn session(
                 &mut io,
                 &scan_socket,
                 &device,
+                &cfg.pair_id,
                 incremental_allowed,
                 urgent,
                 audit_events,
@@ -1649,6 +1636,7 @@ fn session_round(
     mut io: &mut (impl std::io::Read + std::io::Write),
     scan_socket: &TcpStream,
     device: &str,
+    pair_id: &str,
     incremental_allowed: bool,
     urgent: &Mutex<BTreeMap<String, bool>>,
     audit_events: &Mutex<(u64, BTreeMap<String, u64>)>,
@@ -1665,6 +1653,11 @@ fn session_round(
             .as_millis()
     ));
     let mut cfg = DeviceConfig::load(home)?;
+    ensure!(cfg.pair_id == pair_id, "pairing credentials revoked");
+    ensure!(
+        cfg.peer_device.as_deref() == Some(device),
+        "Android peer revoked"
+    );
     let result = (|| -> Result<()> {
         let mut advertised = Vec::with_capacity(cfg.shares.len());
         for share in &cfg.shares {
@@ -1705,15 +1698,10 @@ fn session_round(
             anyhow::bail!("expected Android capabilities")
         };
         ensure!(device_id == device, "Android device/capabilities mismatch");
-        if cfg.pending_unlink || unlink_requested {
-            protocol::send(&mut io, &Message::DeviceUnlinked)?;
-            ensure!(
-                matches!(protocol::receive(&mut io)?, Message::UnlinkAck),
-                "unlink acknowledgement missing"
-            );
+        if unlink_requested {
             revoke_device_unlocked(home)?;
-            protocol::send(&mut io, &Message::UnlinkComplete)?;
             event("Android desvinculado; uma nova identidade de pareamento foi criada".into());
+            protocol::send(&mut io, &Message::DeviceUnlinked)?;
             return Ok(());
         }
 

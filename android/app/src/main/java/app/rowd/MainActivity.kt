@@ -67,9 +67,11 @@ class MainActivity : AppCompatActivity() {
                 .setMessage("${invite.getString("address")}\n\nCompare este SHA-256 com o exibido pelo PC:\n$fingerprint\n\nImporte apenas convites gerados por você.")
                 .setNegativeButton("Cancelar", null).setPositiveButton("Conectar") { _, _ -> safely {
                     check(!SyncService.busy.get()) { "Aguarde a operação atual terminar para trocar o vínculo." }
-                    prefs.edit().putString("invitation", invite.getString("invitation"))
+                    check(prefs.edit().putString("invitation", invite.getString("invitation"))
                         .putString("peerAddress", invite.getString("address"))
-                        .remove("unlinkRequested").apply()
+                        .remove("unlinkRequested").remove("unlinkPrepared").commit()) {
+                        "Não foi possível salvar o novo convite."
+                    }
                     SyncService.wake()
                     SyncService.publish(RowdStatus.Kind.Ready, "Pronto para sincronizar", "Toque em Sincronizar agora."); refresh()
                 } }.show()

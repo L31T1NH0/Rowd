@@ -481,20 +481,7 @@ class FolderAccess(private val context: Context) {
     }
 
     fun unlinkRequested(): String = context.getSharedPreferences("rowd", Context.MODE_PRIVATE)
-        .let { (it.getBoolean("unlinkRequested", false) || it.getBoolean("unlinkPrepared", false)).toString() }
-
-    fun prepareUnlink(): String = synchronized(stateLock) {
-        val shareState = File(context.filesDir, "shares")
-        if (shareState.exists()) {
-            val archive = File(context.filesDir, "state-archives").apply { mkdirs() }
-            check(shareState.renameTo(File(archive, "shares-before-unlink-${System.currentTimeMillis()}"))) {
-                "Não foi possível preservar o estado anterior dos Shares."
-            }
-        }
-        check(context.getSharedPreferences("rowd", Context.MODE_PRIVATE).edit()
-            .putBoolean("unlinkPrepared", true).commit()) { "Não foi possível registrar a preparação da desvinculação." }
-        "ok"
-    }
+        .getBoolean("unlinkRequested", false).toString()
 
     fun confirmUnlinked(): String = synchronized(stateLock) {
         val oldUris = treeUris().map(Uri::toString).toSet()

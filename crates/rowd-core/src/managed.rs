@@ -35,7 +35,6 @@ pub trait ManagedClient: Store {
         rejected: &[String],
         cancelled: &[String],
     ) -> Result<()>;
-    fn prepare_unlink(&mut self) -> Result<()>;
     fn finish_unlink(&mut self) -> Result<()>;
 }
 impl<S: Store> Store for &mut S {
@@ -258,12 +257,6 @@ pub fn client_round_on_excluding(
                     cancelled,
                 } => (accepted, rejected, cancelled),
                 Message::DeviceUnlinked => {
-                    store.prepare_unlink()?;
-                    protocol::send(io, &Message::UnlinkAck)?;
-                    ensure!(
-                        matches!(protocol::receive(io)?, Message::UnlinkComplete),
-                        "unlink confirmation missing"
-                    );
                     store.finish_unlink()?;
                     return Ok(None);
                 }
@@ -482,9 +475,6 @@ impl ManagedClient for LocalDevice {
             }
         }
         self.active = Some(LocalStore::open_with_policy(&path, &policy)?);
-        Ok(())
-    }
-    fn prepare_unlink(&mut self) -> Result<()> {
         Ok(())
     }
     fn finish_unlink(&mut self) -> Result<()> {

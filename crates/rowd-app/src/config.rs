@@ -13,7 +13,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const CURRENT_DEVICE_VERSION: u32 = 8;
+pub const CURRENT_DEVICE_VERSION: u32 = 9;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceConfig {
@@ -33,8 +33,6 @@ pub struct DeviceConfig {
     pub rejected_requests: Vec<ShareRequest>,
     #[serde(default)]
     pub sync_paused: bool,
-    #[serde(default)]
-    pub pending_unlink: bool,
     #[serde(default)]
     pub import_generation: Option<String>,
 }
@@ -215,7 +213,7 @@ impl DeviceConfig {
         }
         let mut config: Self = serde_json::from_value(raw)?;
         match config.version {
-            CURRENT_DEVICE_VERSION | 2..=7 => {
+            CURRENT_DEVICE_VERSION | 2..=8 => {
                 let previous_version = config.version;
                 let mut changed = requests_migrated;
                 for share in &mut config.shares {
@@ -403,9 +401,27 @@ mod tests {
             share_requests: Vec::new(),
             rejected_requests: Vec::new(),
             sync_paused: false,
-            pending_unlink: false,
             import_generation: None,
         }
+    }
+
+    #[test]
+    fn migration_discards_pending_unlink_without_revoking_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        fs::create_dir_all(home.join(".rowd")).unwrap();
+        let mut old = serde_json::to_value(config()).unwrap();
+        old["version"] = 8.into();
+        old["peer_device"] = "phone-a".into();
+        old["pending_unlink"] = true.into();
+        atomic_json(&home.join(".rowd/device.json"), &old).unwrap();
+
+        let migrated = DeviceConfig::load(home).unwrap();
+        assert_eq!(migrated.version, CURRENT_DEVICE_VERSION);
+        assert_eq!(migrated.peer_device.as_deref(), Some("phone-a"));
+        let saved: serde_json::Value =
+            serde_json::from_reader(File::open(home.join(".rowd/device.json")).unwrap()).unwrap();
+        assert!(saved.get("pending_unlink").is_none());
     }
 
     #[test]

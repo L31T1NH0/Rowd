@@ -180,6 +180,10 @@ class SyncService : Service() {
                         android.util.Log.i("RowdLatency", "round_started_at=$startedAt focus=${if (full) "audit" else focus} activation_ms=$activationMs")
                         val result = JSONObject(NativeBridge.sync(invitation, device, focus, access))
                         if (result.has("error")) error(result.getString("error"))
+                        if (!prefs.contains("invitation")) {
+                            publish(RowdStatus.Kind.Idle, "Celular desvinculado", "Pareie novamente para continuar.")
+                            break
+                        }
                         result.optJSONObject("metrics")?.put("activation_ms", activationMs)
                         val roundDeferred = result.optBoolean("round_deferred")
                         val completedAt = android.os.SystemClock.elapsedRealtime()

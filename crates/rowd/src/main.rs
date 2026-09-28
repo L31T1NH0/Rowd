@@ -262,14 +262,11 @@ fn run() -> Result<()> {
             DeviceCommand::Pause => app.set_sync_paused(true)?,
             DeviceCommand::Resume => app.set_sync_paused(false)?,
             DeviceCommand::Unlink { confirm } => {
-                ensure!(confirm, "use --confirm to request bilateral unlink");
+                ensure!(confirm, "use --confirm to revoke the Android pairing");
                 app.unlink_device()?;
             }
             DeviceCommand::Revoke { confirm } => {
-                ensure!(
-                    confirm,
-                    "use --confirm to revoke immediately without Android acknowledgement"
-                );
+                ensure!(confirm, "use --confirm to revoke the Android pairing");
                 app.revoke_device()?;
             }
         },
