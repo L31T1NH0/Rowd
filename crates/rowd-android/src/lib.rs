@@ -33,7 +33,6 @@ static PAIRING_CONNECTION: OnceLock<
         )>,
     >,
 > = OnceLock::new();
-static PAIRING_SESSION: OnceLock<String> = OnceLock::new();
 
 fn pairing_connection() -> &'static Mutex<
     Option<(
@@ -77,9 +76,11 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollPairOffer(
     mut env: JNIEnv,
     _class: JObject,
     name: JString,
+    session: JString,
 ) -> jstring {
     let result = (|| -> Result<serde_json::Value> {
         let name: String = env.get_string(&name)?.into();
+        let session_id: String = env.get_string(&session)?.into();
         let socket =
             std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, rowd_core::pairing::PORT))?;
         socket.set_read_timeout(Some(Duration::from_millis(900)))?;
@@ -94,11 +95,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollPairOffer(
                 } => {
                     let reply = rowd_core::pairing::Packet::Announce {
                         nonce,
-                        session_id: PAIRING_SESSION
-                            .get_or_init(|| {
-                                rowd_core::random_id().unwrap_or_else(|_| "0".repeat(64))
-                            })
-                            .clone(),
+                        session_id,
                         device_name: name,
                         device_type: rowd_core::pairing::DeviceType::Android,
                         pair_id: None,
@@ -184,6 +181,55 @@ fn clear_connection(connection: &mut Option<(String, rowd_core::tls::ClientStrea
 
 fn connection() -> &'static Mutex<Option<(String, rowd_core::tls::ClientStream)>> {
     CONNECTION.get_or_init(|| Mutex::new(None))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_clearPersistentConnection(
+    env: JNIEnv,
+    class: JObject,
+) {
+    Java_app_rowd_NativeBridge_networkChanged(env, class);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_revokeRemotePairing(
+    mut env: JNIEnv,
+    _class: JObject,
+    invitation: JString,
+    device_id: JString,
+) -> jstring {
+    let result = (|| -> Result<serde_json::Value> {
+        let invite = Invitation::decode(&String::from(env.get_string(&invitation)?))?;
+        let device: String = env.get_string(&device_id)?.into();
+        let mut resolver = rowd_core::discovery::EndpointResolver::default();
+        let (mut io, _) = resolver.connect(&invite, &device, 0, |fingerprint| {
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            rowd_core::discovery::collect(
+                &socket,
+                (rowd_core::discovery::GROUP, rowd_core::discovery::PORT).into(),
+                fingerprint,
+            )
+        })?;
+        io.sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+        match rowd_core::protocol::receive(&mut io)? {
+            rowd_core::protocol::Message::Shares { .. } => {}
+            _ => anyhow::bail!("expected PC Shares"),
+        }
+        rowd_core::protocol::send(
+            &mut io,
+            &rowd_core::protocol::Message::Capabilities {
+                device_id: device,
+                share_requests: Vec::new(),
+                cancel_intents: Vec::new(),
+                available_shares: Vec::new(),
+                requested_share_ids: Vec::new(),
+                audit: false,
+                unlink_requested: true,
+            },
+        )?;
+        Ok(serde_json::Value::Null)
+    })();
+    pairing_result(env, result)
 }
 
 #[no_mangle]
@@ -571,7 +617,6 @@ impl rowd_core::managed::ManagedClient for AndroidStore<'_, '_, '_> {
         Ok(())
     }
     fn finish_unlink(&mut self) -> Result<()> {
-        self.call("confirmUnlinked", &[])?;
         Ok(())
     }
 }

@@ -501,22 +501,9 @@ class FolderAccess(private val context: Context) {
         .getBoolean("unlinkRequested", false).toString()
 
     fun confirmUnlinked(): String = synchronized(stateLock) {
-        val oldUris = treeUris().map(Uri::toString).toSet()
-        val shareState = File(context.filesDir, "shares")
-        if (shareState.exists()) {
-            val archive = File(context.filesDir, "state-archives").apply { mkdirs() }
-            check(shareState.renameTo(File(archive, "shares-before-unlink-${System.currentTimeMillis()}"))) {
-                "Não foi possível preservar o estado anterior dos Shares."
-            }
-        }
-        definitions.delete()
-        shareBindings.delete()
-        legacyTrees.delete()
-        requests.delete()
-        requestResults.delete()
-        releaseUnusedGrants(oldUris)
         check(context.getSharedPreferences("rowd", Context.MODE_PRIVATE).edit()
-            .remove("invitation").remove("peerAddress").remove("unlinkRequested").remove("unlinkPrepared").commit()) {
+            .remove("invitation").remove("peerAddress").remove("unlinkRequested").remove("unlinkPrepared")
+            .remove("lastStatus").remove("lastDetail").remove("lastStatusKind").commit()) {
             "Não foi possível concluir a desvinculação local."
         }
         active = null
@@ -530,6 +517,24 @@ class FolderAccess(private val context: Context) {
             scheduledDeepScanShares.clear()
         }
         "ok"
+    }
+
+    fun resetConfiguration(): String = synchronized(stateLock) {
+        val oldUris = treeUris().map(Uri::toString).toSet()
+        val shareState = File(context.filesDir, "shares")
+        if (shareState.exists()) {
+            val archive = File(context.filesDir, "state-archives").apply { mkdirs() }
+            check(shareState.renameTo(File(archive, "shares-before-reset-${System.currentTimeMillis()}"))) {
+                "Não foi possível preservar o estado anterior dos Shares."
+            }
+        }
+        definitions.delete()
+        shareBindings.delete()
+        legacyTrees.delete()
+        requests.delete()
+        requestResults.delete()
+        releaseUnusedGrants(oldUris)
+        confirmUnlinked()
     }
 
     fun configureShares(json: String): String = synchronized(stateLock) {

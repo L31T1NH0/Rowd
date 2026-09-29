@@ -49,6 +49,7 @@ pub struct PendingPairRequest {
 #[derive(Default)]
 struct PairingState {
     until: Option<Instant>,
+    tcp_port: Option<u16>,
     pending: Option<PendingPairRequest>,
     decision: Option<bool>,
 }
@@ -94,6 +95,7 @@ impl App {
         ensure!(self.config()?.peer_device.is_none(), "celular já vinculado");
         let (lock, _) = pairing_state();
         lock.lock().unwrap().until = Some(Instant::now() + Duration::from_secs(120));
+        eprintln!("Pairing mode iniciado");
         Ok(())
     }
 
@@ -101,6 +103,7 @@ impl App {
         let (lock, wake) = pairing_state();
         let mut state = lock.lock().unwrap();
         state.until = None;
+        state.tcp_port = None;
         state.decision = Some(false);
         wake.notify_all();
     }
@@ -169,13 +172,19 @@ impl App {
         );
         let cfg = self.config()?;
         ensure!(cfg.peer_device.is_none(), "celular já vinculado");
+        let tcp_port = pairing_state()
+            .0
+            .lock()
+            .unwrap()
+            .tcp_port
+            .context("pairing listener unavailable")?;
         let packet = pairing::Packet::Offer {
             session_id: random_id()?,
             device_name: pairing_device_name(),
             pair_id: cfg.pair_id,
             fingerprint: hex::encode(discovery::fingerprint(&cfg.cert)?),
             cert_der: cfg.cert,
-            tcp_port: cfg.listen.parse::<SocketAddr>()?.port(),
+            tcp_port,
         };
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         let bytes = pairing::encode(&packet)?;
@@ -2367,6 +2376,9 @@ fn pairing_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()
         let session_id = random_id()?;
         socket.set_read_timeout(Some(Duration::from_millis(250)))?;
         let mut joined = BTreeSet::new();
+        let mut join_errors = BTreeSet::new();
+        let mut logged_discover = false;
+        let mut logged_announce = false;
         let mut refreshed = Instant::now() - Duration::from_secs(2);
         let mut buf = [0u8; 4097];
         while pairing_advertising(&pairing_state().0.lock().unwrap())
@@ -2376,7 +2388,14 @@ fn pairing_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()
                 let addresses = local_ipv4_addresses().unwrap_or_default();
                 let (add, remove) = discovery::multicast_membership_changes(&joined, addresses);
                 joined.extend(discovery::join_multicast_interfaces(add, |address| {
-                    socket.join_multicast_v4(&pairing::GROUP, address)
+                    socket
+                        .join_multicast_v4(&pairing::GROUP, address)
+                        .map_err(|error| {
+                            if join_errors.insert(*address) {
+                                eprintln!("Pairing discovery join {address}: {error}");
+                            }
+                            error
+                        })
                 }));
                 for address in remove {
                     let _ = socket.leave_multicast_v4(&pairing::GROUP, &address);
@@ -2399,6 +2418,10 @@ fn pairing_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()
                     if cfg.peer_device.is_some() {
                         continue;
                     }
+                    if !logged_discover {
+                        eprintln!("Pairing Discover recebido de {source}");
+                        logged_discover = true;
+                    }
                     let packet = pairing::Packet::Announce {
                         nonce,
                         session_id: session_id.clone(),
@@ -2409,7 +2432,12 @@ fn pairing_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()
                         cert_der: Some(cfg.cert),
                         tcp_port: Some(tcp_port),
                     };
-                    let _ = socket.send_to(&pairing::encode(&packet)?, source);
+                    if socket.send_to(&pairing::encode(&packet)?, source).is_ok() {
+                        if !logged_announce {
+                            eprintln!("Pairing Announce enviado para {source}");
+                            logged_announce = true;
+                        }
+                    }
                 }
                 Err(error)
                     if matches!(
@@ -2493,6 +2521,7 @@ fn serve(
     listener.set_nonblocking(true)?;
     event(format!("Rowd ouvindo em {}", listener.local_addr()?));
     let tcp_port = listener.local_addr()?.port();
+    pairing_state().0.lock().unwrap().tcp_port = Some(tcp_port);
     let discovery_stop = stop.clone();
     let discovery_home = home.to_path_buf();
     let responder = std::thread::spawn(move || {
@@ -2517,9 +2546,17 @@ fn serve(
     let pairing_stop = stop.clone();
     let pairing_home = home.to_path_buf();
     let pairing_responder = std::thread::spawn(move || {
+        let mut last_error = None;
         while !pairing_stop.load(Ordering::Relaxed) {
-            if let Err(error) = pairing_responder(&pairing_home, tcp_port, &pairing_stop) {
-                eprintln!("Pairing discovery indisponível: {error:#}");
+            match pairing_responder(&pairing_home, tcp_port, &pairing_stop) {
+                Ok(()) => last_error = None,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("Pairing discovery bind/receive indisponível: {message}");
+                        last_error = Some(message);
+                    }
+                }
             }
             if !pairing_stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(250));
@@ -2789,6 +2826,7 @@ fn serve(
     stop.store(true, Ordering::Relaxed);
     let _ = responder.join();
     let _ = pairing_responder.join();
+    App::new(home).stop_pairing_mode();
     result
 }
 
@@ -2819,6 +2857,60 @@ fn pairing_payload(cfg: &DeviceConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_discover_and_offer_use_runtime_port() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::new(directory.path());
+        app.pair("127.0.0.1:43821").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let runtime_port = listener.local_addr().unwrap().port();
+        pairing_state().0.lock().unwrap().tcp_port = Some(runtime_port);
+        app.start_pairing_mode().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let home = directory.path().to_path_buf();
+        let worker =
+            std::thread::spawn(move || pairing_responder(&home, runtime_port, &worker_stop));
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let nonce = random_id().unwrap();
+        let discover = pairing::Packet::Discover {
+            nonce: nonce.clone(),
+            device_type: pairing::DeviceType::Pc,
+        };
+        socket
+            .send_to(
+                &pairing::encode(&discover).unwrap(),
+                ("127.0.0.1", pairing::PORT),
+            )
+            .unwrap();
+        let mut buf = [0u8; 4097];
+        let (len, _) = socket.recv_from(&mut buf).unwrap();
+        assert!(
+            matches!(pairing::decode(&buf[..len]).unwrap(), pairing::Packet::Announce { nonce: echoed, tcp_port: Some(port), .. } if echoed == nonce && port == runtime_port)
+        );
+        let phone = pairing::Peer {
+            session_id: random_id().unwrap(),
+            device_name: "Phone".into(),
+            device_type: pairing::DeviceType::Android,
+            pair_id: None,
+            fingerprint: None,
+            cert_der: None,
+            endpoint: socket.local_addr().unwrap(),
+        };
+        app.offer_pairing(&phone).unwrap();
+        let (len, _) = socket.recv_from(&mut buf).unwrap();
+        assert!(
+            matches!(pairing::decode(&buf[..len]).unwrap(), pairing::Packet::Offer { tcp_port, .. } if tcp_port == runtime_port)
+        );
+        app.stop_pairing_mode();
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap().unwrap();
+    }
 
     fn test_session(home: PathBuf) -> (SocketAddr, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

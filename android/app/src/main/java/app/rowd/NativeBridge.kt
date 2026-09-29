@@ -7,7 +7,9 @@ object NativeBridge {
     external fun networkChanged()
     external fun previewInvitation(invitation: String, address: String): String
     external fun discoverPairing(): String
-    external fun pollPairOffer(deviceName: String): String
+    external fun pollPairOffer(deviceName: String, sessionId: String): String
+    external fun revokeRemotePairing(invitation: String, deviceId: String): String
+    external fun clearPersistentConnection()
     external fun beginPairing(peer: String, deviceId: String, deviceName: String): String
     external fun finishPairing(): String
     external fun cancel()

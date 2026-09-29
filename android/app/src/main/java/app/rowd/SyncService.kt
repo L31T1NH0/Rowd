@@ -172,8 +172,6 @@ class SyncService : Service() {
                             val preview = JSONObject(NativeBridge.previewInvitation(invitation, ""))
                             check(!preview.has("error")) { preview.optString("error", "Convite inválido.") }
                             invitation = preview.getString("invitation")
-                            prefs.edit().putString("invitation", invitation)
-                                .remove("peerAddress").apply()
                         }
                         val device = prefs.getString("deviceId", null) ?: error("Abra o Rowd novamente para criar a identidade do aparelho.")
                         val now = android.os.SystemClock.elapsedRealtime()
@@ -203,6 +201,7 @@ class SyncService : Service() {
                         }
                         access.setFocusedScan(focus.isNotEmpty())
                         access.setAuditRound(full)
+                        if (!prefs.contains("invitation")) break
                         publish(RowdStatus.Kind.Working,
                             if (full) "Verificando arquivos" else "Sincronizando alterações",
                             if (full) "Auditoria periódica dos Shares." else "Verificando os Shares alterados.")
@@ -265,7 +264,8 @@ class SyncService : Service() {
                         publish(if (roundDeferred) RowdStatus.Kind.Working else if (missing > 0 || conflicts > 0) RowdStatus.Kind.NeedsAttention else RowdStatus.Kind.Ready, title, detail)
                     } catch (error: Exception) {
                         failures++
-                        if (!active.get()) publish(RowdStatus.Kind.Paused, "Sincronização pausada", "A operação foi cancelada em um ponto seguro.")
+                        if (!prefs.contains("invitation")) publish(RowdStatus.Kind.Idle, "Celular desvinculado", "Conecte ao computador para parear novamente.")
+                        else if (!active.get()) publish(RowdStatus.Kind.Paused, "Sincronização pausada", "A operação foi cancelada em um ponto seguro.")
                         else publish(RowdStatus.Kind.Error,
                             "Aguardando conexão ou correção",
                             error.message ?: "Confira a pasta e o endereço do PC.")
@@ -302,9 +302,11 @@ class SyncService : Service() {
                     }
                 } while (active.get())
             } catch (_: InterruptedException) {
-                publish(RowdStatus.Kind.Paused, "Sincronização pausada", state.detail)
+                if (!prefs.contains("invitation")) publish(RowdStatus.Kind.Idle, "Celular desvinculado", "Conecte ao computador para parear novamente.")
+                else publish(RowdStatus.Kind.Paused, "Sincronização pausada", state.detail)
             } catch (error: Exception) {
-                publish(RowdStatus.Kind.Error, "Não foi possível iniciar a sincronização",
+                if (!prefs.contains("invitation")) publish(RowdStatus.Kind.Idle, "Celular desvinculado", "Conecte ao computador para parear novamente.")
+                else publish(RowdStatus.Kind.Error, "Não foi possível iniciar a sincronização",
                     error.message ?: "Confira o armazenamento do aplicativo.")
             } finally {
                 observers.values.forEach(contentResolver::unregisterContentObserver)

@@ -660,7 +660,6 @@ impl Ui {
                     KeyCode::Up => *index = index.saturating_sub(1),
                     KeyCode::Down => *index = (*index + 1).min(1),
                     KeyCode::Enter if *index == 0 => {
-                        app.start_pairing_mode()?;
                         self.modal = Some(Modal::PairDiscovery(Vec::new(), 0));
                         self.last_pair_search = Instant::now() - Duration::from_secs(2);
                     }
@@ -875,7 +874,7 @@ impl Ui {
                 }
             }
             UiAction::Pair => {
-                app.pair("")?;
+                app.start_pairing_mode()?;
                 self.modal = Some(Modal::PairMenu(0));
             },
             UiAction::TestConnection => {
@@ -2162,7 +2161,7 @@ mod tests {
         assert_eq!(ui.tab, Tab::Device);
         ui.begin_action(UiAction::Pair, &app).unwrap();
         assert!(matches!(ui.modal, Some(Modal::PairMenu(0))));
-        assert!(!app.pairing_mode_active());
+        assert!(app.pairing_mode_active());
         press(&mut ui, &app, KeyCode::Enter);
         assert!(matches!(ui.modal, Some(Modal::PairDiscovery(_, _))));
         assert!(app.pairing_mode_active());
@@ -2172,7 +2171,7 @@ mod tests {
         press(&mut ui, &app, KeyCode::Down);
         press(&mut ui, &app, KeyCode::Enter);
         assert!(matches!(ui.modal, Some(Modal::Qr(_))));
-        assert!(!app.pairing_mode_active());
+        assert!(app.pairing_mode_active());
         press(&mut ui, &app, KeyCode::Esc);
     }
 

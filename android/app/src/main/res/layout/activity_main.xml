@@ -8,9 +8,7 @@
         <LinearLayout android:id="@+id/onboarding" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical">
         <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="24dp" android:text="Conectar ao computador" android:textAppearance="?attr/textAppearanceTitleMedium" android:accessibilityHeading="true" />
         <TextView android:id="@+id/peerLabel" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="Ainda não pareado" android:textAppearance="?attr/textAppearanceBodyMedium" />
-        <com.google.android.material.button.MaterialButton android:id="@+id/findNetwork" android:layout_width="match_parent" android:layout_height="wrap_content" android:minHeight="48dp" android:layout_marginTop="8dp" android:text="Encontrar na rede" />
-        <com.google.android.material.button.MaterialButton android:id="@+id/scanQr" android:layout_width="match_parent" android:layout_height="wrap_content" android:minHeight="48dp" android:layout_marginTop="8dp" android:text="Escanear QR" />
-        <com.google.android.material.button.MaterialButton android:id="@+id/importInvite" style="@style/Widget.Material3.Button.OutlinedButton" android:layout_width="match_parent" android:layout_height="wrap_content" android:minHeight="48dp" android:text="Importar convite" />
+        <com.google.android.material.button.MaterialButton android:id="@+id/connectComputer" android:layout_width="match_parent" android:layout_height="wrap_content" android:minHeight="48dp" android:layout_marginTop="8dp" android:text="Conectar ao computador" />
         </LinearLayout>
         <LinearLayout android:id="@+id/operations" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical">
         <com.google.android.material.button.MaterialButton android:id="@+id/changeAddress" style="@style/Widget.Material3.Button.TextButton" android:layout_width="match_parent" android:layout_height="wrap_content" android:minHeight="48dp" android:text="Alterar endereço do PC" />

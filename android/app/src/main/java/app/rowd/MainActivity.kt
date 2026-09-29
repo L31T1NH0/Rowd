@@ -108,6 +108,9 @@ class MainActivity : AppCompatActivity() {
     private fun findOnNetwork() {
         check(!prefs.contains("invitation")) { "Desvincule o aparelho antes de criar outro vínculo." }
         val active = AtomicBoolean(true)
+        val sessionId = MessageDigest.getInstance("SHA-256")
+            .digest(UUID.randomUUID().toString().toByteArray())
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
         pairingDiscovery = active
         val deadline = SystemClock.elapsedRealtime() + 120_000
         val access = FolderAccess(this)
@@ -155,7 +158,7 @@ class MainActivity : AppCompatActivity() {
             val deviceName = (Build.MODEL ?: "Android").filter { !Character.isISOControl(it) }.take(20).ifEmpty { "Android" }
             while (active.get() && SystemClock.elapsedRealtime() < deadline) {
                 try {
-                    val offer = NativeBridge.pollPairOffer(deviceName)
+                    val offer = NativeBridge.pollPairOffer(deviceName, sessionId)
                     if (offer != "null") {
                         val peer = nativeObject(offer)
                         active.set(false)
@@ -213,9 +216,16 @@ class MainActivity : AppCompatActivity() {
             view.setPadding(bars.left, bars.top, bars.right, bars.bottom); insets
         }
         if (!SyncService.busy.get()) SyncService.restore(this)
-        ui.scanQr.setOnClickListener { qrScanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Escaneie o QR no PC").setBeepEnabled(false).setOrientationLocked(false)) }
-        ui.findNetwork.setOnClickListener { safely { findOnNetwork() } }
-        ui.importInvite.setOnClickListener { invitePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) }
+        ui.connectComputer.setOnClickListener {
+            MaterialAlertDialogBuilder(this).setTitle("Conectar ao computador")
+                .setItems(arrayOf("Encontrar na rede", "Escanear QR", "Importar convite")) { _, choice ->
+                    when (choice) {
+                        0 -> safely { findOnNetwork() }
+                        1 -> qrScanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Escaneie o QR no PC").setBeepEnabled(false).setOrientationLocked(false))
+                        2 -> invitePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream"))
+                    }
+                }.show()
+        }
         ui.requestShare.setOnClickListener { shareFolderPicker.launch(null) }
         ui.manageRequests.setOnClickListener { manageRequests() }
         ui.bindShare.setOnClickListener { chooseUnassignedShare() }
@@ -277,13 +287,26 @@ class MainActivity : AppCompatActivity() {
         }
         ui.unlinkDevice.setOnClickListener {
             MaterialAlertDialogBuilder(this).setTitle("Desvincular este aparelho?")
-                .setMessage("O PC revogará a credencial atual. Arquivos e versões de recovery serão preservados.")
+                .setMessage("O vínculo local será removido agora. A revogação no PC será tentada em seguida. Arquivos, Shares, pastas e recovery serão preservados.")
                 .setNegativeButton("Cancelar", null).setPositiveButton("Desvincular") { _, _ -> safely {
-                    FolderAccess(this).requestUnlink()
-                    SyncService.wake()
-                    SyncService.publish(RowdStatus.Kind.Working, "Desvinculação pendente", "Conectando ao PC para revogar a credencial.")
-                    if (!SyncService.busy.get()) startSync()
+                    val invitation = prefs.getString("invitation", null) ?: return@safely
+                    val deviceId = prefs.getString("deviceId", null) ?: return@safely
+                    NativeBridge.cancel()
+                    stopService(Intent(this, SyncService::class.java).setAction(SyncService.STOP))
+                    FolderAccess(this).confirmUnlinked()
+                    NativeBridge.clearPersistentConnection()
+                    SyncService.publish(RowdStatus.Kind.Idle, "Celular desvinculado", "Conecte ao computador para parear novamente.")
                     refresh()
+                    Thread {
+                        val access = FolderAccess(this)
+                        try {
+                            access.acquireMulticast()
+                            val result = JSONObject(NativeBridge.revokeRemotePairing(invitation, deviceId))
+                            if (result.has("error")) android.util.Log.i("RowdUnlink", "Revogação remota não concluída: ${result.optString("error")}")
+                        } catch (error: Exception) {
+                            android.util.Log.i("RowdUnlink", "Revogação remota não concluída", error)
+                        } finally { access.releaseMulticast() }
+                    }.start()
                 } }.show()
         }
         ui.resetApp.setOnClickListener { showResetOptions() }
@@ -414,7 +437,7 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("Cancelar", null).setPositiveButton("Confirmar") { _, _ -> safely {
                 check(!SyncService.busy.get()) { "Aguarde a rodada atual terminar." }
                 stopService(Intent(this, SyncService::class.java).setAction(SyncService.STOP))
-                FolderAccess(this).confirmUnlinked()
+                FolderAccess(this).resetConfiguration()
                 if (eraseAll) filesDir.listFiles()?.forEach { it.deleteRecursively() }
                 SyncService.publish(RowdStatus.Kind.Idle, "Rowd redefinido", "Pareie novamente para continuar.")
                 refresh()
@@ -425,14 +448,12 @@ class MainActivity : AppCompatActivity() {
         val paired = prefs.contains("invitation")
         ui.onboarding.visibility = if (paired) View.GONE else View.VISIBLE
         ui.operations.visibility = if (paired) View.VISIBLE else View.GONE
-        ui.findNetwork.visibility = if (paired) View.GONE else View.VISIBLE
         ui.status.text = SyncService.state.title; ui.detail.text = SyncService.state.detail
         ui.progress.visibility = if (busy) View.VISIBLE else View.GONE
         ui.peerLabel.text = if (paired) prefs.getString("peerAddress", null)
             ?: runCatching { previewInvitation(prefs.getString("invitation", "")!!).getString("address") }.getOrDefault("Convite inválido")
             else "Ainda não pareado"
-        ui.importInvite.isEnabled = !busy
-        ui.scanQr.isEnabled = !busy
+        ui.connectComputer.isEnabled = !busy
         ui.manageRecovery.isEnabled = !busy
         ui.requestShare.isEnabled = true
         val local = runCatching {
