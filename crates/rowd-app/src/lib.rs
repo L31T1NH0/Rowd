@@ -21,7 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{
@@ -567,8 +567,8 @@ fn device_status_from_config(home: &Path, config: &DeviceConfig) -> Result<Devic
     })
 }
 
-/// Keep the server wildcard bind private; invitations must contain an address
-/// reachable from the Android device on the local network.
+/// Keep the server wildcard bind private; use an explicit discovery-only
+/// address when no local LAN IPv4 address is available.
 fn published_address(address: &str) -> Result<String> {
     let socket: std::net::SocketAddr = address
         .parse()
@@ -576,16 +576,31 @@ fn published_address(address: &str) -> Result<String> {
     if !socket.ip().is_unspecified() {
         return Ok(address.to_owned());
     }
-    let probe = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
-    let ip = match probe
-        .connect((std::net::Ipv4Addr::new(8, 8, 8, 8), 80))
-        .and_then(|_| probe.local_addr())
-        .map(|addr| addr.ip())
-    {
-        Ok(IpAddr::V4(ip)) if !ip.is_loopback() => ip,
-        _ => std::net::Ipv4Addr::LOCALHOST,
-    };
-    Ok(format!("{ip}:{}", socket.port()))
+    Ok(published_address_from_ipv4(
+        socket.port(),
+        local_ipv4_addresses().unwrap_or_default(),
+    ))
+}
+
+fn local_ipv4_addresses() -> Result<Vec<std::net::Ipv4Addr>> {
+    Ok(if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(address) => Some(address.ip),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect())
+}
+
+fn published_address_from_ipv4(
+    port: u16,
+    addresses: impl IntoIterator<Item = std::net::Ipv4Addr>,
+) -> String {
+    let ip = discovery::eligible_ipv4_addresses(addresses)
+        .into_iter()
+        .next()
+        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+    format!("{ip}:{port}")
 }
 
 fn pair(home: &Path, address: &str) -> Result<DeviceConfig> {
@@ -2081,6 +2096,63 @@ fn session_round(
     result
 }
 
+fn discovery_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()> {
+    let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, discovery::PORT))?;
+    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut joined = BTreeSet::new();
+    let mut next_refresh = Instant::now();
+    let mut packet = [0; 256];
+
+    while !stop.load(Ordering::Relaxed) {
+        if Instant::now() >= next_refresh {
+            match local_ipv4_addresses() {
+                Ok(addresses) => {
+                    let (to_join, to_leave) =
+                        discovery::multicast_membership_changes(&joined, addresses);
+                    let joined_now = discovery::join_multicast_interfaces(to_join, |address| {
+                        socket
+                            .join_multicast_v4(&discovery::GROUP, address)
+                            .map_err(|error| {
+                                eprintln!(
+                                    "Discovery: não foi possível associar {address}: {error}"
+                                );
+                                error
+                            })
+                    });
+                    joined.extend(joined_now);
+                    for address in to_leave {
+                        let _ = socket.leave_multicast_v4(&discovery::GROUP, &address);
+                        joined.remove(&address);
+                    }
+                }
+                Err(error) => eprintln!("Discovery: interfaces indisponíveis: {error:#}"),
+            }
+            next_refresh = Instant::now() + Duration::from_secs(1);
+        }
+
+        match socket.recv_from(&mut packet) {
+            Ok((len, peer)) => {
+                if let Ok(cfg) = DeviceConfig::load(home) {
+                    if let Ok(fingerprint) = discovery::fingerprint(&cfg.cert) {
+                        if let Ok(reply) =
+                            discovery::announce_packet(&packet[..len], &fingerprint, tcp_port)
+                        {
+                            let _ = socket.send_to(&reply, peer);
+                        }
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn serve(
     home: &Path,
     listen: Option<&str>,
@@ -2097,45 +2169,20 @@ fn serve(
     let discovery_stop = stop.clone();
     let discovery_home = home.to_path_buf();
     let responder = std::thread::spawn(move || {
+        let mut last_error = None;
         while !discovery_stop.load(Ordering::Relaxed) {
-            let result = (|| -> Result<()> {
-                let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, discovery::PORT))?;
-                socket.join_multicast_v4(&discovery::GROUP, &std::net::Ipv4Addr::UNSPECIFIED)?;
-                socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-                let until = Instant::now() + Duration::from_secs(30);
-                let mut packet = [0; 256];
-                while !discovery_stop.load(Ordering::Relaxed) && Instant::now() < until {
-                    match socket.recv_from(&mut packet) {
-                        Ok((len, peer)) => {
-                            if let Ok(cfg) = DeviceConfig::load(&discovery_home) {
-                                if let Ok(fingerprint) = discovery::fingerprint(&cfg.cert) {
-                                    if let Ok(reply) = discovery::announce_packet(
-                                        &packet[..len],
-                                        &fingerprint,
-                                        tcp_port,
-                                    ) {
-                                        let _ = socket.send_to(&reply, peer);
-                                    }
-                                }
-                            }
-                        }
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                            ) => {}
-                        Err(error) => return Err(error.into()),
+            let result = discovery_responder(&discovery_home, tcp_port, &discovery_stop);
+            match result {
+                Ok(()) => last_error = None,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("Discovery indisponível: {message}");
+                        last_error = Some(message);
                     }
                 }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                eprintln!("Discovery indisponível: {error:#}");
             }
-            for _ in 0..10 {
-                if discovery_stop.load(Ordering::Relaxed) {
-                    break;
-                }
+            if !discovery_stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -2456,12 +2503,31 @@ mod tests {
         app.pair("").unwrap();
         let first = DeviceConfig::load(directory.path()).unwrap();
         assert!(!first.address.is_empty());
+        assert_ne!(first.address, "127.0.0.1:43821");
         app.pair("").unwrap();
         let second = DeviceConfig::load(directory.path()).unwrap();
         assert_eq!(first.address, second.address);
         assert_eq!(first.pair_id, second.pair_id);
         assert_eq!(first.secret, second.secret);
         assert_eq!(first.cert, second.cert);
+    }
+
+    #[test]
+    fn automatic_address_without_lan_is_explicitly_unavailable() {
+        assert_eq!(
+            published_address_from_ipv4(43821, [std::net::Ipv4Addr::LOCALHOST]),
+            "0.0.0.0:43821"
+        );
+        assert_eq!(
+            published_address_from_ipv4(
+                43821,
+                [
+                    "192.168.1.20".parse().unwrap(),
+                    std::net::Ipv4Addr::LOCALHOST
+                ]
+            ),
+            "192.168.1.20:43821"
+        );
     }
 
     #[test]

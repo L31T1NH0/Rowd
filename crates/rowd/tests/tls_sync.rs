@@ -5,7 +5,15 @@ use rowd_core::{
     sync::{self, State},
     tls,
 };
-use std::{fs, net::TcpListener};
+use std::{
+    fs,
+    net::TcpListener,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 fn invitation(address: String) -> (Invitation, String) {
     let cert = rcgen::generate_simple_self_signed(vec!["rowd.local".into()]).unwrap();
@@ -146,6 +154,69 @@ fn resolver_reuses_authenticated_endpoint_until_network_changes() {
             .connect(&invite, &device, 1, |_| Ok(vec![candidate]))
             .unwrap();
     });
+}
+
+#[test]
+fn resolver_drops_cached_endpoint_when_invitation_identity_changes() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_address = first_listener.local_addr().unwrap();
+    let second_address = second_listener.local_addr().unwrap();
+    let (first_invite, first_key) = invitation(first_address.to_string());
+    let (second_invite, second_key) = invitation(second_address.to_string());
+    let first_config = tls::server_config(&first_invite.cert_der, &first_key).unwrap();
+    let second_config = tls::server_config(&second_invite.cert_der, &second_key).unwrap();
+    let device = random_id().unwrap();
+    let first_connections = Arc::new(AtomicUsize::new(0));
+    let first_connections_for_server = first_connections.clone();
+    let first_pair_id = first_invite.pair_id.clone();
+    let first_secret = first_invite.secret.clone();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let (socket, _) = first_listener.accept().unwrap();
+            first_connections_for_server.fetch_add(1, Ordering::Relaxed);
+            let mut io = tls::accept(socket, first_config).unwrap();
+            protocol::server_auth(&mut io, &first_pair_id, &first_secret).unwrap();
+
+            first_listener.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < until {
+                match first_listener.accept() {
+                    Ok((socket, _)) => {
+                        first_connections_for_server.fetch_add(1, Ordering::Relaxed);
+                        drop(socket);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        scope.spawn(|| {
+            let (socket, _) = second_listener.accept().unwrap();
+            let mut io = tls::accept(socket, second_config).unwrap();
+            assert_eq!(
+                protocol::server_auth(&mut io, &second_invite.pair_id, &second_invite.secret)
+                    .unwrap(),
+                device
+            );
+        });
+
+        let mut resolver = rowd_core::discovery::EndpointResolver::default();
+        let (first_io, _) = resolver
+            .connect(&first_invite, &device, 7, |_| Ok(vec![first_address]))
+            .unwrap();
+        drop(first_io);
+        let (_second_io, address) = resolver
+            .connect(&second_invite, &device, 7, |_| Ok(vec![second_address]))
+            .unwrap();
+        assert_eq!(address, second_address.to_string());
+    });
+
+    assert_eq!(first_connections.load(Ordering::Relaxed), 1);
 }
 
 #[test]

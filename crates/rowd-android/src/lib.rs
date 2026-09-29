@@ -467,11 +467,10 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
         let mut connection = connection().lock().unwrap();
+        let fingerprint = invite.fingerprint()?;
         let key = format!(
-            "{}|{:?}|{}|{device}",
-            invite.pair_id,
-            rowd_core::discovery::fingerprint(&invite.cert_der)?,
-            invite.secret
+            "{}|{}|{}|{device}",
+            invite.pair_id, fingerprint, invite.secret
         );
         if connection.as_ref().is_some_and(|(current, _)| {
             current != &key
@@ -491,15 +490,19 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                     .unwrap();
                 let (io, endpoint) =
                     resolver.connect(&invite, &device, generation, |fingerprint| {
-                        store.call("acquireMulticast", &[])?;
-                        let result = (|| {
-                            let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-                            rowd_core::discovery::collect(
-                                &socket,
-                                (rowd_core::discovery::GROUP, rowd_core::discovery::PORT).into(),
-                                fingerprint,
-                            )
-                        })();
+                        let acquired = store.call("acquireMulticast", &[]);
+                        let result = match acquired {
+                            Ok(_) => (|| {
+                                let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                                rowd_core::discovery::collect(
+                                    &socket,
+                                    (rowd_core::discovery::GROUP, rowd_core::discovery::PORT)
+                                        .into(),
+                                    fingerprint,
+                                )
+                            })(),
+                            Err(error) => Err(error),
+                        };
                         let _ = store.call("releaseMulticast", &[]);
                         result
                     })?;

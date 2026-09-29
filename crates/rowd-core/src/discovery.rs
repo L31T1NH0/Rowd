@@ -2,26 +2,74 @@
 use anyhow::{ensure, Result};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     time::{Duration, Instant},
 };
 
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
 pub const PORT: u16 = 43822;
+pub const MAGIC: [u8; 4] = *b"ROWD";
 const VERSION: u8 = 1;
 const DISCOVER: u8 = 1;
 const ANNOUNCE: u8 = 2;
-const REQUEST_LEN: usize = 34;
-const RESPONSE_LEN: usize = 68;
+const MAGIC_LEN: usize = MAGIC.len();
+const HEADER_LEN: usize = MAGIC_LEN + 2;
+const NONCE_LEN: usize = 32;
+const FINGERPRINT_LEN: usize = 32;
+const REQUEST_LEN: usize = HEADER_LEN + NONCE_LEN + FINGERPRINT_LEN;
+const RESPONSE_LEN: usize = REQUEST_LEN + 2;
+
+pub fn eligible_ipv4_addresses<I>(addresses: I) -> Vec<Ipv4Addr>
+where
+    I: IntoIterator<Item = Ipv4Addr>,
+{
+    addresses
+        .into_iter()
+        .filter(|address| {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && *address != Ipv4Addr::BROADCAST
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub fn multicast_membership_changes(
+    joined: &BTreeSet<Ipv4Addr>,
+    available: impl IntoIterator<Item = Ipv4Addr>,
+) -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
+    let available = eligible_ipv4_addresses(available)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let to_join = available.difference(joined).copied().collect();
+    let to_leave = joined.difference(&available).copied().collect();
+    (to_join, to_leave)
+}
+
+pub fn join_multicast_interfaces<I, E, F>(interfaces: I, mut join: F) -> Vec<Ipv4Addr>
+where
+    I: IntoIterator<Item = Ipv4Addr>,
+    F: FnMut(&Ipv4Addr) -> Result<(), E>,
+{
+    interfaces
+        .into_iter()
+        .filter(|address| join(address).is_ok())
+        .collect()
+}
 
 pub fn fingerprint(cert_der: &str) -> Result<[u8; 32]> {
     Ok(Sha256::digest(hex::decode(cert_der)?).into())
 }
 
-pub fn discover_packet(nonce: &[u8; 32]) -> [u8; REQUEST_LEN] {
+pub fn discover_packet(nonce: &[u8; 32], fingerprint: &[u8; 32]) -> [u8; REQUEST_LEN] {
     let mut packet = [0; REQUEST_LEN];
-    packet[..2].copy_from_slice(&[VERSION, DISCOVER]);
-    packet[2..].copy_from_slice(nonce);
+    packet[..MAGIC_LEN].copy_from_slice(&MAGIC);
+    packet[MAGIC_LEN..HEADER_LEN].copy_from_slice(&[VERSION, DISCOVER]);
+    packet[HEADER_LEN..HEADER_LEN + NONCE_LEN].copy_from_slice(nonce);
+    packet[HEADER_LEN + NONCE_LEN..].copy_from_slice(fingerprint);
     packet
 }
 
@@ -31,15 +79,23 @@ pub fn announce_packet(
     port: u16,
 ) -> Result<[u8; RESPONSE_LEN]> {
     ensure!(
-        request.len() == REQUEST_LEN && request[..2] == [VERSION, DISCOVER],
+        request.len() == REQUEST_LEN
+            && request[..MAGIC_LEN] == MAGIC
+            && request[MAGIC_LEN..HEADER_LEN] == [VERSION, DISCOVER],
         "invalid discovery request"
+    );
+    ensure!(
+        &request[HEADER_LEN + NONCE_LEN..REQUEST_LEN] == fingerprint,
+        "discovery fingerprint mismatch"
     );
     ensure!(port != 0, "invalid TCP port");
     let mut packet = [0; RESPONSE_LEN];
-    packet[..2].copy_from_slice(&[VERSION, ANNOUNCE]);
-    packet[2..34].copy_from_slice(&request[2..]);
-    packet[34..66].copy_from_slice(fingerprint);
-    packet[66..].copy_from_slice(&port.to_be_bytes());
+    packet[..MAGIC_LEN].copy_from_slice(&MAGIC);
+    packet[MAGIC_LEN..HEADER_LEN].copy_from_slice(&[VERSION, ANNOUNCE]);
+    packet[HEADER_LEN..HEADER_LEN + NONCE_LEN]
+        .copy_from_slice(&request[HEADER_LEN..HEADER_LEN + NONCE_LEN]);
+    packet[HEADER_LEN + NONCE_LEN..REQUEST_LEN].copy_from_slice(fingerprint);
+    packet[REQUEST_LEN..].copy_from_slice(&port.to_be_bytes());
     Ok(packet)
 }
 
@@ -50,14 +106,17 @@ pub fn endpoint(
     source: SocketAddr,
 ) -> Result<SocketAddr> {
     ensure!(
-        packet.len() == RESPONSE_LEN && packet[..2] == [VERSION, ANNOUNCE],
+        packet.len() == RESPONSE_LEN
+            && packet[..MAGIC_LEN] == MAGIC
+            && packet[MAGIC_LEN..HEADER_LEN] == [VERSION, ANNOUNCE],
         "invalid discovery response"
     );
     ensure!(
-        &packet[2..34] == nonce && &packet[34..66] == fingerprint,
+        &packet[HEADER_LEN..HEADER_LEN + NONCE_LEN] == nonce
+            && &packet[HEADER_LEN + NONCE_LEN..REQUEST_LEN] == fingerprint,
         "discovery response mismatch"
     );
-    let port = u16::from_be_bytes([packet[66], packet[67]]);
+    let port = u16::from_be_bytes([packet[REQUEST_LEN], packet[REQUEST_LEN + 1]]);
     ensure!(port != 0 && source.is_ipv4(), "invalid discovery endpoint");
     Ok(SocketAddr::new(source.ip(), port))
 }
@@ -69,14 +128,32 @@ pub fn collect(
 ) -> Result<Vec<SocketAddr>> {
     let mut nonce = [0; 32];
     getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
-    socket.send_to(&discover_packet(&nonce), destination)?;
-    let until = Instant::now() + Duration::from_millis(700);
+    let query = discover_packet(&nonce, fingerprint);
+    let started = Instant::now();
+    let until = started + Duration::from_millis(700);
+    let query_delays = [
+        Duration::ZERO,
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+    ];
+    let mut next_query = 0;
     let mut candidates = Vec::new();
     let mut packet = [0; 256];
     while Instant::now() < until && candidates.len() < 8 {
+        let now = Instant::now();
+        if next_query < query_delays.len() && now >= started + query_delays[next_query] {
+            socket.send_to(&query, destination)?;
+            next_query += 1;
+            continue;
+        }
+        let next_send = query_delays
+            .get(next_query)
+            .map(|delay| started + *delay)
+            .unwrap_or(until);
+        let read_until = until.min(next_send);
         socket.set_read_timeout(Some(
-            until
-                .saturating_duration_since(Instant::now())
+            read_until
+                .saturating_duration_since(now)
                 .max(Duration::from_millis(1)),
         ))?;
         match socket.recv_from(&mut packet) {
@@ -91,10 +168,7 @@ pub fn collect(
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                break
-            }
+                ) => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -108,8 +182,8 @@ mod tests {
     fn validates_packets_and_uses_source_ip() {
         let nonce = [7; 32];
         let fp = [9; 32];
-        let request = discover_packet(&nonce);
-        assert!(announce_packet(&request[..33], &fp, 42).is_err());
+        let request = discover_packet(&nonce, &fp);
+        assert!(announce_packet(&request[..REQUEST_LEN - 1], &fp, 42).is_err());
         let response = announce_packet(&request, &fp, 43821).unwrap();
         let source = "127.0.0.2:9999".parse().unwrap();
         assert_eq!(
@@ -120,12 +194,86 @@ mod tests {
         );
         assert!(endpoint(&response[..67], &nonce, &fp, source).is_err());
         let mut bad = response;
-        bad[34] ^= 1;
+        bad[HEADER_LEN + NONCE_LEN] ^= 1;
         assert!(endpoint(&bad, &nonce, &fp, source).is_err());
         bad = response;
-        bad[67] = 0;
-        bad[66] = 0;
+        bad[REQUEST_LEN + 1] = 0;
+        bad[REQUEST_LEN] = 0;
         assert!(endpoint(&bad, &nonce, &fp, source).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_magic_version_type_nonce_fingerprint_and_truncation() {
+        let nonce = [7; 32];
+        let fp = [9; 32];
+        let request = discover_packet(&nonce, &fp);
+        let response = announce_packet(&request, &fp, 43821).unwrap();
+        let source = "127.0.0.2:9999".parse().unwrap();
+
+        let mut bad_request = request;
+        bad_request[0] ^= 1;
+        assert!(announce_packet(&bad_request, &fp, 42).is_err());
+        bad_request = request;
+        bad_request[MAGIC_LEN] = 2;
+        assert!(announce_packet(&bad_request, &fp, 42).is_err());
+        bad_request = request;
+        bad_request[MAGIC_LEN + 1] = ANNOUNCE;
+        assert!(announce_packet(&bad_request, &fp, 42).is_err());
+
+        let mut bad_response = response;
+        bad_response[0] ^= 1;
+        assert!(endpoint(&bad_response, &nonce, &fp, source).is_err());
+        bad_response = response;
+        bad_response[MAGIC_LEN] = 2;
+        assert!(endpoint(&bad_response, &nonce, &fp, source).is_err());
+        bad_response = response;
+        bad_response[MAGIC_LEN + 1] = DISCOVER;
+        assert!(endpoint(&bad_response, &nonce, &fp, source).is_err());
+        assert!(endpoint(&response[..RESPONSE_LEN - 1], &nonce, &fp, source).is_err());
+
+        let mut bad_nonce = response;
+        bad_nonce[HEADER_LEN] ^= 1;
+        assert!(endpoint(&bad_nonce, &nonce, &fp, source).is_err());
+        let mut bad_fingerprint = response;
+        bad_fingerprint[HEADER_LEN + NONCE_LEN] ^= 1;
+        assert!(endpoint(&bad_fingerprint, &nonce, &fp, source).is_err());
+        assert!(announce_packet(&request, &fp, 0).is_err());
+    }
+
+    #[test]
+    fn selects_lan_addresses_and_membership_changes_independently() {
+        let loopback = Ipv4Addr::LOCALHOST;
+        let wlan = "192.168.1.20".parse().unwrap();
+        let ethernet = "10.0.0.20".parse().unwrap();
+        let joined = [wlan].into_iter().collect();
+        assert_eq!(
+            eligible_ipv4_addresses([
+                loopback,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::BROADCAST,
+                wlan,
+                ethernet,
+            ]),
+            vec![ethernet, wlan]
+        );
+        assert_eq!(
+            multicast_membership_changes(&joined, [loopback, wlan, ethernet]),
+            (vec![ethernet], Vec::new())
+        );
+        assert_eq!(
+            multicast_membership_changes(&[wlan, ethernet].into_iter().collect(), [wlan]),
+            (Vec::new(), vec![ethernet])
+        );
+        assert_eq!(
+            join_multicast_interfaces([wlan, ethernet], |address| {
+                if *address == wlan {
+                    Err("membership failed")
+                } else {
+                    Ok(())
+                }
+            }),
+            vec![ethernet]
+        );
     }
 
     #[test]
@@ -136,8 +284,14 @@ mod tests {
         let destination = server.local_addr().unwrap();
         let responder = std::thread::spawn(move || {
             let mut buffer = [0; 256];
+            let (size, _first_peer) = server.recv_from(&mut buffer).unwrap();
+            let first = buffer[..size].to_vec();
+            let false_reply = announce_packet(&buffer[..size], &[4; 32], 43821).unwrap_err();
+            assert!(false_reply.to_string().contains("fingerprint"));
             let (size, peer) = server.recv_from(&mut buffer).unwrap();
-            let mut false_reply = announce_packet(&buffer[..size], &[4; 32], 43821).unwrap();
+            assert_eq!(&buffer[..size], first.as_slice());
+            let mut false_reply = announce_packet(&buffer[..size], &fp, 43821).unwrap();
+            false_reply[HEADER_LEN + NONCE_LEN] ^= 1;
             server.send_to(&false_reply, peer).unwrap();
             false_reply = announce_packet(&buffer[..size], &fp, 43821).unwrap();
             server.send_to(&false_reply, peer).unwrap();
@@ -149,9 +303,16 @@ mod tests {
     }
 }
 
+#[derive(Clone, Debug)]
+struct VerifiedEndpoint {
+    peer_key: String,
+    address: SocketAddr,
+    generation: u64,
+}
+
 #[derive(Default)]
 pub struct EndpointResolver {
-    last: Option<SocketAddr>,
+    last: Option<VerifiedEndpoint>,
     generation: u64,
 }
 
@@ -180,12 +341,21 @@ impl EndpointResolver {
     where
         F: FnOnce(&[u8; 32]) -> Result<Vec<SocketAddr>>,
     {
+        let fingerprint = fingerprint(&invite.cert_der)?;
+        let peer_key = format!("{}:{}", invite.pair_id, hex::encode(fingerprint));
         let changed = self.generation != generation;
         self.generation = generation;
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|cached| cached.peer_key != peer_key)
+        {
+            self.last = None;
+        }
         let mut candidates = Vec::new();
         if !changed {
-            if let Some(last) = self.last {
-                let address = last.to_string();
+            if let Some(last) = &self.last {
+                let address = last.address.to_string();
                 if let Ok(io) =
                     Self::authenticate(invite, device, &address, Duration::from_millis(800))
                 {
@@ -193,28 +363,36 @@ impl EndpointResolver {
                 }
             }
         }
-        let fingerprint = fingerprint(&invite.cert_der)?;
         if let Ok(found) = discover(&fingerprint) {
             candidates.extend(found.into_iter().take(8).map(|address| address.to_string()));
         }
         if changed {
-            if let Some(last) = self.last {
-                candidates.push(last.to_string());
+            if let Some(last) = &self.last {
+                candidates.push(last.address.to_string());
             }
         }
         candidates.push(invite.address.clone());
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|address| seen.insert(address.clone()));
         let mut last_error = None;
+        let cached_address = self
+            .last
+            .as_ref()
+            .filter(|cached| cached.generation == generation)
+            .map(|cached| cached.address);
         for address in candidates.into_iter().take(10) {
-            let timeout = if self.last.is_some_and(|last| last.to_string() == address) {
+            let timeout = if cached_address.is_some_and(|cached| cached.to_string() == address) {
                 Duration::from_millis(800)
             } else {
                 Duration::from_secs(3)
             };
             match Self::authenticate(invite, device, &address, timeout) {
                 Ok(io) => {
-                    self.last = address.parse().ok();
+                    self.last = Some(VerifiedEndpoint {
+                        peer_key: peer_key.clone(),
+                        address: address.parse()?,
+                        generation,
+                    });
                     return Ok((io, address));
                 }
                 Err(error) => last_error = Some(error),
