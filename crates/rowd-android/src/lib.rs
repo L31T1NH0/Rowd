@@ -24,6 +24,156 @@ static RESOLVER: OnceLock<Mutex<rowd_core::discovery::EndpointResolver>> = OnceL
 static NETWORK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CONNECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ACTIVE_SOCKET: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
+static PAIRING_CONNECTION: OnceLock<
+    Mutex<
+        Option<(
+            rowd_core::pairing::Peer,
+            String,
+            rowd_core::tls::ClientStream,
+        )>,
+    >,
+> = OnceLock::new();
+static PAIRING_SESSION: OnceLock<String> = OnceLock::new();
+
+fn pairing_connection() -> &'static Mutex<
+    Option<(
+        rowd_core::pairing::Peer,
+        String,
+        rowd_core::tls::ClientStream,
+    )>,
+> {
+    PAIRING_CONNECTION.get_or_init(|| Mutex::new(None))
+}
+
+fn pairing_result(env: JNIEnv, result: Result<serde_json::Value>) -> jstring {
+    let output = match result {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({"error":format!("{error:#}")}),
+    };
+    env.new_string(output.to_string())
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_discoverPairing(
+    env: JNIEnv,
+    _class: JObject,
+) -> jstring {
+    let result = (|| -> Result<serde_json::Value> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let peers = rowd_core::pairing::discover(
+            &socket,
+            rowd_core::pairing::DeviceType::Pc,
+            (rowd_core::pairing::GROUP, rowd_core::pairing::PORT).into(),
+        )?;
+        Ok(serde_json::to_value(peers)?)
+    })();
+    pairing_result(env, result)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_pollPairOffer(
+    mut env: JNIEnv,
+    _class: JObject,
+    name: JString,
+) -> jstring {
+    let result = (|| -> Result<serde_json::Value> {
+        let name: String = env.get_string(&name)?.into();
+        let socket =
+            std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, rowd_core::pairing::PORT))?;
+        socket.set_read_timeout(Some(Duration::from_millis(900)))?;
+        let _ =
+            socket.join_multicast_v4(&rowd_core::pairing::GROUP, &std::net::Ipv4Addr::UNSPECIFIED);
+        let mut buf = [0u8; 4097];
+        let result = match socket.recv_from(&mut buf) {
+            Ok((len, source)) => match rowd_core::pairing::decode(&buf[..len])? {
+                rowd_core::pairing::Packet::Discover {
+                    nonce,
+                    device_type: rowd_core::pairing::DeviceType::Android,
+                } => {
+                    let reply = rowd_core::pairing::Packet::Announce {
+                        nonce,
+                        session_id: PAIRING_SESSION
+                            .get_or_init(|| {
+                                rowd_core::random_id().unwrap_or_else(|_| "0".repeat(64))
+                            })
+                            .clone(),
+                        device_name: name,
+                        device_type: rowd_core::pairing::DeviceType::Android,
+                        pair_id: None,
+                        fingerprint: None,
+                        cert_der: None,
+                        tcp_port: None,
+                    };
+                    socket.send_to(&rowd_core::pairing::encode(&reply)?, source)?;
+                    serde_json::Value::Null
+                }
+                packet @ rowd_core::pairing::Packet::Offer { .. } => {
+                    serde_json::to_value(rowd_core::pairing::offered_peer(packet, source)?)?
+                }
+                _ => serde_json::Value::Null,
+            },
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                serde_json::Value::Null
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(result)
+    })();
+    pairing_result(env, result)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_beginPairing(
+    mut env: JNIEnv,
+    _class: JObject,
+    peer: JString,
+    device_id: JString,
+    name: JString,
+) -> jstring {
+    let result = (|| -> Result<serde_json::Value> {
+        let peer: rowd_core::pairing::Peer =
+            serde_json::from_str(&String::from(env.get_string(&peer)?))?;
+        rowd_core::pairing::validate_pc_peer(&peer)?;
+        let device_id: String = env.get_string(&device_id)?.into();
+        let name: String = env.get_string(&name)?.into();
+        let mut io = rowd_core::tls::connect_pinned(
+            peer.cert_der
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing certificate"))?,
+            &peer.endpoint.to_string(),
+            Duration::from_secs(5),
+        )?;
+        io.sock.set_read_timeout(Some(Duration::from_secs(65)))?;
+        let (_, code) = rowd_core::pairing::request(&mut io, &peer, &device_id, &name)?;
+        *pairing_connection().lock().unwrap() = Some((peer, device_id, io));
+        Ok(serde_json::json!({"verification_code":code}))
+    })();
+    pairing_result(env, result)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_finishPairing(
+    env: JNIEnv,
+    _class: JObject,
+) -> jstring {
+    let result = (|| -> Result<serde_json::Value> {
+        let (peer, device_id, mut io) = pairing_connection()
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no pairing in progress"))?;
+        let invitation = rowd_core::pairing::finish(&mut io, &peer, &device_id)?;
+        Ok(serde_json::json!({"invitation":invitation.encode()?}))
+    })();
+    pairing_result(env, result)
+}
 
 fn clear_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream)>) {
     *connection = None;

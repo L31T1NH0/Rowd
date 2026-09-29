@@ -5,9 +5,11 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.View
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ArrayAdapter
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,9 +24,12 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
     private lateinit var ui: ActivityMainBinding
+    private var pairingDiscovery: AtomicBoolean? = null
+    private var pairingDialog: androidx.appcompat.app.AlertDialog? = null
     private val prefs by lazy { getSharedPreferences("rowd", MODE_PRIVATE) }
     private val statusChanged: () -> Unit = { refresh() }
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -58,8 +63,117 @@ class MainActivity : AppCompatActivity() {
     private val qrScanner = registerForActivityResult(ScanContract()) { result ->
         result.contents?.let { safely { acceptInvitation(it) } }
     }
+    private fun saveAndConnect(invitation: String) {
+        check(prefs.edit().putString("invitation", invitation).remove("peerAddress")
+            .remove("unlinkRequested").remove("unlinkPrepared").commit()) {
+            "Não foi possível salvar o novo convite."
+        }
+        SyncService.publish(RowdStatus.Kind.Working, "Conectando ao PC", "Autenticando o vínculo.")
+        refresh()
+        startSync()
+    }
+
+    private fun nativeObject(text: String): JSONObject = JSONObject(text).also {
+        check(!it.has("error")) { it.optString("error", "Erro de pareamento.") }
+    }
+
+    private fun startNetworkPairing(peer: JSONObject) {
+        check(!prefs.contains("invitation")) { "Desvincule o aparelho antes de criar outro vínculo." }
+        val deviceId = prefs.getString("deviceId", "")!!
+        val deviceName = (Build.MODEL ?: "Android").filter { !Character.isISOControl(it) }.take(20).ifEmpty { "Android" }
+        Thread {
+            try {
+                val pending = nativeObject(NativeBridge.beginPairing(peer.toString(), deviceId, deviceName))
+                runOnUiThread {
+                    val waiting = MaterialAlertDialogBuilder(this)
+                        .setTitle("Confirme o código no PC")
+                        .setMessage("Código: ${pending.getString("verification_code")}\n\nAguardando aprovação no computador.")
+                        .setCancelable(false).create()
+                    waiting.show()
+                    Thread {
+                        try {
+                            val accepted = nativeObject(NativeBridge.finishPairing())
+                            runOnUiThread { waiting.dismiss(); safely { saveAndConnect(accepted.getString("invitation")) } }
+                        } catch (error: Exception) {
+                            runOnUiThread { waiting.dismiss(); message("Pareamento não concluído", error.message ?: "Tente novamente.") }
+                        }
+                    }.start()
+                }
+            } catch (error: Exception) {
+                runOnUiThread { message("Pareamento não concluído", error.message ?: "Tente novamente.") }
+            }
+        }.start()
+    }
+
+    private fun findOnNetwork() {
+        check(!prefs.contains("invitation")) { "Desvincule o aparelho antes de criar outro vínculo." }
+        val active = AtomicBoolean(true)
+        pairingDiscovery = active
+        val deadline = SystemClock.elapsedRealtime() + 120_000
+        val access = FolderAccess(this)
+        access.acquireMulticast()
+        val peers = linkedMapOf<String, JSONObject>()
+        val labels = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, mutableListOf("Procurando computadores..."))
+        val dialog = MaterialAlertDialogBuilder(this).setTitle("Encontrar na rede")
+            .setAdapter(labels) { _, position ->
+                peers.values.elementAtOrNull(position)?.let { peer ->
+                    active.set(false)
+                    startNetworkPairing(peer)
+                }
+            }.setNegativeButton("Fechar", null).create()
+        pairingDialog = dialog
+        dialog.setOnDismissListener {
+            active.set(false)
+            if (pairingDialog === dialog) { pairingDialog = null; pairingDiscovery = null }
+        }
+        dialog.show()
+        Thread {
+            try {
+                while (active.get() && SystemClock.elapsedRealtime() < deadline) {
+                    val result = NativeBridge.discoverPairing()
+                    val found = JSONArray(result)
+                    val candidates = (0 until found.length()).map { found.getJSONObject(it) }
+                    runOnUiThread {
+                        if (active.get()) {
+                            candidates.forEach { peers[it.getString("session_id")] = it }
+                            labels.clear()
+                            if (peers.isEmpty()) labels.add("Procurando computadores...")
+                            else peers.values.forEach { labels.add("${it.getString("device_name")} · ${it.getString("endpoint")}") }
+                            labels.notifyDataSetChanged()
+                        }
+                    }
+                }
+                if (active.getAndSet(false)) runOnUiThread {
+                    dialog.dismiss()
+                    message("Busca encerrada", "Abra Encontrar na rede para procurar novamente.")
+                }
+            } catch (error: Exception) {
+                runOnUiThread { if (active.get()) message("Descoberta indisponível", error.message ?: "Tente novamente.") }
+            } finally { runOnUiThread { access.releaseMulticast() } }
+        }.start()
+        Thread {
+            val deviceName = (Build.MODEL ?: "Android").filter { !Character.isISOControl(it) }.take(20).ifEmpty { "Android" }
+            while (active.get() && SystemClock.elapsedRealtime() < deadline) {
+                try {
+                    val offer = NativeBridge.pollPairOffer(deviceName)
+                    if (offer != "null") {
+                        val peer = nativeObject(offer)
+                        active.set(false)
+                        runOnUiThread {
+                            dialog.dismiss()
+                            MaterialAlertDialogBuilder(this).setTitle("${peer.getString("device_name")} quer se conectar")
+                                .setMessage("Confirme o código de seis dígitos nos dois aparelhos.")
+                                .setNegativeButton("Recusar", null)
+                                .setPositiveButton("Conectar") { _, _ -> startNetworkPairing(peer) }.show()
+                        }
+                    }
+                } catch (_: Exception) { }
+            }
+        }.start()
+    }
     private fun acceptInvitation(text: String) {
         check(text.length <= 32768) { "Convite muito grande." }
+            check(!prefs.contains("invitation")) { "Desvincule o aparelho antes de criar outro vínculo." }
             check(!SyncService.busy.get()) { "Aguarde a operação atual terminar para trocar o vínculo." }
             val invite = previewInvitation(text)
             val fingerprint = invite.getString("fingerprint")
@@ -67,13 +181,7 @@ class MainActivity : AppCompatActivity() {
                 .setMessage("${invite.getString("address")}\n\nCompare este SHA-256 com o exibido pelo PC:\n$fingerprint\n\nImporte apenas convites gerados por você.")
                 .setNegativeButton("Cancelar", null).setPositiveButton("Conectar") { _, _ -> safely {
                     check(!SyncService.busy.get()) { "Aguarde a operação atual terminar para trocar o vínculo." }
-                    check(prefs.edit().putString("invitation", invite.getString("invitation"))
-                        .remove("peerAddress")
-                        .remove("unlinkRequested").remove("unlinkPrepared").commit()) {
-                        "Não foi possível salvar o novo convite."
-                    }
-                    SyncService.wake()
-                    SyncService.publish(RowdStatus.Kind.Ready, "Pronto para sincronizar", "Toque em Sincronizar agora."); refresh()
+                    saveAndConnect(invite.getString("invitation"))
                 } }.show()
     }
     private fun previewInvitation(text: String, address: String = ""): JSONObject {
@@ -106,6 +214,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (!SyncService.busy.get()) SyncService.restore(this)
         ui.scanQr.setOnClickListener { qrScanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Escaneie o QR no PC").setBeepEnabled(false).setOrientationLocked(false)) }
+        ui.findNetwork.setOnClickListener { safely { findOnNetwork() } }
         ui.importInvite.setOnClickListener { invitePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) }
         ui.requestShare.setOnClickListener { shareFolderPicker.launch(null) }
         ui.manageRequests.setOnClickListener { manageRequests() }
@@ -314,6 +423,9 @@ class MainActivity : AppCompatActivity() {
     private fun refresh() {
         val busy = SyncService.busy.get()
         val paired = prefs.contains("invitation")
+        ui.onboarding.visibility = if (paired) View.GONE else View.VISIBLE
+        ui.operations.visibility = if (paired) View.VISIBLE else View.GONE
+        ui.findNetwork.visibility = if (paired) View.GONE else View.VISIBLE
         ui.status.text = SyncService.state.title; ui.detail.text = SyncService.state.detail
         ui.progress.visibility = if (busy) View.VISIBLE else View.GONE
         ui.peerLabel.text = if (paired) prefs.getString("peerAddress", null)
@@ -359,5 +471,10 @@ class MainActivity : AppCompatActivity() {
     private fun message(title: String, text: String) { MaterialAlertDialogBuilder(this).setTitle(title).setMessage(text).setPositiveButton("Entendi", null).show() }
     private fun safely(action: () -> Unit) { try { action() } catch (e: Exception) { message("Não foi possível continuar", e.message ?: "Tente novamente.") } }
     override fun onResume() { super.onResume(); SyncService.observe(statusChanged); refresh() }
-    override fun onPause() { SyncService.stopObserving(statusChanged); super.onPause() }
+    override fun onPause() {
+        pairingDiscovery?.set(false)
+        pairingDialog?.dismiss()
+        SyncService.stopObserving(statusChanged)
+        super.onPause()
+    }
 }

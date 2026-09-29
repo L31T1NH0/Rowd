@@ -13,8 +13,11 @@ use ratatui::{
     Frame, Terminal,
 };
 use rowd_app::{App, AppSnapshot, ConnectionTest, DeviceConfig, PairingInfo, RecoveryItem, Status};
-use rowd_core::config::{RemapPolicy, ShareRequest, SyncMode};
 use rowd_core::trace;
+use rowd_core::{
+    config::{RemapPolicy, ShareRequest, SyncMode},
+    pairing,
+};
 use std::{
     io::{self, IsTerminal},
     path::{Path, PathBuf},
@@ -404,12 +407,16 @@ const SHARE_DIRECTIONS: [(&str, SyncMode); 3] = [
 enum Modal {
     Help,
     Qr(PairingInfo),
+    PairMenu(usize),
+    PairDiscovery(Vec<pairing::Peer>, usize),
+    PairApproval(rowd_app::PendingPairRequest),
     Input(InputDialog),
 }
 
 enum UiEvent {
     Notice(String),
     JobDone(String),
+    PairPeers(Vec<pairing::Peer>),
 }
 
 struct Ui {
@@ -425,6 +432,7 @@ struct Ui {
     job: Option<String>,
     dirty: bool,
     last_refresh: Instant,
+    last_pair_search: Instant,
 }
 
 impl Ui {
@@ -442,8 +450,12 @@ impl Ui {
             job: None,
             dirty: true,
             last_refresh: Instant::now() - Duration::from_secs(2),
+            last_pair_search: Instant::now() - Duration::from_secs(2),
         };
         ui.refresh(app);
+        if !ui.snapshot.device.paired {
+            ui.tab = Tab::Device;
+        }
         ui
     }
 
@@ -625,8 +637,70 @@ impl Ui {
 
     fn handle_modal_key(&mut self, key: KeyEvent, app: &App, tx: &Sender<UiEvent>) -> Result<()> {
         if key.code == KeyCode::Esc {
+            if let Some(Modal::PairApproval(request)) = &self.modal {
+                app.decide_pairing(&request.request_id, false)?;
+            }
+            if matches!(
+                self.modal,
+                Some(
+                    Modal::PairMenu(_)
+                        | Modal::PairDiscovery(_, _)
+                        | Modal::PairApproval(_)
+                        | Modal::Qr(_)
+                )
+            ) {
+                app.stop_pairing_mode();
+            }
             self.modal = None;
             return Ok(());
+        }
+        match self.modal.as_mut() {
+            Some(Modal::PairMenu(index)) => {
+                match key.code {
+                    KeyCode::Up => *index = index.saturating_sub(1),
+                    KeyCode::Down => *index = (*index + 1).min(1),
+                    KeyCode::Enter if *index == 0 => {
+                        app.start_pairing_mode()?;
+                        self.modal = Some(Modal::PairDiscovery(Vec::new(), 0));
+                        self.last_pair_search = Instant::now() - Duration::from_secs(2);
+                    }
+                    KeyCode::Enter => self.modal = Some(Modal::Qr(app.pairing_info()?)),
+                    _ => {}
+                }
+                return Ok(());
+            }
+            Some(Modal::PairDiscovery(peers, index)) => {
+                match key.code {
+                    KeyCode::Up => *index = index.saturating_sub(1),
+                    KeyCode::Down => *index = (*index + 1).min(peers.len().saturating_sub(1)),
+                    KeyCode::Enter => {
+                        if let Some(peer) = peers.get(*index) {
+                            app.offer_pairing(peer)?;
+                            self.notice = format!(
+                                "Convite enviado para {}. Confirme no celular.",
+                                peer.device_name
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            Some(Modal::PairApproval(request)) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        app.decide_pairing(&request.request_id, true)?;
+                        self.modal = Some(Modal::PairDiscovery(Vec::new(), 0));
+                    }
+                    KeyCode::Char('r') => {
+                        app.decide_pairing(&request.request_id, false)?;
+                        self.modal = Some(Modal::PairDiscovery(Vec::new(), 0));
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            _ => {}
         }
         if let Some(Modal::Input(input)) = self.modal.as_mut() {
             if input.share.is_some() {
@@ -666,7 +740,14 @@ impl Ui {
                 KeyCode::Char(character) => input.value.push(character),
                 _ => {}
             },
-            Some(Modal::Help | Modal::Qr(_)) | None => {}
+            Some(
+                Modal::Help
+                | Modal::Qr(_)
+                | Modal::PairMenu(_)
+                | Modal::PairDiscovery(_, _)
+                | Modal::PairApproval(_),
+            )
+            | None => {}
         }
         Ok(())
     }
@@ -795,8 +876,7 @@ impl Ui {
             }
             UiAction::Pair => {
                 app.pair("")?;
-                self.modal = Some(Modal::Qr(app.pairing_info()?));
-                self.notice = "QR pronto para leitura pelo celular.".into();
+                self.modal = Some(Modal::PairMenu(0));
             },
             UiAction::TestConnection => {
                 self.connection = Some(app.connection_test()?);
@@ -1521,6 +1601,12 @@ pub fn run(home: &Path) -> Result<()> {
         for message in rx.try_iter() {
             match message {
                 UiEvent::Notice(message) => ui.notice = message,
+                UiEvent::PairPeers(peers) => {
+                    if let Some(Modal::PairDiscovery(found, index)) = &mut ui.modal {
+                        *found = peers;
+                        *index = (*index).min(found.len().saturating_sub(1));
+                    }
+                }
                 UiEvent::JobDone(message) => {
                     ui.job = None;
                     ui.notice = message;
@@ -1529,6 +1615,50 @@ pub fn run(home: &Path) -> Result<()> {
             }
         }
         ui.refresh(&app);
+        if matches!(
+            ui.modal,
+            Some(Modal::PairMenu(_) | Modal::PairDiscovery(_, _))
+        ) && !app.pairing_mode_active()
+        {
+            app.stop_pairing_mode();
+            ui.modal = None;
+            ui.notice =
+                "A busca de pareamento expirou. Abra Conectar celular para tentar novamente."
+                    .into();
+        }
+        if ui.snapshot.device.paired
+            && matches!(
+                ui.modal,
+                Some(
+                    Modal::PairMenu(_)
+                        | Modal::PairDiscovery(_, _)
+                        | Modal::PairApproval(_)
+                        | Modal::Qr(_)
+                )
+            )
+        {
+            app.stop_pairing_mode();
+            ui.modal = None;
+            ui.notice = "Celular conectado.".into();
+        }
+        if let Some(request) = app.pending_pairing() {
+            if !matches!(&ui.modal, Some(Modal::PairApproval(current)) if current.request_id == request.request_id)
+            {
+                ui.modal = Some(Modal::PairApproval(request));
+            }
+        }
+        if matches!(ui.modal, Some(Modal::PairDiscovery(_, _)))
+            && ui.last_pair_search.elapsed() >= Duration::from_secs(2)
+        {
+            ui.last_pair_search = Instant::now();
+            let app = app.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(peers) = app.discover_phones() {
+                    let _ = tx.send(UiEvent::PairPeers(peers));
+                }
+            });
+        }
         terminal.draw(|frame| ui.render(frame))?;
         if !event::poll(Duration::from_millis(150))? {
             continue;
@@ -1617,6 +1747,45 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, title: &str, text: String) {
 
 fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &Modal) {
     match modal {
+        Modal::PairMenu(index) => {
+            let popup = centered(area, 54, 10);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(Paragraph::new(format!("Conectar celular\n\n{} Encontrar na rede\n{} Mostrar QR\n\n↑↓ seleciona · Enter abre · Esc fecha", if *index == 0 { ">" } else { " " }, if *index == 1 { ">" } else { " " }))
+                .block(Block::default().title(" Pareamento ").borders(Borders::ALL).border_style(Style::default().fg(ACCENT))), popup);
+        }
+        Modal::PairDiscovery(peers, index) => {
+            let popup = centered(area, 64, 16);
+            frame.render_widget(Clear, popup);
+            let mut lines = vec!["Celulares Rowd na rede".to_string(), String::new()];
+            if peers.is_empty() {
+                lines.push("Procurando celulares...".into());
+            }
+            for (i, peer) in peers.iter().enumerate() {
+                lines.push(format!(
+                    "{} {} · {}",
+                    if i == *index { ">" } else { " " },
+                    peer.device_name,
+                    peer.endpoint.ip()
+                ));
+            }
+            lines.push(String::new());
+            lines.push("↑↓ seleciona · Enter envia convite · Esc fecha".into());
+            frame.render_widget(
+                Paragraph::new(lines.join("\n")).block(
+                    Block::default()
+                        .title(" Encontrar na rede ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT)),
+                ),
+                popup,
+            );
+        }
+        Modal::PairApproval(request) => {
+            let popup = centered(area, 58, 11);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(Paragraph::new(format!("{} quer se conectar\n\nCódigo: {}\n\nCompare com o celular.\n\nEnter Aceitar · r Recusar", request.device_name, request.verification_code))
+                .block(Block::default().title(" Confirmar celular ").borders(Borders::ALL).border_style(Style::default().fg(WARNING))), popup);
+        }
         Modal::Help => {
             let popup = centered(area, 92, 32);
             frame.render_widget(Clear, popup);
@@ -1983,6 +2152,28 @@ mod tests {
         assert_eq!(wide[0].y, wide[1].y);
         assert_eq!(medium[0].y, medium[1].y);
         assert!(narrow[1].y > narrow[0].y);
+    }
+
+    #[test]
+    fn unpaired_device_starts_on_pairing_menu_and_keeps_qr() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::new(directory.path());
+        let mut ui = Ui::new(&app);
+        assert_eq!(ui.tab, Tab::Device);
+        ui.begin_action(UiAction::Pair, &app).unwrap();
+        assert!(matches!(ui.modal, Some(Modal::PairMenu(0))));
+        assert!(!app.pairing_mode_active());
+        press(&mut ui, &app, KeyCode::Enter);
+        assert!(matches!(ui.modal, Some(Modal::PairDiscovery(_, _))));
+        assert!(app.pairing_mode_active());
+        press(&mut ui, &app, KeyCode::Esc);
+        assert!(!app.pairing_mode_active());
+        ui.begin_action(UiAction::Pair, &app).unwrap();
+        press(&mut ui, &app, KeyCode::Down);
+        press(&mut ui, &app, KeyCode::Enter);
+        assert!(matches!(ui.modal, Some(Modal::Qr(_))));
+        assert!(!app.pairing_mode_active());
+        press(&mut ui, &app, KeyCode::Esc);
     }
 
     #[test]

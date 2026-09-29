@@ -34,8 +34,12 @@ pub fn connect(invite: &Invitation) -> Result<StreamOwned<ClientConnection, TcpS
 }
 pub fn connect_to(invite: &Invitation, endpoint: &str, timeout: Duration) -> Result<ClientStream> {
     invite.validate()?;
+    connect_pinned(&invite.cert_der, endpoint, timeout)
+}
+
+pub fn connect_pinned(cert_der: &str, endpoint: &str, timeout: Duration) -> Result<ClientStream> {
     let mut roots = RootCertStore::empty();
-    roots.add(CertificateDer::from(hex::decode(&invite.cert_der)?))?;
+    roots.add(CertificateDer::from(hex::decode(cert_der)?))?;
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();

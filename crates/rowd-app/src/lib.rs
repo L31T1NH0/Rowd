@@ -10,6 +10,7 @@ use rowd_core::{
     config::{RemapPolicy, ShareConfig, ShareRequest, SyncMode},
     discovery,
     model::{Invitation, INVITATION_VERSION},
+    pairing,
     protocol::{self, Message},
     random_id,
     storage::{atomic_json, LocalStore, Store},
@@ -26,7 +27,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Condvar, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -36,7 +37,156 @@ pub struct App {
     home: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingPairRequest {
+    pub request_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub verification_code: String,
+    pub created_at: Instant,
+}
+
+#[derive(Default)]
+struct PairingState {
+    until: Option<Instant>,
+    pending: Option<PendingPairRequest>,
+    decision: Option<bool>,
+}
+
+static PAIRING: OnceLock<(Mutex<PairingState>, Condvar)> = OnceLock::new();
+
+fn pairing_state() -> &'static (Mutex<PairingState>, Condvar) {
+    PAIRING.get_or_init(|| (Mutex::new(PairingState::default()), Condvar::new()))
+}
+
+fn pairing_active(state: &PairingState) -> bool {
+    state.until.is_some_and(|until| Instant::now() < until)
+}
+
+fn pairing_advertising(state: &PairingState) -> bool {
+    pairing_active(state) && state.pending.is_none()
+}
+
+fn pairing_device_name() -> String {
+    let mut name = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| fs::read_to_string("/etc/hostname").ok())
+        .unwrap_or_else(|| "Desktop".into())
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    while name.len() > 80 {
+        name.pop();
+    }
+    if name.is_empty() {
+        "Desktop".into()
+    } else {
+        name
+    }
+}
+
 impl App {
+    pub fn start_pairing_mode(&self) -> Result<()> {
+        self.pair("")?;
+        ensure!(self.config()?.peer_device.is_none(), "celular já vinculado");
+        let (lock, _) = pairing_state();
+        lock.lock().unwrap().until = Some(Instant::now() + Duration::from_secs(120));
+        Ok(())
+    }
+
+    pub fn stop_pairing_mode(&self) {
+        let (lock, wake) = pairing_state();
+        let mut state = lock.lock().unwrap();
+        state.until = None;
+        state.decision = Some(false);
+        wake.notify_all();
+    }
+
+    pub fn pending_pairing(&self) -> Option<PendingPairRequest> {
+        pairing_state().0.lock().unwrap().pending.clone()
+    }
+
+    pub fn pairing_mode_active(&self) -> bool {
+        pairing_active(&pairing_state().0.lock().unwrap())
+    }
+
+    pub fn decide_pairing(&self, request_id: &str, accept: bool) -> Result<()> {
+        let (lock, wake) = pairing_state();
+        let mut state = lock.lock().unwrap();
+        ensure!(
+            pairing_active(&state)
+                && state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.request_id == request_id),
+            "pairing request expired"
+        );
+        state.decision = Some(accept);
+        wake.notify_all();
+        Ok(())
+    }
+
+    pub fn discover_phones(&self) -> Result<Vec<pairing::Peer>> {
+        ensure!(self.config()?.peer_device.is_none(), "celular já vinculado");
+        let addresses = discovery::eligible_ipv4_addresses(local_ipv4_addresses()?);
+        let mut found = Vec::new();
+        std::thread::scope(|scope| {
+            let searches = addresses
+                .iter()
+                .map(|address| {
+                    scope.spawn(move || -> Result<Vec<pairing::Peer>> {
+                        let socket = UdpSocket::bind((*address, 0))?;
+                        pairing::discover(
+                            &socket,
+                            pairing::DeviceType::Android,
+                            (pairing::GROUP, pairing::PORT).into(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            for search in searches {
+                if let Ok(Ok(peers)) = search.join() {
+                    found.extend(peers);
+                }
+            }
+        });
+        let mut seen = BTreeSet::new();
+        found.retain(|peer| seen.insert((peer.session_id.clone(), peer.endpoint.ip())));
+        Ok(found)
+    }
+
+    pub fn offer_pairing(&self, phone: &pairing::Peer) -> Result<()> {
+        ensure!(
+            pairing_active(&pairing_state().0.lock().unwrap()),
+            "pairing mode closed"
+        );
+        ensure!(
+            phone.device_type == pairing::DeviceType::Android,
+            "not an Android device"
+        );
+        let cfg = self.config()?;
+        ensure!(cfg.peer_device.is_none(), "celular já vinculado");
+        let packet = pairing::Packet::Offer {
+            session_id: random_id()?,
+            device_name: pairing_device_name(),
+            pair_id: cfg.pair_id,
+            fingerprint: hex::encode(discovery::fingerprint(&cfg.cert)?),
+            cert_der: cfg.cert,
+            tcp_port: cfg.listen.parse::<SocketAddr>()?.port(),
+        };
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        let bytes = pairing::encode(&packet)?;
+        for attempt in 0..3 {
+            if attempt != 0 {
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            socket.send_to(&bytes, phone.endpoint)?;
+        }
+        Ok(())
+    }
     pub fn new(home: impl Into<PathBuf>) -> Self {
         Self { home: home.into() }
     }
@@ -1540,7 +1690,118 @@ fn session(
 ) -> Result<()> {
     let cfg = DeviceConfig::load(home)?;
     let mut io = tls::accept(socket, tls::server_config(&cfg.cert, &cfg.key)?)?;
-    let device = protocol::server_auth(&mut io, &cfg.pair_id, &cfg.secret)?;
+    let first = protocol::receive(&mut io)?;
+    let device = match first {
+        Message::PairRequest {
+            version,
+            request_id,
+            device_id,
+            device_name,
+        } => {
+            let request_id_for_cleanup = request_id.clone();
+            let request = (|| -> Result<String> {
+                ensure!(version == pairing::VERSION, "unsupported pairing protocol");
+                rowd_core::model::validate_hash(&request_id)?;
+                rowd_core::model::validate_hash(&device_id)?;
+                ensure!(
+                    !device_name.is_empty()
+                        && device_name.len() <= 80
+                        && !device_name.chars().any(char::is_control),
+                    "invalid device name"
+                );
+                ensure!(
+                    DeviceConfig::load(home)?.peer_device.is_none(),
+                    "already paired"
+                );
+                let code = pairing::verification_code(
+                    &request_id,
+                    &hex::encode(discovery::fingerprint(&cfg.cert)?),
+                    &device_id,
+                )?;
+                let (lock, wake) = pairing_state();
+                {
+                    let mut state = lock.lock().unwrap();
+                    ensure!(
+                        pairing_active(&state) && state.pending.is_none(),
+                        "pairing mode unavailable"
+                    );
+                    state.pending = Some(PendingPairRequest {
+                        request_id: request_id.clone(),
+                        device_id: device_id.clone(),
+                        device_name,
+                        verification_code: code.clone(),
+                        created_at: Instant::now(),
+                    });
+                    state.decision = None;
+                    wake.notify_all();
+                }
+                protocol::send(
+                    &mut io,
+                    &Message::PairPending {
+                        request_id,
+                        verification_code: code,
+                    },
+                )?;
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let mut state = lock.lock().unwrap();
+                let accepted = loop {
+                    if !pairing_active(&state) || Instant::now() >= deadline {
+                        break false;
+                    }
+                    if let Some(decision) = state.decision.take() {
+                        break decision;
+                    }
+                    let (next, _) = wake
+                        .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                        .unwrap();
+                    state = next;
+                };
+                state.pending = None;
+                wake.notify_all();
+                drop(state);
+                ensure!(
+                    accepted && DeviceConfig::load(home)?.peer_device.is_none(),
+                    "pairing rejected or expired"
+                );
+                protocol::send(
+                    &mut io,
+                    &Message::PairAccepted {
+                        invitation: invitation(&cfg),
+                    },
+                )?;
+                let authenticated = protocol::server_auth(&mut io, &cfg.pair_id, &cfg.secret)?;
+                ensure!(
+                    authenticated == device_id,
+                    "authenticated device differs from request"
+                );
+                Ok(authenticated)
+            })();
+            match request {
+                Ok(device) => device,
+                Err(error) => {
+                    let (lock, wake) = pairing_state();
+                    let mut state = lock.lock().unwrap();
+                    if state
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id == request_id_for_cleanup)
+                    {
+                        state.pending = None;
+                        wake.notify_all();
+                    }
+                    drop(state);
+                    let _ = protocol::send(
+                        &mut io,
+                        &Message::PairRejected {
+                            reason: format!("{error:#}"),
+                        },
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        other => protocol::server_auth_with_first(&mut io, &cfg.pair_id, &cfg.secret, other)?,
+    };
     {
         let _session = session_guard(home)?;
         let _config = config_guard(home)?;
@@ -2096,6 +2357,72 @@ fn session_round(
     result
 }
 
+fn pairing_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()> {
+    while !stop.load(Ordering::Relaxed) {
+        if !pairing_advertising(&pairing_state().0.lock().unwrap()) {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, pairing::PORT))?;
+        let session_id = random_id()?;
+        socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+        let mut joined = BTreeSet::new();
+        let mut refreshed = Instant::now() - Duration::from_secs(2);
+        let mut buf = [0u8; 4097];
+        while pairing_advertising(&pairing_state().0.lock().unwrap())
+            && !stop.load(Ordering::Relaxed)
+        {
+            if refreshed.elapsed() >= Duration::from_secs(1) {
+                let addresses = local_ipv4_addresses().unwrap_or_default();
+                let (add, remove) = discovery::multicast_membership_changes(&joined, addresses);
+                joined.extend(discovery::join_multicast_interfaces(add, |address| {
+                    socket.join_multicast_v4(&pairing::GROUP, address)
+                }));
+                for address in remove {
+                    let _ = socket.leave_multicast_v4(&pairing::GROUP, &address);
+                    joined.remove(&address);
+                }
+                refreshed = Instant::now();
+            }
+            match socket.recv_from(&mut buf) {
+                Ok((len, source)) => {
+                    let Ok(pairing::Packet::Discover {
+                        nonce,
+                        device_type: pairing::DeviceType::Pc,
+                    }) = pairing::decode(&buf[..len])
+                    else {
+                        continue;
+                    };
+                    let Ok(cfg) = DeviceConfig::load(home) else {
+                        continue;
+                    };
+                    if cfg.peer_device.is_some() {
+                        continue;
+                    }
+                    let packet = pairing::Packet::Announce {
+                        nonce,
+                        session_id: session_id.clone(),
+                        device_name: pairing_device_name(),
+                        device_type: pairing::DeviceType::Pc,
+                        pair_id: Some(cfg.pair_id),
+                        fingerprint: Some(hex::encode(discovery::fingerprint(&cfg.cert)?)),
+                        cert_der: Some(cfg.cert),
+                        tcp_port: Some(tcp_port),
+                    };
+                    let _ = socket.send_to(&pairing::encode(&packet)?, source);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn discovery_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()> {
     let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, discovery::PORT))?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -2184,6 +2511,18 @@ fn serve(
             }
             if !discovery_stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+    let pairing_stop = stop.clone();
+    let pairing_home = home.to_path_buf();
+    let pairing_responder = std::thread::spawn(move || {
+        while !pairing_stop.load(Ordering::Relaxed) {
+            if let Err(error) = pairing_responder(&pairing_home, tcp_port, &pairing_stop) {
+                eprintln!("Pairing discovery indisponível: {error:#}");
+            }
+            if !pairing_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
     });
@@ -2449,6 +2788,7 @@ fn serve(
     });
     stop.store(true, Ordering::Relaxed);
     let _ = responder.join();
+    let _ = pairing_responder.join();
     result
 }
 
@@ -2479,6 +2819,191 @@ fn pairing_payload(cfg: &DeviceConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_session(home: PathBuf) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let (_, wakes) = mpsc::channel();
+            let urgent = Mutex::new(BTreeMap::new());
+            let audit = Mutex::new((0, BTreeMap::new()));
+            let stop = AtomicBool::new(false);
+            let _ = session(
+                &home,
+                socket,
+                true,
+                wakes,
+                &urgent,
+                &audit,
+                &stop,
+                true,
+                &|_| {},
+            );
+        });
+        (endpoint, worker)
+    }
+
+    #[test]
+    fn pairing_requires_mode_and_approval_then_preserves_qr_and_endpoint_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::new(directory.path());
+        app.pair("127.0.0.1:43821").unwrap();
+        let cfg = app.config().unwrap();
+        let device_id = "d".repeat(64);
+        let fingerprint = hex::encode(discovery::fingerprint(&cfg.cert).unwrap());
+        let peer_for = |endpoint| pairing::Peer {
+            session_id: "a".repeat(64),
+            device_name: "Desktop".into(),
+            device_type: pairing::DeviceType::Pc,
+            pair_id: Some(cfg.pair_id.clone()),
+            fingerprint: Some(fingerprint.clone()),
+            cert_der: Some(cfg.cert.clone()),
+            endpoint,
+        };
+
+        let (endpoint, worker) = test_session(directory.path().to_path_buf());
+        let mut io =
+            tls::connect_pinned(&cfg.cert, &endpoint.to_string(), Duration::from_secs(2)).unwrap();
+        protocol::send(
+            &mut io,
+            &Message::PairRequest {
+                version: pairing::VERSION,
+                request_id: random_id().unwrap(),
+                device_id: device_id.clone(),
+                device_name: "Phone".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            protocol::receive(&mut io).unwrap(),
+            Message::PairRejected { .. }
+        ));
+        drop(io);
+        worker.join().unwrap();
+        assert!(app.config().unwrap().peer_device.is_none());
+
+        app.start_pairing_mode().unwrap();
+        let (endpoint, worker) = test_session(directory.path().to_path_buf());
+        let mut io =
+            tls::connect_pinned(&cfg.cert, &endpoint.to_string(), Duration::from_secs(2)).unwrap();
+        let peer = peer_for(endpoint);
+        let (_, code) = pairing::request(&mut io, &peer, &device_id, "Phone").unwrap();
+        let pending = app.pending_pairing().unwrap();
+        assert_eq!(pending.verification_code, code);
+        app.decide_pairing(&pending.request_id, false).unwrap();
+        assert!(pairing::finish(&mut io, &peer, &device_id).is_err());
+        drop(io);
+        worker.join().unwrap();
+        assert!(app.config().unwrap().peer_device.is_none());
+
+        let (endpoint, worker) = test_session(directory.path().to_path_buf());
+        let mut io =
+            tls::connect_pinned(&cfg.cert, &endpoint.to_string(), Duration::from_secs(2)).unwrap();
+        let peer = peer_for(endpoint);
+        pairing::request(&mut io, &peer, &device_id, "Phone").unwrap();
+        let (lock, wake) = pairing_state();
+        lock.lock().unwrap().until = Some(Instant::now() - Duration::from_secs(1));
+        wake.notify_all();
+        assert!(pairing::finish(&mut io, &peer, &device_id).is_err());
+        drop(io);
+        worker.join().unwrap();
+        assert!(app.config().unwrap().peer_device.is_none());
+        app.start_pairing_mode().unwrap();
+
+        let (endpoint, worker) = test_session(directory.path().to_path_buf());
+        let mut io =
+            tls::connect_pinned(&cfg.cert, &endpoint.to_string(), Duration::from_secs(2)).unwrap();
+        let offer = pairing::Packet::Offer {
+            session_id: random_id().unwrap(),
+            device_name: "Desktop".into(),
+            pair_id: cfg.pair_id.clone(),
+            fingerprint: fingerprint.clone(),
+            cert_der: cfg.cert.clone(),
+            tcp_port: endpoint.port(),
+        };
+        let peer = pairing::offered_peer(
+            pairing::decode(&pairing::encode(&offer).unwrap()).unwrap(),
+            SocketAddr::new(endpoint.ip(), pairing::PORT),
+        )
+        .unwrap();
+        pairing::request(&mut io, &peer, &device_id, "Phone").unwrap();
+        let pending = app.pending_pairing().unwrap();
+        app.decide_pairing(&pending.request_id, true).unwrap();
+        let invite = pairing::finish(&mut io, &peer, &device_id).unwrap();
+        assert_eq!(invite.address, endpoint.to_string());
+        drop(io);
+        worker.join().unwrap();
+        assert_eq!(
+            app.config().unwrap().peer_device.as_deref(),
+            Some(device_id.as_str())
+        );
+        let (endpoint, worker) = test_session(directory.path().to_path_buf());
+        let mut io =
+            tls::connect_pinned(&cfg.cert, &endpoint.to_string(), Duration::from_secs(2)).unwrap();
+        protocol::send(
+            &mut io,
+            &Message::PairRequest {
+                version: pairing::VERSION,
+                request_id: random_id().unwrap(),
+                device_id: device_id.clone(),
+                device_name: "Phone".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            protocol::receive(&mut io).unwrap(),
+            Message::PairRejected { .. }
+        ));
+        drop(io);
+        worker.join().unwrap();
+        app.stop_pairing_mode();
+
+        let (endpoint, worker) = test_session(directory.path().to_path_buf());
+        let mut qr_invite = invitation(&cfg);
+        qr_invite.address = endpoint.to_string();
+        let mut io =
+            tls::connect_to(&qr_invite, &qr_invite.address, Duration::from_secs(2)).unwrap();
+        protocol::client_auth(&mut io, &qr_invite.pair_id, &qr_invite.secret, &device_id).unwrap();
+        drop(io);
+        worker.join().unwrap();
+
+        let (endpoint, worker) = test_session(directory.path().to_path_buf());
+        qr_invite.address = "127.0.0.1:1".into();
+        let mut resolver = discovery::EndpointResolver::default();
+        let (io, selected) = resolver
+            .connect(&qr_invite, &device_id, 1, |_| Ok(vec![endpoint]))
+            .unwrap();
+        assert_eq!(selected, endpoint.to_string());
+        drop(io);
+        worker.join().unwrap();
+
+        app.start_pairing_mode().unwrap_err();
+    }
+
+    #[test]
+    fn bootstrap_tls_rejects_a_certificate_different_from_announcement() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let a = App::new(first.path());
+        let b = App::new(second.path());
+        a.pair("127.0.0.1:43821").unwrap();
+        b.pair("127.0.0.1:43821").unwrap();
+        let a = a.config().unwrap();
+        let b = b.config().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut io = tls::accept(socket, tls::server_config(&a.cert, &a.key).unwrap()).unwrap();
+            let mut byte = [0];
+            let _ = io.read(&mut byte);
+        });
+        let mut client =
+            tls::connect_pinned(&b.cert, &endpoint.to_string(), Duration::from_secs(2)).unwrap();
+        assert!(client.write_all(b"hello").is_err());
+        server.join().unwrap();
+    }
 
     #[test]
     fn snapshots_and_pairing_are_derived() {

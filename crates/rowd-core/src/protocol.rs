@@ -15,6 +15,22 @@ pub const PROTOCOL_VERSION: u32 = 12;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
+    PairRequest {
+        version: u32,
+        request_id: String,
+        device_id: String,
+        device_name: String,
+    },
+    PairPending {
+        request_id: String,
+        verification_code: String,
+    },
+    PairAccepted {
+        invitation: crate::model::Invitation,
+    },
+    PairRejected {
+        reason: String,
+    },
     Scoped {
         share_id: String,
         message: Box<Message>,
@@ -282,11 +298,21 @@ fn auth_mac(secret: &str, nonce: &str, pair_id: &str, device_id: &str) -> Result
 }
 
 pub fn server_auth(io: &mut (impl Read + Write), pair_id: &str, secret: &str) -> Result<String> {
+    let first = receive(io)?;
+    server_auth_with_first(io, pair_id, secret, first)
+}
+
+pub fn server_auth_with_first(
+    io: &mut (impl Read + Write),
+    pair_id: &str,
+    secret: &str,
+    first: Message,
+) -> Result<String> {
     let Message::Hello {
         version,
         pair_id: peer,
         device_id,
-    } = receive(io)?
+    } = first
     else {
         anyhow::bail!("expected hello")
     };

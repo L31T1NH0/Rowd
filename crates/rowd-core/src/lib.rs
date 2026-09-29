@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod ignore;
 pub mod managed;
 pub mod model;
+pub mod pairing;
 pub mod protocol;
 pub mod storage;
 pub mod sync;
