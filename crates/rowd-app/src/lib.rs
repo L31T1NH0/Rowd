@@ -227,7 +227,16 @@ impl App {
         stop: Arc<AtomicBool>,
         event: impl Fn(String) + Sync,
     ) -> Result<()> {
-        serve(&self.home, listen, once, stop, event)
+        serve(&self.home, listen, once, stop, event, &|_| {})
+    }
+
+    pub fn serve_observed(
+        &self,
+        stop: Arc<AtomicBool>,
+        log: impl Fn(String) + Sync,
+        signal: impl Fn(AppSignal) + Sync,
+    ) -> Result<()> {
+        serve(&self.home, None, false, stop, log, &signal)
     }
 
     pub fn pairing_info(&self) -> Result<PairingInfo> {
@@ -462,6 +471,25 @@ pub struct AppSnapshot {
     pub shares: Vec<Status>,
     pub requests: Vec<ShareRequest>,
     pub recovery: Vec<RecoveryItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AppSignal {
+    pub kind: &'static str,
+    pub share_id: Option<String>,
+    pub duration_ms: Option<u128>,
+    pub transferred: Option<usize>,
+}
+
+impl AppSignal {
+    fn new(kind: &'static str, share_id: Option<String>) -> Self {
+        Self {
+            kind,
+            share_id,
+            duration_ms: None,
+            transferred: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1696,6 +1724,7 @@ fn session(
     stop: &AtomicBool,
     once: bool,
     event: &impl Fn(String),
+    signal: &impl Fn(AppSignal),
 ) -> Result<()> {
     let cfg = DeviceConfig::load(home)?;
     let mut io = tls::accept(socket, tls::server_config(&cfg.cert, &cfg.key)?)?;
@@ -1836,6 +1865,7 @@ fn session(
         },
     )?;
     event("Android conectado".into());
+    signal(AppSignal::new("connected", None));
     io.sock.set_read_timeout(Some(Duration::from_millis(50)))?;
     let mut audit_preempted = false;
     loop {
@@ -1890,6 +1920,7 @@ fn session(
                 audit_events,
                 &mut audit_preempted,
                 event,
+                signal,
             );
             if once {
                 return result;
@@ -1937,6 +1968,7 @@ fn session_round(
     audit_events: &Mutex<(u64, BTreeMap<String, u64>)>,
     audit_preempted: &mut bool,
     event: &impl Fn(String),
+    signal: &impl Fn(AppSignal),
 ) -> Result<()> {
     let started = Instant::now();
     let audit_generation = audit_events.lock().unwrap().0;
@@ -1961,6 +1993,7 @@ fn session_round(
                     Ok(rules) => (true, rules),
                     Err(error) => {
                         event(format!("{} indisponível: {error:#}", share.name));
+                        signal(AppSignal::new("share_error", Some(share.share_id.clone())));
                         (false, String::new())
                     }
                 }
@@ -2169,6 +2202,7 @@ fn session_round(
                 }
             }
             let share_started_ms = started.elapsed().as_millis();
+            signal(AppSignal::new("sync_start", Some(share.share_id.clone())));
             event(format!(
                 "Sincronizando {} ({}/{})",
                 share.name,
@@ -2250,6 +2284,7 @@ fn session_round(
                 Ok(report) => report,
                 Err(error) => {
                     record_share_error(home, &share.share_id, operation, &error);
+                    signal(AppSignal::new("share_error", Some(share.share_id.clone())));
                     if selected {
                         return Err(error);
                     }
@@ -2304,6 +2339,25 @@ fn session_round(
                 "{}: {} transferências, {} conflitos",
                 share.name, report.transferred, report.conflicts
             ));
+            signal(AppSignal {
+                kind: "sync_done",
+                share_id: Some(share.share_id.clone()),
+                duration_ms: Some(
+                    started
+                        .elapsed()
+                        .as_millis()
+                        .saturating_sub(share_started_ms),
+                ),
+                transferred: Some(report.transferred),
+            });
+            if report.transferred > 0 {
+                signal(AppSignal {
+                    kind: "transfer",
+                    share_id: Some(share.share_id.clone()),
+                    duration_ms: None,
+                    transferred: Some(report.transferred),
+                });
+            }
         }
         round_metrics.total_ms = started.elapsed().as_millis();
         let processed_any = round_metrics.shares_processed > 0;
@@ -2514,6 +2568,7 @@ fn serve(
     once: bool,
     stop: Arc<AtomicBool>,
     event: impl Fn(String) + Sync,
+    signal: &(impl Fn(AppSignal) + Sync),
 ) -> Result<()> {
     let _runtime_lock = LocalStore::open(&home.join(".rowd/runtime"))?;
     let cfg = DeviceConfig::load(home)?;
@@ -2522,8 +2577,10 @@ fn serve(
     event(format!("Rowd ouvindo em {}", listener.local_addr()?));
     let tcp_port = listener.local_addr()?.port();
     pairing_state().0.lock().unwrap().tcp_port = Some(tcp_port);
+    let (responder_errors, responder_error_rx) = mpsc::channel::<String>();
     let discovery_stop = stop.clone();
     let discovery_home = home.to_path_buf();
+    let discovery_errors = responder_errors.clone();
     let responder = std::thread::spawn(move || {
         let mut last_error = None;
         while !discovery_stop.load(Ordering::Relaxed) {
@@ -2533,7 +2590,7 @@ fn serve(
                 Err(error) => {
                     let message = format!("{error:#}");
                     if last_error.as_deref() != Some(message.as_str()) {
-                        eprintln!("Discovery indisponível: {message}");
+                        let _ = discovery_errors.send(format!("Discovery indisponível: {message}"));
                         last_error = Some(message);
                     }
                 }
@@ -2545,6 +2602,7 @@ fn serve(
     });
     let pairing_stop = stop.clone();
     let pairing_home = home.to_path_buf();
+    let pairing_errors = responder_errors;
     let pairing_responder = std::thread::spawn(move || {
         let mut last_error = None;
         while !pairing_stop.load(Ordering::Relaxed) {
@@ -2553,7 +2611,9 @@ fn serve(
                 Err(error) => {
                     let message = format!("{error:#}");
                     if last_error.as_deref() != Some(message.as_str()) {
-                        eprintln!("Pairing discovery bind/receive indisponível: {message}");
+                        let _ = pairing_errors.send(format!(
+                            "Pairing discovery bind/receive indisponível: {message}"
+                        ));
                         last_error = Some(message);
                     }
                 }
@@ -2586,11 +2646,15 @@ fn serve(
     let mut last_config = Instant::now() - Duration::from_secs(2);
     let urgent = Mutex::new(BTreeMap::new());
     let audit_events = Mutex::new((0u64, BTreeMap::new()));
+    signal(AppSignal::new("ready", None));
     let result = std::thread::scope(|scope| -> Result<()> {
         let mut connected = None;
         let mut connected_socket: Option<TcpStream> = None;
         let mut wake_tx: Option<mpsc::Sender<String>> = None;
         while !stop.load(Ordering::Relaxed) {
+            for message in responder_error_rx.try_iter() {
+                event(message);
+            }
             if connected
                 .as_ref()
                 .is_some_and(std::thread::ScopedJoinHandle::is_finished)
@@ -2682,6 +2746,10 @@ fn serve(
                                             events.1.insert(share.share_id.clone(), generation);
                                         }
                                         if !dirty.contains_key(&share.share_id) {
+                                            signal(AppSignal::new(
+                                                "change",
+                                                Some(share.share_id.clone()),
+                                            ));
                                             event(format!(
                                                 "change_detected_at={} share={}",
                                                 std::time::SystemTime::now()
@@ -2794,7 +2862,7 @@ fn serve(
                     let stop = &stop;
                     let event = &event;
                     let handle = scope.spawn(move || {
-                        session(
+                        let result = session(
                             home,
                             socket,
                             !watcher_untrusted,
@@ -2804,7 +2872,10 @@ fn serve(
                             stop,
                             once,
                             event,
-                        )
+                            signal,
+                        );
+                        signal(AppSignal::new("disconnected", None));
+                        result
                     });
                     if once {
                         return handle.join().expect("session thread panicked");
@@ -2930,6 +3001,7 @@ mod tests {
                 &audit,
                 &stop,
                 true,
+                &|_| {},
                 &|_| {},
             );
         });

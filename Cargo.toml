@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/rowd-core", "crates/rowd-app", "crates/rowd", "crates/rowd-android"]
+members = ["crates/rowd-core", "crates/rowd-app", "crates/rowd-daemon", "crates/rowd", "crates/rowd-android"]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.1-alpha"
+version = "0.7.0-alpha"
 edition = "2021"
 license = "MIT"
 

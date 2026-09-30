@@ -1563,6 +1563,7 @@ fn start_job(
 }
 
 pub fn run(home: &Path) -> Result<()> {
+    anyhow::ensure!(!rowd_daemon::ipc_present(home), "Daemon ativo. A TUI ainda não usa IPC para operações; use a CLI ou pare o daemon antes de abrir a TUI.");
     anyhow::ensure!(
         io::stdin().is_terminal(),
         "A TUI requer terminal interativo; use --help para a CLI."
@@ -1584,6 +1585,10 @@ pub fn run(home: &Path) -> Result<()> {
             }
         }
         if worker.is_none() && ui.snapshot.device.configured {
+            anyhow::ensure!(
+                !rowd_daemon::ipc_present(home),
+                "Daemon iniciado enquanto a TUI estava aberta; use a CLI ou pare o daemon."
+            );
             let worker_home = home.to_path_buf();
             let worker_stop = stop.clone();
             let worker_tx = tx.clone();

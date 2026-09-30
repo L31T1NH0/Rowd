@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use rowd_app::App;
 use rowd_core::config::{RemapPolicy, SyncMode};
 use rowd_core::trace;
+use rowd_daemon as daemon;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -22,6 +23,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+    Autostart {
+        #[command(subcommand)]
+        command: AutostartCommand,
+    },
+    Status,
+    Logs {
+        #[arg(short, long)]
+        follow: bool,
+    },
+    Events {
+        #[arg(short, long)]
+        follow: bool,
+    },
     Pair {
         #[arg(long)]
         address: Option<String>,
@@ -82,6 +100,21 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    Run,
+    Start,
+    Stop,
+    Restart,
+}
+
+#[derive(Subcommand)]
+enum AutostartCommand {
+    Enable,
+    Disable,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -206,6 +239,20 @@ fn run() -> Result<()> {
         return tui::run(&home);
     };
     match command {
+        Command::Daemon { command } => match command {
+            DaemonCommand::Run => daemon::run(&home)?,
+            DaemonCommand::Start => daemon::start(&home)?,
+            DaemonCommand::Stop => daemon::stop(&home)?,
+            DaemonCommand::Restart => daemon::restart(&home)?,
+        },
+        Command::Autostart { command } => match command {
+            AutostartCommand::Enable => daemon::autostart_enable(&home)?,
+            AutostartCommand::Disable => daemon::autostart_disable()?,
+            AutostartCommand::Status => println!("{}", daemon::autostart_status()?),
+        },
+        Command::Status => print_daemon_status(&home)?,
+        Command::Logs { follow } => print_stream(&home, "logs", follow)?,
+        Command::Events { follow } => print_stream(&home, "events", follow)?,
         Command::Pair { address, invite } => {
             app.pair(address.as_deref().unwrap_or(""))?;
             if let Some(path) = invite {
@@ -339,6 +386,64 @@ fn run() -> Result<()> {
                 "all" => app.archive_all_application_data()?,
                 _ => anyhow::bail!("level must be share, unlink, initial or all"),
             }
+        }
+    }
+    Ok(())
+}
+
+fn print_stream(home: &std::path::Path, name: &str, follow: bool) -> Result<()> {
+    if follow {
+        daemon::follow(home, name)?;
+    } else {
+        for line in daemon::history(home, name)? {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+fn print_daemon_status(home: &std::path::Path) -> Result<()> {
+    if !daemon::ipc_present(home) {
+        println!("Daemon: parado");
+        return Ok(());
+    }
+    let reply = daemon::request(home, "status")?;
+    let data = reply.data.context("daemon returned no status")?;
+    let uptime = data["uptime_seconds"].as_u64().unwrap_or(0);
+    println!("Daemon        ativo\nModo          {}\nPID           {}\nUptime        {:02}h{:02}m\nIPC           v{}\nRowd          {}",
+        data["launch_mode"].as_str().unwrap_or("?"), data["pid"], uptime / 3600, uptime % 3600 / 60, data["ipc_version"], data["rowd_version"].as_str().unwrap_or("?"));
+    println!(
+        "Celular       {}",
+        if data["connected"].as_bool() == Some(true) {
+            "conectado"
+        } else {
+            "desconectado"
+        }
+    );
+    if let Some(last) = data["app"]["device"]["last_connection"].as_u64() {
+        println!("Última conexão {last}");
+    }
+    if let Some(shares) = data["app"]["shares"].as_array() {
+        println!("\nShares");
+        for item in shares {
+            let share = &item["share"];
+            let name = share["name"].as_str().unwrap_or("?");
+            let state = if share["enabled"].as_bool() == Some(false) {
+                "pausado"
+            } else if item["root_available"].as_bool() == Some(false) {
+                "indisponível"
+            } else if item["error"].is_string() || item["last_error"].is_object() {
+                "erro"
+            } else {
+                "ativo"
+            };
+            let direction = match share["mode"].as_str() {
+                Some("bidirectional") => "↔",
+                Some("to_android") => "→",
+                Some("to_pc") => "←",
+                _ => "?",
+            };
+            println!("{}  {}  {}", name, direction, state);
         }
     }
     Ok(())

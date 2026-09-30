@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "rowd"
-version = "0.6.1-alpha"
+version = "0.7.0-alpha"
 dependencies = [
  "anyhow",
  "clap",
@@ -798,6 +798,7 @@ dependencies = [
  "rcgen",
  "rowd-app",
  "rowd-core",
+ "rowd-daemon",
  "serde",
  "serde_json",
  "tempfile",
@@ -805,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "rowd-android"
-version = "0.6.1-alpha"
+version = "0.7.0-alpha"
 dependencies = [
  "anyhow",
  "jni",
@@ -816,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "rowd-app"
-version = "0.6.1-alpha"
+version = "0.7.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -837,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "rowd-core"
-version = "0.6.1-alpha"
+version = "0.7.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -846,6 +847,21 @@ dependencies = [
  "hex",
  "hmac",
  "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "rowd-daemon"
+version = "0.7.0-alpha"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "hex",
+ "libc",
+ "rowd-app",
  "serde",
  "serde_json",
  "sha2",

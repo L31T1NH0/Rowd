@@ -1,0 +1,18 @@
+[package]
+name = "rowd-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rowd-app = { path = "../rowd-app" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+fs2 = "0.4"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
