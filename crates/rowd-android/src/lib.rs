@@ -234,7 +234,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_revokeRemotePairing(
 
 #[no_mangle]
 pub extern "system" fn Java_app_rowd_NativeBridge_networkChanged(_env: JNIEnv, _class: JObject) {
-    NETWORK_GENERATION.fetch_add(1, Ordering::Relaxed);
+    NETWORK_GENERATION.fetch_add(1, Ordering::SeqCst);
     if let Some(socket) = ACTIVE_SOCKET.get() {
         if let Ok(mut socket) = socket.lock() {
             if let Some(socket) = socket.take() {
@@ -242,10 +242,9 @@ pub extern "system" fn Java_app_rowd_NativeBridge_networkChanged(_env: JNIEnv, _
             }
         }
     }
+    // If sync owns CONNECTION, socket shutdown or its generation check clears it.
     if let Ok(mut connection) = connection().try_lock() {
-        if let Some((_, io)) = connection.take() {
-            let _ = io.sock.shutdown(std::net::Shutdown::Both);
-        }
+        clear_connection(&mut connection);
     }
 }
 
@@ -662,91 +661,105 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
         let mut connection = connection().lock().unwrap();
-        let fingerprint = invite.fingerprint()?;
-        let key = format!(
-            "{}|{}|{}|{device}",
-            invite.pair_id, fingerprint, invite.secret
-        );
-        if connection.as_ref().is_some_and(|(current, _)| {
-            current != &key
-                || CONNECTION_GENERATION.load(Ordering::Relaxed)
-                    != NETWORK_GENERATION.load(Ordering::Relaxed)
-        }) {
-            clear_connection(&mut connection);
-        }
-        let mut skipped = std::collections::BTreeSet::new();
-        let mut errors = Vec::new();
-        loop {
-            if connection.is_none() {
-                let generation = NETWORK_GENERATION.load(Ordering::Relaxed);
-                let mut resolver = RESOLVER
-                    .get_or_init(|| Mutex::new(Default::default()))
-                    .lock()
-                    .unwrap();
-                let (io, endpoint) =
-                    resolver.connect(&invite, &device, generation, |fingerprint| {
-                        let acquired = store.call("acquireMulticast", &[]);
-                        let result = match acquired {
-                            Ok(_) => (|| {
-                                let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-                                rowd_core::discovery::collect(
-                                    &socket,
-                                    (rowd_core::discovery::GROUP, rowd_core::discovery::PORT)
-                                        .into(),
-                                    fingerprint,
-                                )
-                            })(),
-                            Err(error) => Err(error),
-                        };
-                        let _ = store.call("releaseMulticast", &[]);
-                        result
-                    })?;
-                anyhow::ensure!(
-                    generation == NETWORK_GENERATION.load(Ordering::Relaxed),
-                    "Rede alterada durante a conexão"
-                );
-                store.call("authenticatedAddress", &[&endpoint])?;
-                CONNECTION_GENERATION.store(generation, Ordering::Relaxed);
-                *ACTIVE_SOCKET
-                    .get_or_init(|| Mutex::new(None))
-                    .lock()
-                    .unwrap() = Some(io.sock.try_clone()?);
-                *connection = Some((key.clone(), io));
-                if generation != NETWORK_GENERATION.load(Ordering::Relaxed) {
-                    clear_connection(&mut connection);
-                    anyhow::bail!("Rede alterada durante a conexão");
-                }
-            }
-            store.scan_socket = Some(connection.as_ref().unwrap().1.sock.try_clone()?);
-            let mut failed = None;
-            let result = rowd_core::managed::client_round_on_excluding(
-                &mut connection.as_mut().unwrap().1,
-                &device,
-                &mut store,
-                &skipped,
-                &mut failed,
+        let result = (|| -> Result<String> {
+            let fingerprint = invite.fingerprint()?;
+            let key = format!(
+                "{}|{}|{}|{device}",
+                invite.pair_id, fingerprint, invite.secret
             );
-            match result {
-                Ok(report) => {
+            if connection.as_ref().is_some_and(|(current, _)| {
+                current != &key
+                    || CONNECTION_GENERATION.load(Ordering::SeqCst)
+                        != NETWORK_GENERATION.load(Ordering::SeqCst)
+            }) {
+                clear_connection(&mut connection);
+            }
+            let mut skipped = std::collections::BTreeSet::new();
+            let mut errors = Vec::new();
+            loop {
+                if connection.is_none() {
+                    let generation = NETWORK_GENERATION.load(Ordering::SeqCst);
+                    let mut resolver = RESOLVER
+                        .get_or_init(|| Mutex::new(Default::default()))
+                        .lock()
+                        .unwrap();
+                    let (io, endpoint) =
+                        resolver.connect(&invite, &device, generation, |fingerprint| {
+                            let acquired = store.call("acquireMulticast", &[]);
+                            let result = match acquired {
+                                Ok(_) => (|| {
+                                    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                                    rowd_core::discovery::collect(
+                                        &socket,
+                                        (rowd_core::discovery::GROUP, rowd_core::discovery::PORT)
+                                            .into(),
+                                        fingerprint,
+                                    )
+                                })(),
+                                Err(error) => Err(error),
+                            };
+                            let _ = store.call("releaseMulticast", &[]);
+                            result
+                        })?;
                     anyhow::ensure!(
-                        errors.is_empty(),
-                        "{} Share(s) failed: {}",
-                        errors.len(),
-                        errors.join("; ")
+                        generation == NETWORK_GENERATION.load(Ordering::SeqCst),
+                        "Rede alterada durante a conexão"
                     );
-                    break Ok(serde_json::to_string(&report)?);
+                    store.call("authenticatedAddress", &[&endpoint])?;
+                    CONNECTION_GENERATION.store(generation, Ordering::SeqCst);
+                    *ACTIVE_SOCKET
+                        .get_or_init(|| Mutex::new(None))
+                        .lock()
+                        .unwrap() = Some(io.sock.try_clone()?);
+                    *connection = Some((key.clone(), io));
+                    if generation != NETWORK_GENERATION.load(Ordering::SeqCst) {
+                        clear_connection(&mut connection);
+                        anyhow::bail!("Rede alterada durante a conexão");
+                    }
                 }
-                Err(error) => {
-                    clear_connection(&mut connection);
-                    match failed {
-                        Some(id) if skipped.insert(id.clone()) => {
-                            errors.push(format!("{id}: {error:#}"))
+                store.scan_socket = Some(connection.as_ref().unwrap().1.sock.try_clone()?);
+                let mut failed = None;
+                let result = rowd_core::managed::client_round_on_excluding(
+                    &mut connection.as_mut().unwrap().1,
+                    &device,
+                    &mut store,
+                    &skipped,
+                    &mut failed,
+                );
+                anyhow::ensure!(
+                    CONNECTION_GENERATION.load(Ordering::SeqCst)
+                        == NETWORK_GENERATION.load(Ordering::SeqCst),
+                    "Rede alterada durante a rodada"
+                );
+                match result {
+                    Ok(report) => {
+                        anyhow::ensure!(
+                            errors.is_empty(),
+                            "{} Share(s) failed: {}",
+                            errors.len(),
+                            errors.join("; ")
+                        );
+                        break Ok(serde_json::to_string(&report)?);
+                    }
+                    Err(error) => {
+                        store.scan_socket = None;
+                        clear_connection(&mut connection);
+                        match failed {
+                            Some(id) if skipped.insert(id.clone()) => {
+                                errors.push(format!("{id}: {error:#}"))
+                            }
+                            _ => break Err(error),
                         }
-                        _ => break Err(error),
                     }
                 }
             }
+        })();
+        if result.is_err() {
+            // Every error after acquiring the mutex must discard the persistent stream.
+            store.scan_socket = None;
+            clear_connection(&mut connection);
         }
+        result
     }));
     let output = match result {
         Ok(Ok(value)) => value,
@@ -778,7 +791,11 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
     _class: JObject<'local>,
 ) -> jstring {
     let mut connection = connection().lock().unwrap();
-    let result = if let Some((_, io)) = connection.as_mut() {
+    let result = if connection.is_some()
+        && CONNECTION_GENERATION.load(Ordering::SeqCst) != NETWORK_GENERATION.load(Ordering::SeqCst)
+    {
+        "!".to_string()
+    } else if let Some((_, io)) = connection.as_mut() {
         let _ = io.sock.set_read_timeout(Some(Duration::from_millis(100)));
         let mut first = [0u8; 1];
         let buffered = match io.conn.reader().read(&mut first) {
@@ -820,9 +837,16 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
     } else {
         "!".to_string()
     };
-    if result == "!" {
+    let result = if result == "!"
+        || (connection.is_some()
+            && CONNECTION_GENERATION.load(Ordering::SeqCst)
+                != NETWORK_GENERATION.load(Ordering::SeqCst))
+    {
         clear_connection(&mut connection);
-    }
+        "!".to_string()
+    } else {
+        result
+    };
     env.new_string(result)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())

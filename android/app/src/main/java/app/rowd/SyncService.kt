@@ -6,7 +6,6 @@ import android.content.Intent
 import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.Network
-import android.net.NetworkCapabilities
 import android.net.LinkProperties
 import android.os.IBinder
 import android.os.Handler
@@ -15,6 +14,18 @@ import org.json.JSONObject
 import org.json.JSONArray
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.CopyOnWriteArraySet
+import java.net.Inet4Address
+
+internal data class NetworkPath(val network: Long?, val interfaceName: String?, val ipv4: String?) {
+    fun changedFrom(previous: NetworkPath): Boolean =
+        network != previous.network ||
+            (interfaceName != null && previous.interfaceName != null && interfaceName != previous.interfaceName) ||
+            (ipv4 != null && previous.ipv4 != null && ipv4 != previous.ipv4)
+
+    fun retainingKnown(previous: NetworkPath): NetworkPath =
+        if (network == previous.network) NetworkPath(network, interfaceName ?: previous.interfaceName, ipv4 ?: previous.ipv4)
+        else this
+}
 
 data class RowdStatus(val kind: Kind, val title: String, val detail: String) {
     enum class Kind { Idle, Working, Ready, NeedsAttention, Error, Paused }
@@ -64,29 +75,32 @@ class SyncService : Service() {
     private val active = AtomicBoolean(false)
     private var worker: Thread? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var networkSignature: String? = null
+    private var networkPath: NetworkPath? = null
     private fun observeNetwork() {
         val manager = getSystemService(ConnectivityManager::class.java)
-        fun signature(): String {
-            val network = manager.activeNetwork ?: return "offline"
+        fun path(): NetworkPath {
+            val network = manager.activeNetwork ?: return NetworkPath(null, null, null)
             val links = manager.getLinkProperties(network)
-            val caps = manager.getNetworkCapabilities(network)
-            return "$network|${links?.interfaceName}|${links?.linkAddresses}|${links?.routes}|${caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)}"
+            val ipv4 = links?.linkAddresses?.mapNotNull { it.address as? Inet4Address }
+                ?.filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
+                ?.map { it.hostAddress }?.sorted()?.firstOrNull()
+            return NetworkPath(network.networkHandle, links?.interfaceName, ipv4)
         }
-        networkSignature = signature()
+        networkPath = path()
         val callback = object : ConnectivityManager.NetworkCallback() {
             private fun changed() {
-                val current = signature()
-                synchronized(this@SyncService) {
-                    if (current == networkSignature) return
-                    networkSignature = current
+                val current = path()
+                val changed = synchronized(this@SyncService) {
+                    val previous = networkPath ?: current
+                    networkPath = current.retainingKnown(previous)
+                    current.changedFrom(previous)
                 }
+                if (!changed) return
                 NativeBridge.networkChanged()
                 wake()
             }
             override fun onAvailable(network: Network) = changed()
             override fun onLost(network: Network) = changed()
-            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = changed()
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = changed()
         }
         networkCallback = callback
@@ -273,7 +287,7 @@ class SyncService : Service() {
                     notifyStatus(state.title)
                     prefs.edit().putString("lastStatus", state.title).putString("lastDetail", state.detail)
                         .putString("lastStatusKind", state.kind.name).apply()
-                    if (!active.get()) break
+                    if (!active.get() || !prefs.contains("invitation")) break
                     var remoteWake = false
                     if (failures == 0) {
                         while (active.get()) {
@@ -300,7 +314,7 @@ class SyncService : Service() {
                             if (next == "!") break
                         }
                     }
-                } while (active.get())
+                } while (active.get() && prefs.contains("invitation"))
             } catch (_: InterruptedException) {
                 if (!prefs.contains("invitation")) publish(RowdStatus.Kind.Idle, "Celular desvinculado", "Conecte ao computador para parear novamente.")
                 else publish(RowdStatus.Kind.Paused, "Sincronização pausada", state.detail)

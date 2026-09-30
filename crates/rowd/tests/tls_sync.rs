@@ -157,6 +157,64 @@ fn resolver_reuses_authenticated_endpoint_until_network_changes() {
 }
 
 #[test]
+fn resolver_tries_discovery_after_cached_endpoint_fails() {
+    let old = TcpListener::bind("127.0.0.1:0").unwrap();
+    let next = TcpListener::bind("127.0.0.1:0").unwrap();
+    let old_address = old.local_addr().unwrap();
+    let next_address = next.local_addr().unwrap();
+    let (invite, key) = invitation(old_address.to_string());
+    let config = tls::server_config(&invite.cert_der, &key).unwrap();
+    let device = random_id().unwrap();
+    let mut resolver = rowd_core::discovery::EndpointResolver::default();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let (socket, _) = old.accept().unwrap();
+            let mut io = tls::accept(socket, config.clone()).unwrap();
+            protocol::server_auth(&mut io, &invite.pair_id, &invite.secret).unwrap();
+        });
+        let (io, _) = resolver
+            .connect(&invite, &device, 0, |_| Ok(vec![]))
+            .unwrap();
+        drop(io);
+    });
+    drop(old);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            next.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            for _ in 0..2 {
+                let socket = loop {
+                    match next.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("next endpoint did not accept: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                let mut io = tls::accept(socket, config.clone()).unwrap();
+                protocol::server_auth(&mut io, &invite.pair_id, &invite.secret).unwrap();
+            }
+        });
+        let (io, address) = resolver
+            .connect(&invite, &device, 0, |_| Ok(vec![next_address]))
+            .unwrap();
+        assert_eq!(address, next_address.to_string());
+        drop(io);
+        let (_io, cached_address) = resolver
+            .connect(&invite, &device, 0, |_| {
+                panic!("new endpoint should be cached")
+            })
+            .unwrap();
+        assert_eq!(cached_address, address);
+    });
+}
+
+#[test]
 fn resolver_drops_cached_endpoint_when_invitation_identity_changes() {
     let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
