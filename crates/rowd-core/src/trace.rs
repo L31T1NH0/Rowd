@@ -247,6 +247,7 @@ struct Session {
     seq: u64,
     limit: u64,
     seen: HashSet<String>,
+    remote_installs: HashMap<String, String>,
     transfers: HashMap<String, String>,
 }
 fn save_metadata(path: &Path, metadata: &Value) -> Result<()> {
@@ -365,6 +366,7 @@ fn start_with_limit(root: &Path, side: &str, shared_id: Option<&str>, limit: u64
         seq: 0,
         limit,
         seen: HashSet::new(),
+        remote_installs: HashMap::new(),
         transfers: HashMap::new(),
     });
     *FAILURE.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
@@ -1022,19 +1024,31 @@ pub fn first_seen(
     source: &str,
     modified: Option<u64>,
     created: Option<u64>,
+    hash: Option<&str>,
 ) {
     if !enabled() {
         return;
     }
     let id = file_id(share, path);
-    let first = session()
-        .lock()
-        .unwrap()
-        .as_mut()
-        .is_some_and(|s| s.seen.insert(id));
-    if !first {
-        return;
-    }
+    let origin = {
+        let mut guard = session().lock().unwrap();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        if !session.seen.insert(id.clone()) {
+            return;
+        }
+        if hash.is_some_and(|hash| {
+            session
+                .remote_installs
+                .get(&id)
+                .is_some_and(|known| known == hash)
+        }) {
+            "remote_install"
+        } else {
+            "unknown"
+        }
+    };
     let _scope = current_context().file(share, path).enter();
     let ms = wall_ms();
     let loc = std::panic::Location::caller();
@@ -1042,14 +1056,14 @@ pub fn first_seen(
         Level::Trace,
         Component::Filesystem,
         "FILE_FIRST_SEEN",
-        json!({"relative_path":path,"source":source,"first_observed_wall_ms":ms,"metadata_created_ms":created,"metadata_modified_ms":modified,"provider_last_modified_ms":null,"file_age_at_first_observation_ms":modified.map(|m|ms as i128-m as i128)}),
+        json!({"relative_path":path,"origin":origin,"observed_via":source,"first_observed_wall_ms":ms,"metadata_created_ms":created,"metadata_modified_ms":modified,"provider_last_modified_ms":null,"file_age_at_first_observation_ms":modified.map(|m|ms as i128-m as i128)}),
         loc.file(),
         loc.line(),
         "first_seen",
     );
 }
 #[track_caller]
-pub fn observed_file(path: &str, source: &str, metadata: &fs::Metadata) {
+pub fn observed_file(path: &str, source: &str, metadata: &fs::Metadata, hash: &str) {
     if !enabled() {
         return;
     }
@@ -1074,7 +1088,24 @@ pub fn observed_file(path: &str, source: &str, metadata: &fs::Metadata) {
             .ok()
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as u64),
+        Some(hash),
     );
+}
+
+/// Record a successful remote install without inventing an observation.
+pub fn remote_installed(path: &str, hash: &str) {
+    if !enabled() {
+        return;
+    }
+    let ctx = current_context();
+    let Some(share) = ctx.ids.get("share_id").and_then(Value::as_str) else {
+        return;
+    };
+    if let Some(session) = session().lock().unwrap().as_mut() {
+        session
+            .remote_installs
+            .insert(file_id(share, path), hash.into());
+    }
 }
 
 /// Kotlin routes structured events through the same writer and sequence as JNI Rust.
@@ -1305,6 +1336,105 @@ mod tests {
             .find(|v| v["fields"]["relative_path"] == "unchanged")
             .unwrap();
         assert!(unchanged["context"].get("transfer_id").is_none());
+        let mut scan_attempts = 0;
+        let peeked = crate::io_retry::interrupted("scan_peek", || {
+            scan_attempts += 1;
+            if scan_attempts == 1 {
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(1)
+            }
+        })
+        .unwrap();
+        assert_eq!(peeked, 1);
+        {
+            let _share = current_context().with("share_id", "origin-test").enter();
+            remote_installed("received.txt", "verified-hash");
+            first_seen(
+                "origin-test",
+                "received.txt",
+                "focused_scan",
+                None,
+                None,
+                Some("verified-hash"),
+            );
+            remote_installed("edited.txt", "old-hash");
+            first_seen(
+                "origin-test",
+                "edited.txt",
+                "content_observer",
+                None,
+                None,
+                Some("new-hash"),
+            );
+        }
+        {
+            let _connection = current_context()
+                .with("connection_id", "lifecycle-connection")
+                .enter();
+            crate::managed::check_round_lifecycle();
+        }
+        flush().unwrap();
+        let records: Vec<Value> = fs::read_to_string(latest.join("trace-0001.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|v| v["event"] == "IO_INTERRUPTED_RETRY"
+                    && v["fields"]["operation"] == "scan_peek")
+                .count(),
+            1
+        );
+        assert!(!records
+            .iter()
+            .any(|v| v["event"] == "CONNECTION_CLEARED" || v["event"] == "ROUND_FAILED"));
+        let received = records
+            .iter()
+            .find(|v| {
+                v["event"] == "FILE_FIRST_SEEN" && v["fields"]["relative_path"] == "received.txt"
+            })
+            .unwrap();
+        assert_eq!(received["fields"]["origin"], "remote_install");
+        assert_eq!(received["fields"]["observed_via"], "focused_scan");
+        let edited = records
+            .iter()
+            .find(|v| {
+                v["event"] == "FILE_FIRST_SEEN" && v["fields"]["relative_path"] == "edited.txt"
+            })
+            .unwrap();
+        assert_eq!(edited["fields"]["origin"], "unknown");
+        let starts: Vec<_> = records
+            .iter()
+            .filter(|v| {
+                v["event"] == "ROUND_START"
+                    && v["context"]["connection_id"] == "lifecycle-connection"
+            })
+            .collect();
+        let ends: Vec<_> = records
+            .iter()
+            .filter(|v| {
+                v["event"] == "ROUND_END" && v["context"]["connection_id"] == "lifecycle-connection"
+            })
+            .collect();
+        assert_eq!(starts.len(), 4);
+        assert_eq!(starts.len(), ends.len());
+        for start in starts {
+            assert_eq!(
+                ends.iter()
+                    .filter(|end| end["context"]["round_id"] == start["context"]["round_id"])
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            ends.iter()
+                .filter(|end| end["fields"]["result"] == "failed")
+                .count(),
+            2
+        );
         // Read-only descriptor makes writes fail without depending on disk capacity.
         session().lock().unwrap().as_mut().unwrap().writer =
             File::open(latest.join("trace-0001.jsonl")).unwrap();

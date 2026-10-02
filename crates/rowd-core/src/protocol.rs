@@ -386,7 +386,13 @@ pub fn receive_manifest_with_metrics(
     crate::model::validate_manifest(&files)?;
     if crate::trace::enabled() {
         for path in files.keys() {
-            crate::trace::first_seen(share_id, path, "remote", None, None);
+            let _file = crate::trace::current_context().file(share_id, path).enter();
+            crate::trace_event!(
+                crate::trace::Level::Trace,
+                crate::trace::Component::Protocol,
+                "REMOTE_FILE_ADVERTISED",
+                serde_json::json!({"relative_path":path})
+            );
         }
     }
     Ok((files, metrics, io.1))

@@ -1,3 +1,4 @@
+mod transport;
 use anyhow::{ensure, Context, Result};
 use jni::{
     objects::{JObject, JString, JValue},
@@ -19,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 use tempfile::{NamedTempFile, TempPath};
+use transport::{FailureKind, LocalFilesystemError, PollWake, WakeReadiness};
 
 static CONNECTION_TRACE_CONTEXT: OnceLock<Mutex<trace::TraceContext>> = OnceLock::new();
 static CONNECTION_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -43,6 +45,7 @@ fn connection_context() -> trace::TraceContext {
         ctx
     }
 }
+static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static BASE_TOKENS: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
 static CONNECTION: OnceLock<Mutex<Option<(String, rowd_core::tls::ClientStream)>>> =
@@ -114,7 +117,9 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollPairOffer(
         let _ =
             socket.join_multicast_v4(&rowd_core::pairing::GROUP, &std::net::Ipv4Addr::UNSPECIFIED);
         let mut buf = [0u8; 4097];
-        let result = match socket.recv_from(&mut buf) {
+        let result = match rowd_core::io_retry::interrupted("pair_offer_recv_from", || {
+            socket.recv_from(&mut buf)
+        }) {
             Ok((len, source)) => match rowd_core::pairing::decode(&buf[..len])? {
                 rowd_core::pairing::Packet::Discover {
                     nonce,
@@ -199,18 +204,25 @@ pub extern "system" fn Java_app_rowd_NativeBridge_finishPairing(
     pairing_result(env, result)
 }
 
-fn clear_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream)>) {
+fn clear_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream)>, reason: &str) {
+    if connection.is_none() {
+        return;
+    }
     let _context = connection_context().enter();
     trace_event!(
         TraceLevel::Debug,
         TraceComponent::Connection,
         "CONNECTION_CLEARED",
-        serde_json::json!({"reason":"existing_invalidation_path","connection_present":connection.is_some(),"network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst)})
+        serde_json::json!({"reason":reason,"connection_present":connection.is_some(),"network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst)})
     );
     *CONNECTION_ID
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap() = None;
+    *CONNECTION_TRACE_CONTEXT
+        .get_or_init(|| Mutex::new(Default::default()))
+        .lock()
+        .unwrap() = Default::default();
     *connection = None;
     if let Some(socket) = ACTIVE_SOCKET.get() {
         *socket.lock().unwrap() = None;
@@ -272,12 +284,13 @@ pub extern "system" fn Java_app_rowd_NativeBridge_revokeRemotePairing(
 
 #[no_mangle]
 pub extern "system" fn Java_app_rowd_NativeBridge_networkChanged(_env: JNIEnv, _class: JObject) {
+    let _context = connection_context().enter();
     let previous = NETWORK_GENERATION.fetch_add(1, Ordering::SeqCst);
     trace_event!(
         TraceLevel::Info,
         TraceComponent::Network,
-        "NETWORK_CHANGED",
-        serde_json::json!({"previous_generation":previous,"network_generation":previous+1,"operation":"native_network_changed"})
+        "NETWORK_GENERATION_CHANGED",
+        serde_json::json!({"previous_generation":previous,"network_generation":previous+1,"operation":"native_network_changed","connection_invalidated":ACTIVE_SOCKET.get().is_some_and(|s|s.lock().unwrap().is_some())})
     );
     if let Some(socket) = ACTIVE_SOCKET.get() {
         if let Ok(mut socket) = socket.lock() {
@@ -288,7 +301,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_networkChanged(_env: JNIEnv, _
     }
     // If sync owns CONNECTION, socket shutdown or its generation check clears it.
     if let Ok(mut connection) = connection().try_lock() {
-        clear_connection(&mut connection);
+        clear_connection(&mut connection, "network_generation_changed");
     }
 }
 
@@ -297,10 +310,9 @@ fn base_tokens() -> &'static Mutex<std::collections::HashMap<String, String>> {
 }
 
 fn check_cancelled() -> Result<()> {
-    anyhow::ensure!(
-        !CANCELLED.load(Ordering::Relaxed),
-        "Sincronização cancelada"
-    );
+    if CANCELLED.load(Ordering::Relaxed) {
+        return Err(transport::CancelledError.into());
+    }
     Ok(())
 }
 
@@ -314,6 +326,7 @@ struct AndroidStore<'a, 'b, 'c> {
     token_key: Option<String>,
     share_id: Option<String>,
     scan_socket: Option<TcpStream>,
+    scan_errors: Vec<String>,
 }
 impl AndroidStore<'_, '_, '_> {
     fn scan_result(&mut self, result: &str) -> Result<Manifest> {
@@ -404,7 +417,7 @@ impl AndroidStore<'_, '_, '_> {
                         let _ = env.exception_clear();
                     }
                 }
-                anyhow::bail!("SAF {name}: {text}");
+                return Err(LocalFilesystemError(format!("SAF {name}: {text}")).into());
             }
             let object = result?.l()?;
             Ok(env.get_string(&JString::from(object))?.into())
@@ -495,9 +508,9 @@ impl Store for AndroidStore<'_, '_, '_> {
             .context("scan socket missing")?
             .try_clone()?;
         let share_id = self.share_id.clone().context("Share not selected")?;
-        self.call("startScanJson", &[])?;
         let mut preempted = false;
         let result = (|| -> Result<Manifest> {
+            self.call("startScanJson", &[])?;
             loop {
                 check_cancelled()?;
                 let status = self.call("pollScanJson", &[])?;
@@ -510,8 +523,14 @@ impl Store for AndroidStore<'_, '_, '_> {
                 }
                 socket.set_read_timeout(Some(Duration::from_millis(50)))?;
                 let mut byte = [0];
-                match socket.peek(&mut byte) {
-                    Ok(0) => anyhow::bail!("peer disconnected during SAF scan"),
+                match rowd_core::io_retry::interrupted("scan_peek", || socket.peek(&mut byte)) {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "peer disconnected during SAF scan",
+                        )
+                        .into())
+                    }
                     Ok(_) => {
                         socket.set_read_timeout(Some(Duration::from_secs(90)))?;
                         match rowd_core::protocol::receive_for(io, &share_id)? {
@@ -546,7 +565,7 @@ impl Store for AndroidStore<'_, '_, '_> {
             }
             let _ = self.call("discardScanJson", &[]);
         }
-        result
+        transport::deferred_scan_result(result, &mut self.scan_errors)
     }
     fn commit_scan(&mut self) -> Result<()> {
         self.call("commitScanJson", &[])?;
@@ -680,7 +699,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_traceRuntimeState(
         .get()
         .and_then(|s| s.try_lock().ok())
         .map(|s| s.is_some());
-    let state=serde_json::json!({"connection_present":present,"network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst),"cancellation_state":CANCELLED.load(Ordering::Relaxed),"trace_active":trace::enabled(),"trace_error":trace::status()["error"]}).to_string();
+    let state=serde_json::json!({"connection_present":present,"network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst),"poll_count":POLL_COUNT.load(Ordering::Relaxed),"cancellation_state":CANCELLED.load(Ordering::Relaxed),"trace_active":trace::enabled(),"trace_error":trace::status()["error"]}).to_string();
     env.new_string(state)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
@@ -760,6 +779,16 @@ impl rowd_core::managed::ManagedClient for AndroidStore<'_, '_, '_> {
         )?;
         Ok(())
     }
+    fn finish_round(&mut self, report: &rowd_core::sync::Report) -> Result<()> {
+        let result: Result<()> = (|| {
+            check_cancelled()?;
+            if !self.scan_errors.is_empty() {
+                return Err(LocalFilesystemError(self.scan_errors.join("; ")).into());
+            }
+            Ok(())
+        })();
+        result.context(transport::PendingWakes(report.pending_wakes.clone()))
+    }
     fn finish_unlink(&mut self) -> Result<()> {
         Ok(())
     }
@@ -802,6 +831,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
             token_key: None,
             share_id: None,
             scan_socket: None,
+            scan_errors: Vec::new(),
         };
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
@@ -817,7 +847,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                     || CONNECTION_GENERATION.load(Ordering::SeqCst)
                         != NETWORK_GENERATION.load(Ordering::SeqCst)
             }) {
-                clear_connection(&mut connection);
+                clear_connection(&mut connection, "identity_or_network_generation_changed");
             }
             let mut skipped = std::collections::BTreeSet::new();
             let mut errors = Vec::new();
@@ -829,8 +859,8 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                         .get_or_init(|| Mutex::new(Default::default()))
                         .lock()
                         .unwrap();
-                    let (io, endpoint) =
-                        resolver.connect(&invite, &device, generation, |fingerprint| {
+                    let (io, endpoint) = resolver
+                        .connect(&invite, &device, generation, |fingerprint| {
                             let acquired = store.call("acquireMulticast", &[]);
                             let result = match acquired {
                                 Ok(_) => (|| {
@@ -846,7 +876,8 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                             };
                             let _ = store.call("releaseMulticast", &[]);
                             result
-                        })?;
+                        })
+                        .context(transport::ConnectionAttemptFailure)?;
                     anyhow::ensure!(
                         generation == NETWORK_GENERATION.load(Ordering::SeqCst),
                         "Rede alterada durante a conexão"
@@ -858,6 +889,10 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                         .lock()
                         .unwrap() = Some(io.sock.try_clone()?);
                     let resolved_context = resolver.trace_context();
+                    *CONNECTION_TRACE_CONTEXT
+                        .get_or_init(|| Mutex::new(Default::default()))
+                        .lock()
+                        .unwrap() = resolved_context.clone();
                     let id = resolved_context
                         .ids
                         .get("connection_id")
@@ -872,12 +907,12 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                     trace_event!(
                         TraceLevel::Info,
                         TraceComponent::Connection,
-                        "CONNECTION_ESTABLISHED",
+                        "PERSISTENT_CONNECTION_INSTALLED",
                         serde_json::json!({"endpoint":endpoint,"network_generation":generation,"connection_generation":generation})
                     );
                     *connection = Some((key.clone(), io));
                     if generation != NETWORK_GENERATION.load(Ordering::SeqCst) {
-                        clear_connection(&mut connection);
+                        clear_connection(&mut connection, "network_generation_changed");
                         anyhow::bail!("Rede alterada durante a conexão");
                     }
                 }
@@ -890,6 +925,12 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                         serde_json::json!({"reason":"persistent_stream_present","network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst)})
                     );
                 }
+                connection
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .sock
+                    .set_read_timeout(Some(Duration::from_secs(90)))?;
                 store.scan_socket = Some(connection.as_ref().unwrap().1.sock.try_clone()?);
                 let mut failed = None;
                 let result = rowd_core::managed::client_round_on_excluding(
@@ -916,7 +957,17 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                     }
                     Err(error) => {
                         store.scan_socket = None;
-                        clear_connection(&mut connection);
+                        let kind =
+                            transport::classify(&error, false, CANCELLED.load(Ordering::Relaxed));
+                        if kind.invalidates() {
+                            clear_connection(&mut connection, kind.label());
+                        }
+                        if matches!(
+                            kind,
+                            FailureKind::TransportInvalid | FailureKind::NetworkGenerationChanged
+                        ) {
+                            break Err(error); // Retry the same dirty Shares after reconnect; never skip them for TCP loss.
+                        }
                         match failed {
                             Some(id) if skipped.insert(id.clone()) => {
                                 errors.push(format!("{id}: {error:#}"))
@@ -928,22 +979,35 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
             }
         })();
         if result.is_err() {
-            // Every error after acquiring the mutex must discard the persistent stream.
             store.scan_socket = None;
-            clear_connection(&mut connection);
+            let kind = transport::classify(
+                result.as_ref().unwrap_err(),
+                CONNECTION_GENERATION.load(Ordering::SeqCst)
+                    != NETWORK_GENERATION.load(Ordering::SeqCst),
+                CANCELLED.load(Ordering::Relaxed),
+            );
+            if kind.invalidates() {
+                clear_connection(&mut connection, kind.label());
+            }
         }
         result
     }));
     let output = match result {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => {
-            trace_event!(
-                TraceLevel::Error,
-                TraceComponent::Round,
-                "ROUND_FAILED",
-                serde_json::json!({"error":TraceError::new("scheduler","native_sync",&e)})
+            let kind = transport::classify(
+                &e,
+                CONNECTION_GENERATION.load(Ordering::SeqCst)
+                    != NETWORK_GENERATION.load(Ordering::SeqCst),
+                CANCELLED.load(Ordering::Relaxed),
             );
-            serde_json::json!({"error":format!("{e:#}")}).to_string()
+            trace_event!(
+                TraceLevel::Warn,
+                TraceComponent::Round,
+                "SYNC_OPERATION_FAILED",
+                serde_json::json!({"error_kind":kind.label(),"error":TraceError::new("scheduler","native_sync",&e)})
+            );
+            serde_json::json!({"error":format!("{e:#}"),"error_kind":kind.label(),"pending_wakes":e.downcast_ref::<transport::PendingWakes>().map(|pending| &pending.0)}).to_string()
         }
         Err(_) => {
             serde_json::json!({"error":"Falha interna do Rowd; os backups foram preservados."})
@@ -961,52 +1025,50 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
     _class: JObject<'local>,
 ) -> jstring {
     let mut connection = connection().lock().unwrap();
+    let result = poll_connection(&mut connection);
+    env.new_string(result.json())
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+fn poll_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream)>) -> PollWake {
+    if CANCELLED.load(Ordering::Relaxed) {
+        return PollWake::None;
+    }
     let _context = connection_context().enter();
-    let started = Instant::now();
-    trace_event!(
-        TraceLevel::Trace,
-        TraceComponent::Connection,
-        "POLL_WAKE_START",
-        serde_json::json!({"connection_present":connection.is_some()})
-    );
+    POLL_COUNT.fetch_add(1, Ordering::Relaxed);
+    let poll_started = Instant::now();
     let result = if connection.is_some()
         && CONNECTION_GENERATION.load(Ordering::SeqCst) != NETWORK_GENERATION.load(Ordering::SeqCst)
     {
-        "!".to_string()
+        PollWake::TransportInvalid
     } else if let Some((_, io)) = connection.as_mut() {
-        let _ = io.sock.set_read_timeout(Some(Duration::from_millis(100)));
-        let mut first = [0u8; 1];
-        let buffered = match io.conn.reader().read(&mut first) {
-            Ok(1) => Some(true),
-            Ok(0) => Some(false),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Some(false),
-            Err(_) => None,
-            _ => unreachable!(),
-        };
-        let ready = match buffered {
-            Some(true) => Ok(1),
-            Some(false) => io.sock.peek(&mut first),
-            None => Err(std::io::Error::other("TLS receive failed")),
-        };
+        let _ = io.sock.set_read_timeout(Some(Duration::from_secs(1)));
+        let conn = &mut io.conn;
+        let socket = &io.sock;
+        let ready = transport::wait_for_wake(|buf| conn.reader().read(buf), |buf| socket.peek(buf));
         match ready {
-            Ok(0) => {
+            Ok(WakeReadiness::Idle) => PollWake::None,
+            Ok(WakeReadiness::Eof) => {
                 trace_event!(
                     TraceLevel::Warn,
                     TraceComponent::Connection,
                     "POLL_WAKE_EOF",
                     serde_json::json!({"reason":"socket_eof"})
                 );
-                "!".to_string()
+                PollWake::TransportInvalid
             }
-            Ok(_) => {
+            Ok(readiness) => {
                 let _ = io.sock.set_read_timeout(Some(Duration::from_secs(90)));
-                let incoming = if buffered == Some(true) {
-                    rowd_core::protocol::receive_after_first(io, first[0])
+                let incoming = if let WakeReadiness::Buffered(first) = readiness {
+                    rowd_core::protocol::receive_after_first(io, first)
                 } else {
                     rowd_core::protocol::receive(io)
                 };
                 match incoming {
-                    Ok(rowd_core::protocol::Message::WakeShare { share_id }) => share_id,
+                    Ok(rowd_core::protocol::Message::WakeShare { share_id }) => {
+                        PollWake::Share(share_id)
+                    }
                     Err(error) => {
                         trace_event!(
                             TraceLevel::Error,
@@ -1014,7 +1076,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
                             "POLL_WAKE_ERROR",
                             serde_json::json!({"error":TraceError::new("protocol","poll_wake_receive",&error)})
                         );
-                        "!".to_string()
+                        PollWake::TransportInvalid
                     }
                     Ok(message) => {
                         trace_event!(
@@ -1023,7 +1085,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
                             "POLL_WAKE_RESULT",
                             serde_json::json!({"reason":"unexpected_message","message_type":message.trace_type()})
                         );
-                        "!".to_string()
+                        PollWake::TransportInvalid
                     }
                 }
             }
@@ -1033,7 +1095,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                String::new()
+                PollWake::None
             }
             Err(error) => {
                 let error = anyhow::Error::new(error);
@@ -1043,31 +1105,49 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
                     "POLL_WAKE_ERROR",
                     serde_json::json!({"error":TraceError::new("connection","poll_wake_peek",&error)})
                 );
-                "!".to_string()
+                PollWake::TransportInvalid
             }
         }
     } else {
-        "!".to_string()
+        PollWake::TransportInvalid
     };
-    let result = if result == "!"
+    let result = if result == PollWake::TransportInvalid
         || (connection.is_some()
             && CONNECTION_GENERATION.load(Ordering::SeqCst)
                 != NETWORK_GENERATION.load(Ordering::SeqCst))
     {
-        clear_connection(&mut connection);
-        "!".to_string()
+        clear_connection(connection, "transport_invalid");
+        PollWake::TransportInvalid
     } else {
         result
     };
-    trace_event!(
-        TraceLevel::Trace,
-        TraceComponent::Connection,
-        "POLL_WAKE_RESULT",
-        serde_json::json!({"duration_us":started.elapsed().as_micros(),"result":if result=="!" {"invalidated"}else if result.is_empty(){"no_wake"}else{"share_wake"},"share_id":if result!="!"&&!result.is_empty(){Some(&result)}else{None}})
-    );
-    env.new_string(result)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    static IDLE: OnceLock<Mutex<(Instant, u64, Duration)>> = OnceLock::new();
+    let mut idle = IDLE
+        .get_or_init(|| Mutex::new((Instant::now(), 0, Duration::ZERO)))
+        .lock()
+        .unwrap();
+    if result == PollWake::None {
+        idle.1 += 1;
+        idle.2 += poll_started.elapsed();
+    }
+    if idle.1 > 0 && (idle.0.elapsed() >= Duration::from_secs(30) || result != PollWake::None) {
+        trace_event!(
+            TraceLevel::Debug,
+            TraceComponent::Connection,
+            "POLL_WAKE_IDLE_SUMMARY",
+            serde_json::json!({"poll_count":idle.1,"duration_ms":idle.2.as_millis(),"window_ms":idle.0.elapsed().as_millis()})
+        );
+        *idle = (Instant::now(), 0, Duration::ZERO);
+    }
+    if result != PollWake::None {
+        trace_event!(
+            TraceLevel::Info,
+            TraceComponent::Connection,
+            "POLL_WAKE_RESULT",
+            serde_json::from_str::<serde_json::Value>(&result.json()).unwrap()
+        );
+    }
+    result
 }
 
 #[no_mangle]
@@ -1107,4 +1187,96 @@ pub extern "system" fn Java_app_rowd_NativeBridge_previewInvitation<'local>(
     env.new_string(output)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn interrupted_scan_and_poll_keep_stream_but_real_eof_clears_it() {
+        let directory = tempfile::tempdir().unwrap();
+        trace::start(directory.path(), "android", None).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cert: String = include_bytes!("../tests/fixtures/public-test-cert.der")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        // TLS remains lazy here: test the underlying wait/EOF without any wire writes.
+        let stream = rowd_core::tls::connect_pinned(
+            &cert,
+            &listener.local_addr().unwrap().to_string(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut connection = Some(("regression".into(), stream));
+        let idle_started = Instant::now();
+        assert_eq!(poll_connection(&mut connection), PollWake::None);
+        assert!(idle_started.elapsed() >= Duration::from_millis(750));
+        let mut attempts = 0;
+        assert_eq!(
+            rowd_core::io_retry::interrupted("scan_peek", || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(1)
+                }
+            })
+            .unwrap(),
+            1
+        );
+        let mut attempts = 0;
+        assert_eq!(
+            transport::wait_for_wake(
+                |_| Err(std::io::ErrorKind::WouldBlock.into()),
+                |_| {
+                    attempts += 1;
+                    Err(if attempts == 1 {
+                        std::io::ErrorKind::Interrupted
+                    } else {
+                        std::io::ErrorKind::TimedOut
+                    }
+                    .into())
+                }
+            )
+            .unwrap(),
+            WakeReadiness::Idle
+        );
+        assert!(connection.is_some());
+        trace::flush().unwrap();
+        let path = directory.path().join("Latest-trace/trace-0001.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(!before.contains("CONNECTION_CLEARED"));
+        assert!(!before.contains("ROUND_FAILED"));
+        assert!(!before.contains("transport_invalid"));
+        peer.shutdown(std::net::Shutdown::Both).unwrap();
+        assert_eq!(poll_connection(&mut connection), PollWake::TransportInvalid);
+        assert!(connection.is_none());
+        assert_eq!(poll_connection(&mut connection), PollWake::TransportInvalid);
+        trace::stop("regression_test").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<serde_json::Value> = after
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|v| v["event"] == "CONNECTION_CLEARED")
+                .count(),
+            1
+        );
+        let summary = records
+            .iter()
+            .find(|v| v["event"] == "POLL_WAKE_IDLE_SUMMARY")
+            .unwrap();
+        assert_eq!(summary["fields"]["poll_count"], 1);
+        assert!(summary["fields"]["duration_ms"].as_u64().unwrap() >= 750);
+        assert!(!records.iter().any(|v| v["event"] == "POLL_WAKE_START"
+            || (v["event"] == "POLL_WAKE_RESULT" && v["fields"]["kind"] == "none")));
+        assert!(records.iter().any(
+            |v| v["event"] == "POLL_WAKE_RESULT" && v["fields"]["kind"] == "transport_invalid"
+        ));
+    }
 }

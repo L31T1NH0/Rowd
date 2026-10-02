@@ -168,7 +168,8 @@ pub fn collect(
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1)),
         ))?;
-        match socket.recv_from(&mut packet) {
+        match crate::io_retry::interrupted("discovery_recv_from", || socket.recv_from(&mut packet))
+        {
             Ok((len, source)) => {
                 crate::trace_event!(
                     crate::trace::Level::Trace,
@@ -381,8 +382,8 @@ impl EndpointResolver {
             crate::trace_event!(
                 crate::trace::Level::Info,
                 crate::trace::Component::Connection,
-                "CONNECTION_ESTABLISHED",
-                serde_json::json!({"endpoint":address})
+                "CONNECTION_AUTHENTICATED",
+                serde_json::json!({"endpoint":address,"network_generation":crate::trace::current_context().ids.get("network_generation")})
             );
             Ok((io, context))
         })();

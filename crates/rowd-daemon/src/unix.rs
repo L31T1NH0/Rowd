@@ -578,7 +578,7 @@ pub fn run(home: &Path) -> Result<()> {
             );
             snapshot_at = Instant::now();
         }
-        match listener.accept() {
+        match rowd_core::io_retry::interrupted("accept", || listener.accept()) {
             Ok((stream, _)) => {
                 let state = state.clone();
                 handlers.retain(|handle: &std::thread::JoinHandle<()>| !handle.is_finished());

@@ -1895,7 +1895,9 @@ fn session(
             return Ok(());
         }
         let mut first = [0u8; 1];
-        let buffered = match io.conn.reader().read(&mut first) {
+        let buffered = match rowd_core::io_retry::interrupted("idle_tls_read", || {
+            io.conn.reader().read(&mut first)
+        }) {
             Ok(1) => true,
             Ok(0) => false,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
@@ -1905,7 +1907,7 @@ fn session(
         let ready = if buffered {
             true
         } else {
-            match io.sock.peek(&mut first) {
+            match rowd_core::io_retry::interrupted("idle_peek", || io.sock.peek(&mut first)) {
                 Ok(0) => return Ok(()),
                 Ok(_) => true,
                 Err(error)
@@ -2267,7 +2269,7 @@ fn session_round(
                     if audit {
                         "audit_scan"
                     } else if incremental_allowed {
-                        "watcher"
+                        "focused_scan"
                     } else {
                         "startup_scan"
                     },
@@ -2573,7 +2575,9 @@ fn pairing_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()
                 }
                 refreshed = Instant::now();
             }
-            match socket.recv_from(&mut buf) {
+            match rowd_core::io_retry::interrupted("pairing_recv_from", || {
+                socket.recv_from(&mut buf)
+            }) {
                 Ok((len, source)) => {
                     let Ok(pairing::Packet::Discover {
                         nonce,
@@ -2655,7 +2659,9 @@ fn discovery_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<
             next_refresh = Instant::now() + Duration::from_secs(1);
         }
 
-        match socket.recv_from(&mut packet) {
+        match rowd_core::io_retry::interrupted("discovery_recv_from", || {
+            socket.recv_from(&mut packet)
+        }) {
             Ok((len, peer)) => {
                 if let Ok(cfg) = DeviceConfig::load(home) {
                     if let Ok(fingerprint) = discovery::fingerprint(&cfg.cert) {
@@ -2885,8 +2891,13 @@ fn serve(
                                     if trace::enabled() {
                                         if let Ok(metadata) = fs::metadata(path) {
                                             if metadata.is_file() {
-                                                trace::observed_file(
-                                                    &relative, "watcher", &metadata,
+                                                trace_event!(
+                                                    TraceLevel::Trace,
+                                                    TraceComponent::Watcher,
+                                                    "FILE_WATCHER_OBSERVED",
+                                                    serde_json::json!({"relative_path":relative,
+                                                        "observed_via":"filesystem_watcher","size":metadata.len(),
+                                                        "metadata_modified_ms":metadata.modified().ok().and_then(|time|time.duration_since(std::time::UNIX_EPOCH).ok()).map(|age|age.as_millis())})
                                                 );
                                             }
                                         }
@@ -2990,7 +3001,7 @@ fn serve(
                 }
                 full = false;
             }
-            match listener.accept() {
+            match rowd_core::io_retry::interrupted("accept", || listener.accept()) {
                 Ok((socket, _)) => {
                     if let Some(old) = connected_socket.take() {
                         let _ = old.shutdown(std::net::Shutdown::Both);

@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 rowd_root="$PWD"
+python3 scripts/stamp-trace-callsites.py --check
 export JAVA_HOME="${JAVA_HOME:-$rowd_root/.toolchain/jdk}"
 export ANDROID_HOME="${ANDROID_HOME:-$rowd_root/.toolchain/android-sdk}"
 rowd_ndk="${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/27.2.12479018}"

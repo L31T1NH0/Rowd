@@ -644,10 +644,7 @@ impl Store for LocalStore {
             }
             let target = self.checked_path(path, false)?;
             let before = match fs::symlink_metadata(&target) {
-                Ok(meta) if meta.file_type().is_file() => {
-                    crate::trace::observed_file(path, "watcher", &meta);
-                    fingerprint(&meta)
-                }
+                Ok(meta) if meta.file_type().is_file() => fingerprint(&meta),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     self.cache.remove(path);
                     continue;
@@ -655,8 +652,10 @@ impl Store for LocalStore {
                 _ => return Ok(None),
             };
             let (hash, size) = hash_reader(File::open(&target)?)?;
-            let after = fingerprint(&fs::metadata(&target)?);
+            let metadata = fs::metadata(&target)?;
+            let after = fingerprint(&metadata);
             ensure!(before == after, "STALE_SOURCE: {path}");
+            crate::trace::observed_file(path, "focused_scan", &metadata, &hash);
             let entry = Entry { hash, size };
             self.cache.insert(
                 path.clone(),
@@ -726,7 +725,6 @@ impl Store for LocalStore {
                     counts.files_enumerated += 1;
                     metrics.set(counts);
                     let metadata = fs::metadata(&path)?;
-                    crate::trace::observed_file(&rel, "audit_scan", &metadata);
                     let _file = crate::trace::current_context()
                         .for_path(&rel)
                         .with("relative_path", rel.clone())
@@ -747,6 +745,12 @@ impl Store for LocalStore {
                             crate::trace::Component::Scanner,
                             "FILE_HASH_REUSED",
                             serde_json::json!({"relative_path":rel,"reason":"metadata_matches"})
+                        );
+                        crate::trace::observed_file(
+                            &rel,
+                            "audit_scan",
+                            &metadata,
+                            &cached.entry.hash,
                         );
                         result.insert(rel, cached.entry.clone());
                         continue;
@@ -771,6 +775,7 @@ impl Store for LocalStore {
                     metrics.set(counts);
                     let after = fingerprint(&fs::metadata(&path)?);
                     ensure!(before == after, "STALE_SOURCE: {rel}");
+                    crate::trace::observed_file(&rel, "audit_scan", &metadata, &hash);
                     let entry = Entry { hash, size };
                     *cache_changed = true;
                     cache.insert(
@@ -833,11 +838,11 @@ impl Store for LocalStore {
                 match File::open(&target) {
                     Ok(file) => {
                         let metadata = fs::metadata(&target)?;
-                        crate::trace::observed_file(path, "watcher", &metadata);
                         let before = fingerprint(&metadata);
                         let (hash, size) = hash_reader(file)?;
                         let after = fingerprint(&fs::metadata(&target)?);
                         ensure!(before == after, "STALE_SOURCE: {path}");
+                        crate::trace::observed_file(path, "focused_scan", &metadata, &hash);
                         let mut counts = self.metrics.get();
                         counts.files_enumerated += 1;
                         counts.files_hashed += 1;
@@ -934,6 +939,7 @@ impl Store for LocalStore {
         let current = self.current(path)?;
         // A repeated operation after a lost acknowledgment is harmless.
         if current.as_ref() == Some(entry) {
+            crate::trace::remote_installed(path, &entry.hash);
             return Ok(());
         }
         ensure!(
@@ -975,6 +981,7 @@ impl Store for LocalStore {
         sync_dir(target.parent().unwrap())?;
         journal.finished = true;
         atomic_json(&journal_path, &journal)?;
+        crate::trace::remote_installed(path, &entry.hash);
         self.invalidate_path(path);
         Self::queue_cache_invalidation(
             &self.root,

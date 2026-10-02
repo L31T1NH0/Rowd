@@ -36,6 +36,10 @@ pub trait ManagedClient: Store {
         cancelled: &[String],
     ) -> Result<()>;
     fn finish_unlink(&mut self) -> Result<()>;
+    /// Report a local deferred failure only after the session has been drained safely.
+    fn finish_round(&mut self, _report: &Report) -> Result<()> {
+        Ok(())
+    }
 }
 impl<S: Store> Store for &mut S {
     fn scan_is_staged(&self) -> bool {
@@ -158,6 +162,18 @@ pub fn client_round_on(
     client_round_on_excluding(io, root, store, &Default::default(), &mut None)
 }
 
+/// Only a completed session is safe to reuse after an error.
+#[derive(Debug)]
+pub struct RoundFailure {
+    pub stream_reusable: bool,
+}
+impl std::fmt::Display for RoundFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "round failed (stream_reusable={})", self.stream_reusable)
+    }
+}
+impl std::error::Error for RoundFailure {}
+
 pub fn client_round_on_excluding(
     io: &mut (impl std::io::Read + std::io::Write + Send),
     root: &str,
@@ -180,6 +196,43 @@ pub fn client_round_on_excluding(
         "ROUND_START",
         serde_json::json!({})
     );
+    let mut session_complete = false;
+    let result = client_round_session(io, root, store, skipped, failed, &mut session_complete)
+        .and_then(|report| {
+            store.finish_round(&report)?;
+            Ok(report)
+        });
+    let _failed_share = failed.as_ref().map(|id| {
+        crate::trace::current_context()
+            .with("share_id", id.as_str())
+            .enter()
+    });
+    crate::trace_event!(
+        crate::trace::Level::Info,
+        crate::trace::Component::Round,
+        "ROUND_END",
+        serde_json::json!({"result":if result.is_ok(){"success"}else{"failed"},
+            "error":result.as_ref().err().map(|e| crate::trace::TraceError::new("round","client_round",e)),
+            "transferred":result.as_ref().ok().map(|r|r.transferred),
+            "conflicts":result.as_ref().ok().map(|r|r.conflicts),
+            "round_deferred":result.as_ref().ok().map(|r|r.round_deferred),
+            "failed_share":failed})
+    );
+    result.map_err(|error| {
+        error.context(RoundFailure {
+            stream_reusable: session_complete,
+        })
+    })
+}
+
+fn client_round_session(
+    io: &mut (impl std::io::Read + std::io::Write + Send),
+    root: &str,
+    store: &mut impl ManagedClient,
+    skipped: &std::collections::BTreeSet<String>,
+    failed: &mut Option<String>,
+    session_complete: &mut bool,
+) -> Result<Report> {
     protocol::send(io, &Message::StartRound)?;
     let mut queue = None::<std::collections::VecDeque<String>>;
     let mut definitions = None::<Vec<ShareDefinition>>;
@@ -382,7 +435,10 @@ pub fn client_round_on_excluding(
             }
         })();
         match round {
-            Ok(None) => return Ok(aggregate),
+            Ok(None) => {
+                *session_complete = true;
+                return Ok(aggregate);
+            }
             Ok(Some(report)) => {
                 aggregate.transferred += report.transferred;
                 aggregate.conflicts += report.conflicts;
@@ -399,17 +455,12 @@ pub fn client_round_on_excluding(
         }
     }
     aggregate.pending_wakes = pending_wakes.into_iter().collect();
+    *session_complete = true;
     ensure!(
         errors.is_empty(),
         "{} Share(s) failed: {}",
         errors.len(),
         errors.join("; ")
-    );
-    crate::trace_event!(
-        crate::trace::Level::Info,
-        crate::trace::Component::Round,
-        "ROUND_END",
-        serde_json::json!({"transferred":aggregate.transferred,"conflicts":aggregate.conflicts,"round_deferred":aggregate.round_deferred})
     );
     Ok(aggregate)
 }
@@ -646,5 +697,148 @@ mod tests {
         let available: Vec<_> = shares.iter().map(|share| share.share_id.clone()).collect();
         let focus = [shares[37].share_id.clone()].into_iter().collect();
         assert_eq!(share_queue(&shares, &available, Some(&focus)).len(), 1);
+    }
+}
+
+/// Exercise early failure, normal completion, and early unlink on the actual round entrypoint.
+#[cfg(test)]
+pub(crate) fn check_round_lifecycle() {
+    use std::io::{Cursor, Read, Write};
+    struct Client<'a> {
+        device: &'a mut LocalDevice,
+        local_failure: bool,
+    }
+    impl Store for Client<'_> {
+        fn scan(&mut self) -> Result<crate::model::Manifest> {
+            self.device.scan()
+        }
+        fn snapshot(
+            &mut self,
+            path: &str,
+            entry: &crate::model::Entry,
+        ) -> Result<crate::storage::Snapshot> {
+            self.device.snapshot(path, entry)
+        }
+        fn install(
+            &mut self,
+            path: &str,
+            expected: Option<&str>,
+            entry: &crate::model::Entry,
+            staged: &crate::storage::VerifiedStaged,
+        ) -> Result<()> {
+            self.device.install(path, expected, entry, staged)
+        }
+    }
+    impl ManagedClient for Client<'_> {
+        fn configure(&mut self, shares: &[ShareDefinition]) -> Result<()> {
+            self.device.configure(shares)
+        }
+        fn session_state(&mut self) -> Result<ClientState> {
+            self.device.session_state()
+        }
+        fn select(&mut self, id: &str) -> Result<()> {
+            self.device.select(id)
+        }
+        fn acknowledge_share_requests(
+            &mut self,
+            accepted: &[String],
+            rejected: &[String],
+            cancelled: &[String],
+        ) -> Result<()> {
+            self.device
+                .acknowledge_share_requests(accepted, rejected, cancelled)
+        }
+        fn finish_unlink(&mut self) -> Result<()> {
+            self.device.finish_unlink()
+        }
+        fn finish_round(&mut self, _: &Report) -> Result<()> {
+            if self.local_failure {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "local SAF scan failed",
+                )
+                .into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    struct ScriptIo {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        interrupted: bool,
+    }
+    impl Read for ScriptIo {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if std::mem::take(&mut self.interrupted) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.input.read(buffer)
+        }
+    }
+    impl Write for ScriptIo {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.output.write(data)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for mode in ["eof", "success", "unlink", "local_failure"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut device = LocalDevice::open(directory.path()).unwrap();
+        let mut store = Client {
+            device: &mut device,
+            local_failure: mode == "local_failure",
+        };
+        let mut input = Vec::new();
+        if mode != "eof" {
+            protocol::send(&mut input, &Message::Shares { shares: vec![] }).unwrap();
+            protocol::send(
+                &mut input,
+                &if mode == "unlink" {
+                    Message::DeviceUnlinked
+                } else {
+                    Message::ShareRequestStatus {
+                        accepted: vec![],
+                        rejected: vec![],
+                        cancelled: vec![],
+                    }
+                },
+            )
+            .unwrap();
+            if mode == "success" || mode == "local_failure" {
+                protocol::send(&mut input, &Message::SessionDone).unwrap();
+            }
+        }
+        let mut io = ScriptIo {
+            input: Cursor::new(input),
+            output: vec![],
+            interrupted: true,
+        };
+        let result = client_round_on(&mut io, "test-device", &mut store);
+        if mode == "eof" {
+            let error = result.unwrap_err();
+            assert!(
+                !error
+                    .downcast_ref::<RoundFailure>()
+                    .unwrap()
+                    .stream_reusable
+            );
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        } else if mode == "local_failure" {
+            assert!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<RoundFailure>()
+                    .unwrap()
+                    .stream_reusable
+            );
+        } else {
+            assert!(result.is_ok(), "{mode}: {result:?}");
+        }
     }
 }

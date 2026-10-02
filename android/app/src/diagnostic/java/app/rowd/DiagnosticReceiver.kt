@@ -7,6 +7,7 @@ import android.content.ContentValues
 import android.provider.MediaStore
 import android.util.Log
 import org.json.JSONArray
+import org.json.JSONObject
 
 /** Shell-only controls in the diagnostic APK. No command accepts a path or Share ID. */
 class DiagnosticReceiver : BroadcastReceiver() {
@@ -16,6 +17,12 @@ class DiagnosticReceiver : BroadcastReceiver() {
                 "trace-start" -> PerformanceTrace.enable(context)
                 "trace-stop" -> PerformanceTrace.disable()
                 "trace-flush" -> PerformanceTrace.flush()
+                "trace-location-check" -> PerformanceTrace.event("DIAGNOSTIC_SOURCE_CHECK", null,
+                    component = PerformanceTrace.Component.Service, function = "onReceive", sourceFile = "DiagnosticReceiver.kt", sourceLine = 20)
+                "idle-begin", "idle-end" -> PerformanceTrace.event(
+                    if (intent.getStringExtra("command") == "idle-begin") "IDLE_VALIDATION_BEGIN" else "IDLE_VALIDATION_END", null,
+                    component = PerformanceTrace.Component.Service, detail = JSONObject(NativeBridge.traceRuntimeState()), sourceFile = "DiagnosticReceiver.kt", sourceLine = 22)
+                "sync-start" -> if (!SyncService.busy.get()) context.startForegroundService(Intent(context, SyncService::class.java))
                 "sync-now" -> {
                     val shares = JSONArray(FolderAccess(context).knownShares())
                     for (index in 0 until shares.length())

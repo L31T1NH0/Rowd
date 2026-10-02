@@ -744,7 +744,7 @@ fn receive_scan_gate(
     impl<T: Read + Write, F: FnMut(AuditWait) -> Option<Vec<String>>> Read for Waiting<'_, T, F> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             loop {
-                match self.io.read(buf) {
+                match crate::io_retry::interrupted("scan_gate_read", || self.io.read(buf)) {
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -867,7 +867,7 @@ fn coordinate_candidate(
     let pending_state = state_path.with_extension("pending");
     crate::trace_legacy_event!(
         "sync",
-        "round_start",
+        "share_sync_start",
         Some(&share_id),
         None,
         None,
@@ -1612,7 +1612,7 @@ fn coordinate_candidate(
     retry_paths().lock().unwrap().remove(state_path);
     crate::trace_legacy_event!(
         "sync",
-        "round_end",
+        "share_sync_end",
         Some(&share_id),
         None,
         Some(report.metrics.bytes_transferred),
@@ -1635,7 +1635,7 @@ pub fn respond_share(
     let started = Instant::now();
     crate::trace_legacy_event!(
         "sync",
-        "round_start",
+        "share_sync_start",
         expected_share,
         None,
         None,
@@ -2014,7 +2014,7 @@ pub fn respond_share(
                     store.set_base_token(Some(base_token));
                     crate::trace_legacy_event!(
                         "sync",
-                        "round_end",
+                        "share_sync_end",
                         Some(&share_id),
                         None,
                         Some(transferred as u64),
@@ -2044,7 +2044,7 @@ pub fn respond_share(
         crate::trace_event!(
             trace::Level::Error,
             trace::Component::Round,
-            "ROUND_FAILED",
+            "SHARE_FAILED",
             serde_json::json!({"reason":if e.to_string().starts_with("STALE_"){"stale"}else{"round_failed"},"error":trace::TraceError::new("transfer","respond_share",e)})
         );
         let _ = protocol::send(

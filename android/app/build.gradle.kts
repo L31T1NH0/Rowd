@@ -19,6 +19,7 @@ android {
             initWith(getByName("release"))
             matchingFallbacks += listOf("release")
             isDebuggable = false
+            proguardFiles("trace-proguard-rules.pro")
         }
     }
 }

@@ -3,9 +3,10 @@ package app.rowd
 internal data class TraceSource(val file: String?, val line: Int, val function: String?)
 
 /** Inspect only enough frames to identify the producer; no stack is retained in normal events. */
-internal fun traceSource(frames: Array<StackTraceElement> = Thread.currentThread().stackTrace): TraceSource {
+internal fun traceSource(frames: Array<StackTraceElement> = Throwable().stackTrace): TraceSource {
     val frame = frames.firstOrNull {
-        it.fileName != "TraceDiagnostics.kt" && it.className != "java.lang.Thread" &&
+        it.lineNumber > 0 && !it.methodName.startsWith("\$r8\$") &&
+            it.fileName != "TraceDiagnostics.kt" && it.className != "java.lang.Thread" &&
             it.className != "dalvik.system.VMStack" &&
             !it.className.startsWith("app.rowd.PerformanceTrace\$event\$") &&
             !(it.className == "app.rowd.PerformanceTrace" &&
