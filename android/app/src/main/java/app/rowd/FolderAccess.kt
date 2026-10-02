@@ -44,13 +44,22 @@ class FolderAccess(private val context: Context) {
     }
 
     private val resolver = context.contentResolver
-    private fun <T> traced(name: String, path: String?, block: () -> T): T {
+    private fun traceFallback(name: String, share: String?, path: String?, operation: String,
+        fallback: String, error: Exception, component: PerformanceTrace.Component = PerformanceTrace.Component.Scanner) {
+        if (PerformanceTrace.enabled()) PerformanceTrace.event(name, share, path, component = component, level = "warn",
+            detail = JSONObject().put("operation", operation).put("fallback", fallback)
+                .put("error", PerformanceTrace.error(error, "filesystem", operation, false)))
+    }
+    private fun <T> traced(name: String, path: String?, fallback: String? = null, block: () -> T): T {
         if (!PerformanceTrace.enabled()) return block()
         val share = active?.optString("share_id")
         val start = PerformanceTrace.now()
         PerformanceTrace.event("${name}_start", share, path)
         return try { block() } catch (error: Exception) {
-            PerformanceTrace.event("SAF_OPERATION_FAILED", share, path, component = PerformanceTrace.Component.SAF, level = "error", detail = JSONObject().put("error", PerformanceTrace.error(error, "filesystem", name)))
+            PerformanceTrace.event("SAF_OPERATION_FAILED", share, path, component = PerformanceTrace.Component.SAF,
+                level = if (fallback == null) "error" else "warn", detail = JSONObject()
+                    .put("operation", name).put("fallback", fallback ?: JSONObject.NULL)
+                    .put("error", PerformanceTrace.error(error, "filesystem", name, fallback == null)))
             throw error
         } finally { PerformanceTrace.event("${name}_end", share, path, start = start) }
     }
@@ -231,7 +240,8 @@ class FolderAccess(private val context: Context) {
             found.addAll(cache.keys.filter { (prefix.isEmpty() || it.startsWith("$prefix/")) && it !in seen })
             dirtyPaths.getOrPut(id) { mutableSetOf() }.addAll(found)
         }
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            traceFallback("DELTA_SCAN_FAILED", id, null, "resolve_dirty_paths", "deep_scan", error)
             deepScanShares.add(id)
             return@synchronized unavailable("resolution_error")
         }
@@ -258,16 +268,28 @@ class FolderAccess(private val context: Context) {
             val path = paths.getString(index)
             if (cache[path]?.tree != null && cache[path]?.tree != activeTree.toString()) return needDeepScan()
             if (ignored(path, false, ignoreRules())) return needDeepScan()
-            val document = try { find(path) } catch (_: Exception) { return needDeepScan() }
+            val document = try { find(path) } catch (error: Exception) {
+                traceFallback("DELTA_SCAN_FAILED", id, path, "find", "deep_scan", error)
+                return needDeepScan()
+            }
             if (document == null) continue
             if (!document.isFile || document.isVirtual) return needDeepScan()
             val (hash, size) = try {
                 digest(resolver.openInputStream(document.uri) ?: return needDeepScan(), deadline = deadline)
-            } catch (_: Exception) { return needDeepScan() }
+            } catch (error: Exception) {
+                traceFallback("DELTA_SCAN_FAILED", id, path, "digest", "deep_scan", error)
+                return needDeepScan()
+            }
             bytesHashed += size
             enumerated++
-            val modified = try { document.lastModified() } catch (_: Exception) { return needDeepScan() }
-            val length = try { document.length() } catch (_: Exception) { return needDeepScan() }
+            val modified = try { document.lastModified() } catch (error: Exception) {
+                traceFallback("DELTA_SCAN_FAILED", id, path, "last_modified", "deep_scan", error)
+                return needDeepScan()
+            }
+            val length = try { document.length() } catch (error: Exception) {
+                traceFallback("DELTA_SCAN_FAILED", id, path, "length", "deep_scan", error)
+                return needDeepScan()
+            }
             updates[path] = ScanEntry(activeTree.toString(), document.uri.toString(), modified,
                 length, hash, size)
             files.put(path, JSONObject().put("hash", hash).put("size", size))
@@ -852,7 +874,10 @@ class FolderAccess(private val context: Context) {
             DocumentFile.fromSingleUri(context, uri)?.takeIf {
                 it.uri == uri && it.name == path.substringAfterLast('/') && it.isFile && !it.isVirtual
             }
-        } catch (_: Exception) { null }
+        } catch (error: Exception) {
+            traceFallback("INSTALL_CACHE_LOOKUP_FAILED", shareId, path, "cached_target", "resolve_target", error, PerformanceTrace.Component.Filesystem)
+            null
+        }
     }
 
     private fun cachedResolvedTarget(path: String, shareId: String): ResolvedTarget? {
@@ -910,7 +935,10 @@ class FolderAccess(private val context: Context) {
             if (parent.uri != parentUri || target == null || target.uri != targetUri || target.name != name ||
                 !target.isFile || target.isVirtual) null
             else ResolvedTarget(parent, emptyList(), name, target)
-        } catch (_: Exception) { null }
+        } catch (error: Exception) {
+            traceFallback("INSTALL_CACHE_LOOKUP_FAILED", shareId, path, "cached_resolved_target", "resolve_target", error, PerformanceTrace.Component.Filesystem)
+            null
+        }
     }
 
     private fun findDirectory(path: String): DocumentFile? {
@@ -1194,7 +1222,7 @@ class FolderAccess(private val context: Context) {
         val shareId = active?.optString("share_id").orEmpty()
         val hinted = if (expectedHash.isNotEmpty()) cachedTarget(path, shareId) else null
         val hintedHash = hinted?.let {
-            try { traced("target_hash", path) { hash(it) } } catch (_: Exception) { null }
+            try { traced("target_hash", path, fallback = "resolve_target") { hash(it) } } catch (error: Exception) { null }
         }
         val old = if (expectedHash.isEmpty()) null else if (hintedHash == expectedHash) hinted
             else traced("saf_find", path) { find(path) }
@@ -1304,7 +1332,10 @@ class FolderAccess(private val context: Context) {
                         paths[entry.uri] = path
                     }
                 }
-            } catch (_: Exception) { synchronized(scanLock) { deepScanShares.add(shareId) } }
+            } catch (error: Exception) {
+                traceFallback("INSTALL_CACHE_UPDATE_FAILED", shareId, path, "update_scan_cache", "deep_scan", error, PerformanceTrace.Component.Filesystem)
+                synchronized(scanLock) { deepScanShares.add(shareId) }
+            }
         }
         PerformanceTrace.event("install_end", share, path, start = traceStarted)
         android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} prepare_ms=$preparedMs")

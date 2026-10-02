@@ -646,9 +646,14 @@ pub extern "system" fn Java_app_rowd_NativeBridge_traceEvent(
     event: JString,
 ) -> jboolean {
     let result = (|| -> Result<()> {
-        let text: String = env.get_string(&event)?.into();
-        let value: serde_json::Value = serde_json::from_str(&text)?;
-        rowd_core::trace::ingest_android(value)?;
+        let text: String = env.get_string(&event).map_err(|error| {
+            let error = anyhow::Error::new(error);
+            eprintln!("INGEST_ANDROID_FAILED: {error:#}");
+            rowd_core::trace_event!(trace::Level::Warn, trace::Component::Trace, "INGEST_ANDROID_FAILED",
+                serde_json::json!({"error":trace::TraceError::new("trace", "read_kotlin_event", &error)}));
+            error
+        })?.into();
+        rowd_core::trace::ingest_android_json(&text)?;
         Ok(())
     })();
     (result.is_ok() && rowd_core::trace::enabled()).into()

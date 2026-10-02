@@ -72,25 +72,67 @@ fn stream_path(home: &Path, stream: &str) -> Result<PathBuf> {
 }
 fn send_line<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let result = (|| -> Result<()> {
-        serde_json::to_writer(&mut *stream, value)?;
+        // serde_json's error source skips the wrapped io::Error. Recover it so
+        // ErrorKind and raw errno survive the serialization boundary.
+        serde_json::to_writer(&mut *stream, value).map_err(|error| {
+            if error.is_io() {
+                anyhow::Error::new(std::io::Error::from(error)).context("write IPC frame")
+            } else {
+                anyhow::Error::new(error)
+            }
+        })?;
         stream.write_all(b"\n")?;
         Ok(())
     })();
-    match &result {
-        Ok(()) => trace_event!(
-            Level::Trace,
-            Component::DaemonIpc,
-            "IPC_RESPONSE_SENT",
-            json!({})
-        ),
-        Err(error) => trace_event!(
+    if let Err(error) = &result {
+        let context = trace::current_context();
+        let operation = context
+            .ids
+            .get("ipc_write_operation")
+            .and_then(Value::as_str)
+            .unwrap_or("write_ipc_frame");
+        trace_event!(
             Level::Error,
             Component::DaemonIpc,
             "IPC_WRITE_FAILED",
-            json!({"error":TraceError::new("daemon_ipc","send_response",error)})
-        ),
+            json!({"error":TraceError::new("daemon_ipc", operation, error)})
+        );
     }
     result
+}
+// Callers identify semantic responses and subscription items; send_line is only I/O.
+fn send_response(stream: &mut UnixStream, reply: &Reply, started: Instant) -> Result<()> {
+    let context = trace::current_context();
+    let command = context
+        .ids
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let _scope = context
+        .clone()
+        .with("ipc_write_operation", format!("send_{command}_response"))
+        .enter();
+    send_line(stream, reply)?;
+    trace_event!(
+        Level::Trace,
+        Component::DaemonIpc,
+        "IPC_RESPONSE_SENT",
+        json!({"duration_us":started.elapsed().as_micros()})
+    );
+    Ok(())
+}
+fn send_stream_item(stream: &mut UnixStream, line: &str) -> Result<()> {
+    let _scope = trace::current_context()
+        .with("ipc_write_operation", "send_subscription_item")
+        .enter();
+    send_line(stream, &line)?;
+    trace_event!(
+        Level::Trace,
+        Component::DaemonIpc,
+        "IPC_STREAM_ITEM_SENT",
+        json!({})
+    );
+    Ok(())
 }
 fn receive_line<T: for<'a> Deserialize<'a>>(stream: &mut UnixStream) -> Result<T> {
     let mut line = Vec::new();
@@ -281,7 +323,11 @@ impl Runtime {
             json!({"command":req.command})
         );
         if req.version != DAEMON_IPC_VERSION {
-            send_line(&mut stream, &err("incompatible daemon IPC version"))?;
+            send_response(
+                &mut stream,
+                &err("incompatible daemon IPC version"),
+                started,
+            )?;
             return Ok(());
         }
         match req.command.as_str() {
@@ -291,7 +337,7 @@ impl Runtime {
                         PathBuf::from(path)
                     }
                     Some(_) => {
-                        send_line(&mut stream, &err("output_dir must be absolute"))?;
+                        send_response(&mut stream, &err("output_dir must be absolute"), started)?;
                         return Ok(());
                     }
                     None => self.home.join(".rowd"),
@@ -317,6 +363,12 @@ impl Runtime {
                             json!({"command":req.command})
                         );
                         trace_event!(
+                            Level::Trace,
+                            Component::DaemonIpc,
+                            "IPC_RESPONSE_START",
+                            json!({"command":req.command})
+                        );
+                        trace_event!(
                             Level::Info,
                             Component::Daemon,
                             "DAEMON_START",
@@ -328,26 +380,28 @@ impl Runtime {
                             "DAEMON_READY",
                             json!({"ready":self.ready.load(Ordering::Relaxed),"launch_mode":self.mode})
                         );
-                        send_line(&mut stream, &ok(Some(trace::status())))?;
+                        send_response(&mut stream, &ok(Some(trace::status())), started)?;
                     }
-                    Err(error) => send_line(&mut stream, &err(&format!("{error:#}")))?,
+                    Err(error) => send_response(&mut stream, &err(&format!("{error:#}")), started)?,
                 }
             }
-            "trace_status" => send_line(&mut stream, &ok(Some(trace::status())))?,
+            "trace_status" => send_response(&mut stream, &ok(Some(trace::status())), started)?,
             "trace_flush" => {
                 trace::flush()?;
-                send_line(&mut stream, &ok(Some(trace::status())))?;
+                send_response(&mut stream, &ok(Some(trace::status())), started)?;
             }
             "trace_stop" => {
                 trace::stop("trace_stop")?;
-                send_line(&mut stream, &ok(Some(trace::status())))?;
+                send_response(&mut stream, &ok(Some(trace::status())), started)?;
             }
-            "ping" if self.ready.load(Ordering::Relaxed) => send_line(&mut stream, &ok(None))?,
+            "ping" if self.ready.load(Ordering::Relaxed) => {
+                send_response(&mut stream, &ok(None), started)?
+            }
             "status" if self.ready.load(Ordering::Relaxed) => {
-                send_line(&mut stream, &ok(Some(self.status()?)))?
+                send_response(&mut stream, &ok(Some(self.status()?)), started)?
             }
             "stop" => {
-                send_line(&mut stream, &ok(None))?;
+                send_response(&mut stream, &ok(None), started)?;
                 self.stop.store(true, Ordering::Relaxed);
             }
             "subscribe" => {
@@ -355,19 +409,19 @@ impl Runtime {
                     Some("logs") => &self.logs,
                     Some("events") => &self.events,
                     _ => {
-                        send_line(&mut stream, &err("invalid stream"))?;
+                        send_response(&mut stream, &err("invalid stream"), started)?;
                         return Ok(());
                     }
                 };
                 let rx = bus.subscribe();
-                send_line(&mut stream, &ok(None))?;
+                send_response(&mut stream, &ok(None), started)?;
                 for line in recent_lines(&bus.path, 100)? {
-                    send_line(&mut stream, &line)?;
+                    send_stream_item(&mut stream, &line)?;
                 }
                 while !self.stop.load(Ordering::Relaxed) {
                     match rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(line) => {
-                            if send_line(&mut stream, &line).is_err() {
+                            if send_stream_item(&mut stream, &line).is_err() {
                                 break;
                             }
                         }
@@ -376,14 +430,8 @@ impl Runtime {
                     }
                 }
             }
-            _ => send_line(&mut stream, &err("unknown command"))?,
+            _ => send_response(&mut stream, &err("unknown command"), started)?,
         }
-        trace_event!(
-            Level::Trace,
-            Component::DaemonIpc,
-            "IPC_RESPONSE_SENT",
-            json!({"command":req.command,"duration_us":started.elapsed().as_micros()})
-        );
         trace_event!(
             Level::Trace,
             Component::DaemonIpc,
@@ -791,6 +839,41 @@ mod tests {
             true
         );
         request(&home, "status").unwrap();
+        let mut subscription = UnixStream::connect(&socket).unwrap();
+        subscription
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        send_line(
+            &mut subscription,
+            &Request {
+                version: 1,
+                command: "subscribe".into(),
+                stream: Some("logs".into()),
+                args: Value::Null,
+            },
+        )
+        .unwrap();
+        assert!(receive_line::<Reply>(&mut subscription).unwrap().ok);
+        assert!(!receive_line::<String>(&mut subscription)
+            .unwrap()
+            .is_empty());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !fs::read_to_string(output.join("Latest-trace/trace-0001.jsonl"))
+            .unwrap()
+            .contains("IPC_STREAM_ITEM_SENT")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (mut broken_server, broken_client) = UnixStream::pair().unwrap();
+        drop(broken_client);
+        {
+            let _scope = trace::current_context()
+                .with("request_id", "broken-write-test")
+                .with("command", "status")
+                .enter();
+            assert!(send_response(&mut broken_server, &ok(None), Instant::now()).is_err());
+        }
         request(&home, "trace_flush").unwrap();
         let latest = output.join("Latest-trace");
         assert!(fs::metadata(latest.join("trace-0001.jsonl")).unwrap().len() > 0);
@@ -803,6 +886,77 @@ mod tests {
         assert!(!trace.contains(&secret));
         assert!(trace.contains("IPC_REQUEST_PARSED"));
         assert!(trace.contains("request_id"));
+        let records: Vec<Value> = trace
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let subscriber_request = records
+            .iter()
+            .find(|v| v["event"] == "IPC_REQUEST_PARSED" && v["fields"]["command"] == "subscribe")
+            .unwrap()["context"]["request_id"]
+            .clone();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|v| v["context"]["request_id"] == subscriber_request
+                    && v["event"] == "IPC_RESPONSE_SENT")
+                .count(),
+            1
+        );
+        assert!(records
+            .iter()
+            .any(|v| v["context"]["request_id"] == subscriber_request
+                && v["event"] == "IPC_STREAM_ITEM_SENT"));
+        let write_failure = records
+            .iter()
+            .find(|v| {
+                v["event"] == "IPC_WRITE_FAILED"
+                    && v["context"]["request_id"] == "broken-write-test"
+            })
+            .unwrap();
+        assert_eq!(
+            write_failure["fields"]["error"]["operation"],
+            "send_status_response"
+        );
+        assert_eq!(write_failure["fields"]["error"]["os_kind"], "BrokenPipe");
+        assert_eq!(write_failure["fields"]["error"]["os_code"], 32);
+        assert!(
+            write_failure["fields"]["error"]["chain"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 1
+        );
+        assert!(!records
+            .iter()
+            .any(|v| v["context"]["request_id"] == "broken-write-test"
+                && v["event"] == "IPC_RESPONSE_SENT"));
+        let status_request = records
+            .iter()
+            .find(|v| v["event"] == "IPC_REQUEST_PARSED" && v["fields"]["command"] == "status")
+            .unwrap()["context"]["request_id"]
+            .clone();
+        let request_records: Vec<&Value> = records
+            .iter()
+            .filter(|v| v["context"]["request_id"] == status_request)
+            .collect();
+        for event in [
+            "IPC_ACCEPT",
+            "IPC_REQUEST_RECEIVED",
+            "IPC_REQUEST_PARSED",
+            "IPC_RESPONSE_START",
+            "IPC_RESPONSE_SENT",
+            "IPC_CLIENT_CLOSED",
+        ] {
+            assert_eq!(
+                request_records
+                    .iter()
+                    .filter(|v| v["event"] == event)
+                    .count(),
+                1,
+                "{event}"
+            );
+        }
         assert_eq!(
             request(&home, "trace_status").unwrap().data.unwrap()["active"],
             false

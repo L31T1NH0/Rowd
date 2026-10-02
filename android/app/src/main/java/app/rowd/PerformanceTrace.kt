@@ -22,12 +22,33 @@ object PerformanceTrace {
     private val observers = mutableMapOf<String, Long>()
     private val seen = mutableSetOf<String>()
     private val shareNames = mutableMapOf<String, String>()
-    @Volatile private var active = false
-    @Volatile var failure: String? = null; private set
-    fun enabled() = active
+    private val producer = TraceProducerState()
+    private var active: Boolean
+        get() = producer.active
+        set(value) { producer.active = value }
+    var failure: String?
+        @Synchronized get() = producer.failure
+        private set(value) { producer.failure = value }
+    private fun writerState(): TraceWriterState {
+        val state = JSONObject(NativeBridge.traceRuntimeState())
+        return TraceWriterState(state.getBoolean("trace_active"),
+            if (state.isNull("trace_error")) null else state.optString("trace_error"))
+    }
+    @Synchronized fun enabled(): Boolean {
+        val wasActive = active
+        val previousFailure = failure
+        try {
+            producer.reconcile(writerState())
+        } catch (error: Exception) {
+            android.util.Log.e("RowdTrace", "TRACE_STATE_UNAVAILABLE", error)
+        }
+        if (!active && failure != null && (wasActive || previousFailure != failure))
+            android.util.Log.e("RowdTrace", failure!!)
+        return active
+    }
 
     @Synchronized fun enable(context: Context) {
-        check(!active) { "Trace já ativo" }
+        check(!enabled()) { "Trace já ativo" }
         val directory = File(context.filesDir, "diagnostic-trace")
         check(NativeBridge.setTrace(directory.absolutePath, UUID.randomUUID().toString())) { "Não foi possível iniciar o trace Rust." }
         root = directory
@@ -39,20 +60,16 @@ object PerformanceTrace {
             .put("app_version", context.packageManager.getPackageInfo(context.packageName, 0).versionName))
     }
     @Synchronized fun disable(termination: String = "trace_stop") {
-        if (!active) return
+        if (!enabled()) return
         event("TRACE_PRODUCER_STOP", null, component = Component.Service, level = "info", sourceFile = "PerformanceTrace.kt", function = "disable", detail = JSONObject().put("termination", termination))
-        check(NativeBridge.stopTrace(termination)) { "Não foi possível finalizar o trace Rust." }
-        active = false
+        val stopped = NativeBridge.stopTrace(termination)
+        producer.reconcile(writerState())
+        if (stopped) failure = null
+        check(stopped) { failure ?: "Não foi possível finalizar o trace Rust." }
     }
     @Synchronized fun flush() {
         NativeBridge.flushTrace()
-        if (active) {
-            val status = JSONObject(NativeBridge.traceRuntimeState())
-            if (!status.optBoolean("trace_active")) {
-                active = false; failure = status.optString("trace_error", "TRACE_WRITER_FAILED")
-                android.util.Log.e("RowdTrace", failure ?: "TRACE_WRITER_FAILED")
-            }
-        }
+        enabled()
     }
     @Synchronized fun observerRegistered(share: String?) { if (share != null) observers[share] = System.currentTimeMillis() }
     @Synchronized fun observerUnregistered() { observers.clear() }
@@ -77,9 +94,10 @@ object PerformanceTrace {
             .put("message", error.message).put("chain", chain).apply { if (stack) put("stack", android.util.Log.getStackTraceString(error)) }
     }
     @Synchronized fun event(name: String, share: String?, path: String? = null, bytes: Long? = null, start: Long? = null,
-        detail: JSONObject? = null, component: Component = Component.SAF, level: String = "trace", function: String = name, sourceFile: String = "FolderAccess.kt") {
-        if (!active) return
-        try {
+        detail: JSONObject? = null, component: Component = Component.SAF, level: String = "trace", function: String? = null, sourceFile: String = "FolderAccess.kt") {
+        if (!enabled()) return
+        producer.deliver(send = {
+            val source = traceSource()
             val context = JSONObject()
             if (share != null) {context.put("share_id", share);shareNames[share]?.let {context.put("share_name", it)}}
             if (share != null && path != null) context.put("file_id", fileId(share, path))
@@ -89,15 +107,13 @@ object PerformanceTrace {
             if (start != null) fields.put("duration_us", (now() - start) / 1000)
             val json = JSONObject().put("event", name.uppercase()).put("component", component.label).put("level", level)
                 .put("context", context).put("fields", fields)
-                .put("source", JSONObject().put("file", sourceFile).put("function", function).put("thread", Thread.currentThread().name))
-            check(NativeBridge.traceEvent(json.toString())) { "TRACE_WRITER_FAILED" }
-        } catch (error: Exception) {
-            failure = error.toString(); active = false
-            android.util.Log.e("RowdTrace", "TRACE_WRITER_FAILED; trace desativado", error)
-        }
+                .put("source", JSONObject().put("file", source.file ?: sourceFile).put("line", source.line)
+                    .put("function", function ?: source.function ?: name).put("thread", Thread.currentThread().name))
+            NativeBridge.traceEvent(json.toString())
+        }, runtime = ::writerState, report = { android.util.Log.e("RowdTrace", it) })
     }
     @Synchronized fun firstSeen(share: String, path: String, modified: Long?, source: String) {
-        if (!active || !seen.add(fileId(share, path))) return
+        if (!enabled() || !seen.add(fileId(share, path))) return
         val wall = System.currentTimeMillis()
         val registered = observers[share]
         event("FILE_FIRST_SEEN", share, path, component = Component.Filesystem, detail = JSONObject()

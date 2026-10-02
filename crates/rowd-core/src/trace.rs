@@ -1078,7 +1078,24 @@ pub fn observed_file(path: &str, source: &str, metadata: &fs::Metadata) {
 }
 
 /// Kotlin routes structured events through the same writer and sequence as JNI Rust.
+pub fn ingest_android_json(text: &str) -> Result<()> {
+    let result = serde_json::from_str(text)
+        .context("parse Kotlin trace event")
+        .and_then(ingest_android);
+    if let Err(error) = &result {
+        eprintln!("INGEST_ANDROID_FAILED: {error:#}");
+        crate::trace_event!(
+            Level::Warn,
+            Component::Trace,
+            "INGEST_ANDROID_FAILED",
+            json!({"error":TraceError::new("trace", "ingest_android", error), "writer_active":enabled()})
+        );
+    }
+    result
+}
+
 pub fn ingest_android(value: Value) -> Result<()> {
+    let event = value["event"].as_str().context("missing event")?;
     let component = match value["component"].as_str().unwrap_or("SAF") {
         "Watcher" => Component::Watcher,
         "Scanner" => Component::Scanner,
@@ -1126,10 +1143,13 @@ pub fn ingest_android(value: Value) -> Result<()> {
     emit(
         level,
         component,
-        value["event"].as_str().context("missing event")?,
+        event,
         value["fields"].clone(),
         value["source"]["file"].as_str().unwrap_or("Kotlin"),
-        0,
+        value["source"]["line"]
+            .as_u64()
+            .and_then(|line| u32::try_from(line).ok())
+            .unwrap_or(0),
         value["source"]["function"].as_str().unwrap_or("unknown"),
     );
     Ok(())
@@ -1239,7 +1259,8 @@ mod tests {
         assert_eq!(error.chain.len(), 2);
         assert_eq!(error.code, "broken_pipe");
         start(dir.path(), "pc", Some("shared-android-session")).unwrap();
-        ingest_android(json!({"component":"Watcher","event":"OBSERVER_CALLBACK","source":{"file":"SyncService.kt","function":"onChange","thread":"main"},"context":{"share_id":"camera"},"fields":{"self_change":false}})).unwrap();
+        ingest_android_json(&json!({"component":"Watcher","event":"OBSERVER_CALLBACK","source":{"file":"SyncService.kt","line":228,"function":"onChange","thread":"main"},"context":{"share_id":"camera"},"fields":{"self_change":false}}).to_string()).unwrap();
+        assert!(enabled());
         let line: Value = serde_json::from_str(
             fs::read_to_string(latest.join("trace-0001.jsonl"))
                 .unwrap()
@@ -1253,6 +1274,13 @@ mod tests {
             "shared-android-session"
         );
         assert_eq!(line["source"]["thread"], "main");
+        assert_eq!(line["source"]["line"], 228);
+        assert!(ingest_android_json("invalid json").is_err());
+        assert!(ingest_android_json("{}").is_err());
+        assert!(enabled()); // Individual ingestion failures do not disable the writer.
+        assert!(fs::read_to_string(latest.join("trace-0001.jsonl"))
+            .unwrap()
+            .contains("INGEST_ANDROID_FAILED"));
         let before = status()["events"].as_u64().unwrap();
         acknowledge_file("share", "unchanged", "ack_batch_sent");
         assert_eq!(status()["events"], before + 1); // No fabricated queued/start/complete events.
@@ -1280,12 +1308,12 @@ mod tests {
         // Read-only descriptor makes writes fail without depending on disk capacity.
         session().lock().unwrap().as_mut().unwrap().writer =
             File::open(latest.join("trace-0001.jsonl")).unwrap();
-        crate::trace_event!(
-            Level::Error,
-            Component::Trace,
-            "TEST_WRITE_FAILURE",
-            json!({})
-        );
+        let accepted = ingest_android_json(
+            r#"{"event":"TEST_WRITE_FAILURE","component":"Watcher","fields":{}}"#,
+        )
+        .is_ok()
+            && enabled();
+        assert!(!accepted);
         assert!(!enabled());
         assert!(status()["error"]
             .as_str()

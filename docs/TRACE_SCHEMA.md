@@ -71,7 +71,9 @@ wall_ms pode saltar após ajuste do relógio civil. Ordene por seq dentro da ses
 23:45:01.884 [ERROR] [Daemon-IPC] [req=request-...] IPC_WRITE_FAILED | error={...} | source=crates/rowd-daemon/src/unix.rs:120 ...
 ```
 
-Rust usa trace_event! e trace_legacy_event! para file!, line! e module_path!. source.function é o módulo Rust, não necessariamente o nome da função. event() mantém track_caller para compatibilidade. Kotlin informa arquivo, função/contexto e thread, sem stacks em eventos normais; line=0 significa indisponível.
+Rust usa trace_event! e trace_legacy_event! para file!, line! e module_path!. source.function é o módulo Rust, não necessariamente o nome da função. event() mantém track_caller para compatibilidade. Kotlin inspeciona frames para identificar arquivo, linha real do callsite, função/contexto e thread, ignorando os wrappers de trace. Eventos normais não armazenam a stack; line=0 é apenas fallback quando a informação não está disponível.
+
+Uma rejeição de evento Kotlin registra INGEST_ANDROID_FAILED sem desativar um writer saudável. O produtor reconcilia seu estado com traceRuntimeState após o envio e ao consultar enabled/flush; falhas do writer conservam o erro nativo e desativam a coleta. Falhas ao consultar estado aparecem no Logcat como TRACE_STATE_UNAVAILABLE.
 
 ## Componentes e contexto
 
@@ -97,7 +99,7 @@ Rede: NETWORK_CALLBACK/CHANGED, DISCOVERY_START/QUERY_SENT/REPLY_RECEIVED/CANDID
 
 Protocolo/transfer: PROTOCOL_SEND/RECEIVE e falhas, TRANSFER_QUEUED/START/COMPLETE/FAILED, BLOB_SEND_START/END, BLOB_RECEIVE_START/END e REMOTE_ACK. Só tipos, tamanhos e identificadores, nunca payloads.
 
-StateStore/SAF: STATE_PERSIST_START/END/FAILED e SAF_CALL_START/END/FAILED. IPC: IPC_ACCEPT, IPC_REQUEST_RECEIVED/PARSED, IPC_RESPONSE_START/SENT, IPC_CLIENT_CLOSED, IPC_READ_FAILED/WRITE_FAILED/TIMEOUT/HANDLER_FAILED. IPC_CLIENT_CLOSED indica fim do handler, não prova recebimento pelo cliente. A resposta de trace_stop ocorre depois da finalização e, portanto, fora da sessão encerrada.
+StateStore/SAF: STATE_PERSIST_START/END/FAILED e SAF_CALL_START/END/FAILED. Fallbacks de delta preservam DELTA_SCAN_FAILED com operação, erro e fallback=deep_scan; instalação preserva INSTALL_CACHE_LOOKUP_FAILED/INSTALL_CACHE_UPDATE_FAILED. IPC: IPC_ACCEPT, IPC_REQUEST_RECEIVED/PARSED, IPC_RESPONSE_START/SENT, IPC_STREAM_ITEM_SENT, IPC_CLIENT_CLOSED, IPC_READ_FAILED/WRITE_FAILED/TIMEOUT/HANDLER_FAILED. IPC_RESPONSE_SENT indica uma resposta semântica escrita com sucesso; IPC_STREAM_ITEM_SENT indica cada item adicional de subscription. A primitiva de escrita não emite sucesso semântico. IPC_CLIENT_CLOSED indica fim do handler, não prova recebimento pelo cliente. A resposta de trace_stop ocorre depois da finalização e, portanto, fora da sessão encerrada.
 
 RUNTIME_STATE_SNAPSHOT ocorre aproximadamente a cada 30 segundos quando ativo. Android inclui serviço, worker, observers, Share selecionada, dirty/pending URIs, rede, conexão, gerações e cancelamento. Daemon inclui readiness, conexão, uptime e handlers. INVARIANT_VIOLATION produz evidência e não executa recuperação automática. Terminal-output registra mensagens sem capturar frames da TUI.
 

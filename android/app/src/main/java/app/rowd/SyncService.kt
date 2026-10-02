@@ -34,7 +34,7 @@ data class RowdStatus(val kind: Kind, val title: String, val detail: String) {
 class SyncService : Service() {
     companion object {
         private fun traceEvent(name: String, share: String?, component: PerformanceTrace.Component,
-            level: String = "trace", detail: JSONObject? = null, function: String = name) {
+            level: String = "trace", detail: JSONObject? = null, function: String? = null) {
             PerformanceTrace.event(name, share, component = component, level = level, detail = detail,
                 function = function, sourceFile = "SyncService.kt")
         }
