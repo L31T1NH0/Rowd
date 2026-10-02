@@ -23,9 +23,9 @@ internal class WakeState {
     fun requestReconnect() { reconnectRequested = true }
     fun pollResult(kind: String, shareId: String?, at: Long) {
         when (kind) {
-            "none" -> Unit
+            "none", "local", "cancelled", "audit_due" -> Unit
             "share" -> wake(requireNotNull(shareId), WakeSource.REMOTE_WAKE, at)
-            "transport_invalid" -> requestReconnect()
+            "transport_invalid", "network" -> requestReconnect()
             else -> error("Resultado pollWake desconhecido: $kind")
         }
     }

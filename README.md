@@ -1,7 +1,7 @@
 # <img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="40"> Rowd
 
 > [!WARNING]
-> **Unstable alpha (0.7.0).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+> **Unstable alpha (0.8.2).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
 
 Rowd syncs folders between one Linux PC and one Android phone on the same local network. You choose which folders connect and whether files travel both ways, to Android, or to the PC. The devices transfer files over TLS without a cloud account or relay.
 
@@ -9,21 +9,26 @@ The Rust test suite and Android build pass, and the app has seen use on a real d
 
 ## Get Rowd
 
-Download both files from the [0.7.0 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.7.0-alpha):
+Download both files from the [0.8.2 alpha release](https://github.com/L31T1NH0/Rowd/releases/tag/v0.8.2-alpha):
 
 | Device | File |
 | --- | --- |
-| Linux x86_64 | `rowd-v0.7.0-alpha-linux-x86_64` |
-| Android 8 or newer, ARM64 | `rowd-v0.7.0-alpha-android-arm64.apk` |
+| Linux x86_64 | `rowd-v0.8.2-alpha-linux-x86_64` |
+| Android 8 or newer, ARM64 | `rowd-v0.8.2-alpha-android-arm64.apk` |
 
-The release includes `rowd-v0.7.0-alpha-SHA256SUMS` so you can check both downloads. The Android release APK is signed with the debug key. Update the PC binary and APK together to use pairing discovery; both builds use sync protocol V12.
+The release includes `rowd-v0.8.2-alpha-SHA256SUMS` so you can check both downloads. The Android release APK is signed with the debug key. Update the PC binary and APK together to use pairing discovery; both builds use sync protocol V12.
 
 On Linux, make the downloaded binary executable and start it:
 
 ```bash
-chmod +x rowd-v0.7.0-alpha-linux-x86_64
-./rowd-v0.7.0-alpha-linux-x86_64
+chmod +x rowd-v0.8.2-alpha-linux-x86_64
+mkdir -p ~/.local/bin
+install -m 755 rowd-v0.8.2-alpha-linux-x86_64 ~/.local/bin/rowd
+rowd --version
+rowd
 ```
+
+`~/.local/bin` must be in your shell’s `PATH`. When building from source, `scripts/build-desktop.sh` builds the release binary and links `rowd` in this directory to the current build; later rebuilds keep the command up to date. Set `ROWD_BIN_DIR` to choose a different directory.
 
 Keep both devices on the same LAN. The phone must reach TCP port `43821`. Endpoint discovery uses multicast UDP `239.255.42.99:43822`; initial pairing discovery uses port `43823`. If endpoint multicast is blocked, Rowd tries the address stored in the invitation.
 
@@ -69,7 +74,8 @@ Rowd does not sync symlinks, empty folders, original permissions, or timestamps.
 The desktop app is a Rust workspace package:
 
 ```bash
-cargo build --release -p rowd
+bash scripts/build-desktop.sh
+rowd --version
 cargo fmt --all --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked

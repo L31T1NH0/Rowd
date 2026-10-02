@@ -90,7 +90,7 @@ pub fn classify(error: &anyhow::Error, generation_changed: bool, cancelled: bool
     if round.is_some_and(|round| !round.stream_reusable) {
         return FailureKind::ProtocolFatal;
     }
-    if cancelled || error.is::<CancelledError>() {
+    if cancelled || is_cancelled(error) {
         return FailureKind::Cancelled;
     }
     if error.is::<LocalFilesystemError>() {
@@ -114,6 +114,10 @@ pub enum PollWake {
     None,
     Share(String),
     TransportInvalid,
+    Local,
+    Network,
+    Cancelled,
+    AuditDue,
 }
 impl PollWake {
     pub fn json(&self) -> String {
@@ -121,6 +125,10 @@ impl PollWake {
             Self::None => serde_json::json!({"kind":"none"}),
             Self::Share(id) => serde_json::json!({"kind":"share","share_id":id}),
             Self::TransportInvalid => serde_json::json!({"kind":"transport_invalid"}),
+            Self::Local => serde_json::json!({"kind":"local"}),
+            Self::Network => serde_json::json!({"kind":"network"}),
+            Self::Cancelled => serde_json::json!({"kind":"cancelled"}),
+            Self::AuditDue => serde_json::json!({"kind":"audit_due"}),
         }
         .to_string()
     }
@@ -180,6 +188,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum WakeReadiness {
     Idle,
@@ -188,6 +197,7 @@ pub enum WakeReadiness {
     SocketData,
 }
 
+#[cfg(test)]
 pub fn wait_for_wake(
     mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
     mut peek: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
@@ -262,12 +272,19 @@ mod wait_tests {
 }
 
 /// A SAF failure before ScanReady can finish through the existing ScanDeferred exchange.
+pub fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.is::<CancelledError>()
+        || error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|inner| inner.is::<CancelledError>())
+}
 pub fn deferred_scan_result<T>(
     result: anyhow::Result<T>,
     errors: &mut Vec<String>,
 ) -> anyhow::Result<T> {
     match result {
-        Err(error) if error.is::<LocalFilesystemError>() || error.is::<CancelledError>() => {
+        Err(error) if error.is::<LocalFilesystemError>() || is_cancelled(&error) => {
             errors.push(format!("{error:#}"));
             Err(rowd_core::sync::ScanDeferred.into())
         }
@@ -305,6 +322,16 @@ mod scan_tests {
             anyhow::Error::new(CancelledError).context(rowd_core::managed::RoundFailure {
                 stream_reusable: true,
             });
+        let interrupted_cancel: anyhow::Error = std::io::Error::other(CancelledError).into();
+        assert_eq!(
+            classify(&interrupted_cancel, false, false),
+            FailureKind::Cancelled
+        );
+        assert!(
+            deferred_scan_result::<()>(Err(interrupted_cancel), &mut errors)
+                .unwrap_err()
+                .is::<rowd_core::sync::ScanDeferred>()
+        );
         assert_eq!(classify(&cancelled, false, true), FailureKind::Cancelled);
         assert!(!classify(&cancelled, false, true).invalidates());
     }

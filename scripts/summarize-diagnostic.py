@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Summarize the three JSONL traces without exposing paths or URIs."""
+import importlib.util
 import collections
 import json
 import pathlib
@@ -7,6 +8,10 @@ import sys
 import zipfile
 
 root = pathlib.Path(sys.argv[1])
+protocol_events = {"pc": [], "android": []}
+spec = importlib.util.spec_from_file_location("clock_offset", pathlib.Path(__file__).with_name("trace-clock-offset.py"))
+clock_offset = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(clock_offset)
 counts = collections.Counter()
 reasons = collections.Counter()
 audits = collections.Counter()
@@ -23,6 +28,10 @@ def read(lines, source):
             event = json.loads(line)
         except (ValueError, UnicodeDecodeError):
             continue
+        if source == "pc":
+            protocol_events["pc"].append(event)
+        elif source != "pc_before" and event.get("side") == "android":
+            protocol_events["android"].append(event)
         name = event.get("event", "").lower()
         context = event.get("context", event)
         fields = event.get("fields", event)
@@ -58,6 +67,7 @@ if archive.exists():
 
 summary = {"events": {f"{side}:{name}": count for (side, name), count in sorted(counts.items())},
            "delta_unavailable_reasons": dict(sorted(reasons.items())),
-           "audit_share_counts": dict(sorted(audits.items()))}
+           "audit_share_counts": dict(sorted(audits.items())),
+           "peer_clock": clock_offset.estimate(protocol_events["pc"], protocol_events["android"])}
 (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 print(json.dumps(summary, indent=2))

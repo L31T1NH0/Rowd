@@ -44,6 +44,15 @@ def measure(items):
     ends = Counter(v['context'].get('round_id') for v, _ in items if v['event'] == 'ROUND_END')
     exact_polls = start_event and end_event and 'poll_count' in start_event['fields'] and 'poll_count' in end_event['fields']
     poll_count = end_event['fields']['poll_count'] - start_event['fields']['poll_count'] if exact_polls else polls + old_empty + nonempty
+    idle_keys = ('idle_waits', 'local_wakes', 'remote_wakes', 'network_wakes', 'cancel_wakes', 'timeouts', 'polls', 'empty_poll_count')
+    start_idle = start_event['fields'].get('idle', {}) if start_event else {}
+    end_idle = end_event['fields'].get('idle', {}) if end_event else {}
+    event_driven = all(key in start_idle and key in end_idle for key in idle_keys)
+    idle_delta = {key: end_idle[key] - start_idle[key] if event_driven else None for key in idle_keys}
+    # Do not let a zero native counter conceal explicit empty-result regressions.
+    explicit_empty = sum(v['event'] == 'POLL_WAKE_RESULT' and v['fields'].get('kind') == 'none' for v, _ in interval)
+    if event_driven:
+        idle_delta['empty_poll_count'] = max(idle_delta['empty_poll_count'], old_empty + explicit_empty)
     connection_stages = Counter((v['context'].get('connection_id'), v['event']) for v, _ in items
                                 if v['event'] in ('CONNECTION_AUTHENTICATED', 'PERSISTENT_CONNECTION_INSTALLED', 'CONNECTION_ESTABLISHED'))
     metrics = {
@@ -60,7 +69,7 @@ def measure(items):
         'trace_bytes_per_minute': round(sum(size for _, size in interval) / minutes),
         'duplicate_connection_stages': sum(count - 1 for count in connection_stages.values() if count > 1),
         'bad_kotlin_sources': len(bad_sources), 'round_lifecycle_balanced': starts == ends and None not in starts,
-        'cpu_wakeups': None,
+        'cpu_wakeups': None, 'event_driven_idle': event_driven, **idle_delta,
     }
     return metrics, interval
 
@@ -94,7 +103,12 @@ def main():
                 failures.append('Filesystem wake during unchanged idle scenario')
             if event['event'] == 'FULL_SCAN_FALLBACK' and event['fields'].get('reason') not in ('full_scan_requested',):
                 failures.append('Unexpected full scan fallback')
-        if metrics['duration_minutes'] >= 9 and metrics['poll_count'] > metrics['duration_minutes'] * 90:
+        if metrics['event_driven_idle']:
+            if metrics['empty_poll_count'] != 0:
+                failures.append('Empty periodic polls in event-driven idle')
+            if metrics['duration_minutes'] >= 9 and metrics['poll_count'] > metrics['audits'] + 5:
+                failures.append('Idle waits exceed audits plus boundary allowance; check for periodic polling')
+        elif metrics['duration_minutes'] >= 9 and metrics['poll_count'] > metrics['duration_minutes'] * 90:
             failures.append('Polling volume above 1.5/s')
     if failures:
         raise SystemExit('\n'.join(failures))

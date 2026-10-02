@@ -1,12 +1,19 @@
 //! Retry only individual, non-consuming wait/read syscalls. Never replay a frame or write.
 use std::io;
 
-pub fn interrupted<T>(
+pub fn interrupted<T>(operation: &str, syscall: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    interrupted_with_control(operation, || Ok(()), syscall)
+}
+
+/// Check control before the syscall and between EINTR retries, without replaying frames.
+pub fn interrupted_with_control<T>(
     operation: &str,
+    mut control: impl FnMut() -> io::Result<()>,
     mut syscall: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
     let mut attempt = 0u64;
     loop {
+        control()?;
         match syscall() {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 attempt += 1;
@@ -45,6 +52,27 @@ mod tests {
             assert_eq!(result.unwrap(), 1);
             assert_eq!(attempts, 2);
         }
+    }
+    #[test]
+    fn cancellation_between_eintr_retries_stops_without_replaying_any_more_io() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let result = interrupted_with_control::<usize>(
+            "peek",
+            || {
+                if attempts.get() == 3 {
+                    Err(io::Error::other("cancelled"))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(io::ErrorKind::Interrupted.into())
+            },
+        );
+        assert_eq!(result.unwrap_err().to_string(), "cancelled");
+        assert_eq!(attempts.get(), 3);
     }
     #[test]
     fn eof_and_transport_errors_are_not_retried() {

@@ -1,8 +1,9 @@
+mod idle;
 mod transport;
 use anyhow::{ensure, Context, Result};
 use jni::{
     objects::{JObject, JString, JValue},
-    sys::{jboolean, jstring},
+    sys::{jboolean, jint, jlong, jstring},
     JNIEnv,
 };
 use rowd_core::{
@@ -20,7 +21,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 use tempfile::{NamedTempFile, TempPath};
-use transport::{FailureKind, LocalFilesystemError, PollWake, WakeReadiness};
+#[cfg(test)]
+use transport::WakeReadiness;
+use transport::{FailureKind, LocalFilesystemError, PollWake};
 
 static CONNECTION_TRACE_CONTEXT: OnceLock<Mutex<trace::TraceContext>> = OnceLock::new();
 static CONNECTION_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -43,6 +46,35 @@ fn connection_context() -> trace::TraceContext {
         ctx.with("connection_id", id)
     } else {
         ctx
+    }
+}
+static IDLE_WAKE: OnceLock<idle::IdleWake> = OnceLock::new();
+fn idle_wake() -> &'static idle::IdleWake {
+    IDLE_WAKE.get_or_init(|| idle::IdleWake::new().expect("idle socketpair"))
+}
+fn io_cancelled() -> std::io::Result<()> {
+    if CANCELLED.load(Ordering::Relaxed) {
+        return Err(std::io::Error::other(transport::CancelledError));
+    }
+    Ok(())
+}
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_signalIdle(
+    _env: JNIEnv,
+    _class: JObject,
+    reason: jint,
+) {
+    if let Err(error) = idle_wake().signal(if reason == 2 {
+        idle::NETWORK
+    } else {
+        idle::LOCAL
+    }) {
+        trace_event!(
+            TraceLevel::Error,
+            TraceComponent::Connection,
+            "IDLE_SIGNAL_FAILED",
+            serde_json::json!({"error":error.to_string()})
+        );
     }
 }
 static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -286,6 +318,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_revokeRemotePairing(
 pub extern "system" fn Java_app_rowd_NativeBridge_networkChanged(_env: JNIEnv, _class: JObject) {
     let _context = connection_context().enter();
     let previous = NETWORK_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let _ = idle_wake().signal(idle::NETWORK);
     trace_event!(
         TraceLevel::Info,
         TraceComponent::Network,
@@ -523,7 +556,11 @@ impl Store for AndroidStore<'_, '_, '_> {
                 }
                 socket.set_read_timeout(Some(Duration::from_millis(50)))?;
                 let mut byte = [0];
-                match rowd_core::io_retry::interrupted("scan_peek", || socket.peek(&mut byte)) {
+                match rowd_core::io_retry::interrupted_with_control(
+                    "scan_peek",
+                    io_cancelled,
+                    || socket.peek(&mut byte),
+                ) {
                     Ok(0) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -699,7 +736,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_traceRuntimeState(
         .get()
         .and_then(|s| s.try_lock().ok())
         .map(|s| s.is_some());
-    let state=serde_json::json!({"connection_present":present,"network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst),"poll_count":POLL_COUNT.load(Ordering::Relaxed),"cancellation_state":CANCELLED.load(Ordering::Relaxed),"trace_active":trace::enabled(),"trace_error":trace::status()["error"]}).to_string();
+    let state=serde_json::json!({"connection_present":present,"network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst),"poll_count":POLL_COUNT.load(Ordering::Relaxed),"idle":idle_wake().metrics(),"cancellation_state":CANCELLED.load(Ordering::Relaxed),"trace_active":trace::enabled(),"trace_error":trace::status()["error"]}).to_string();
     env.new_string(state)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
@@ -797,11 +834,13 @@ impl rowd_core::managed::ManagedClient for AndroidStore<'_, '_, '_> {
 #[no_mangle]
 pub extern "system" fn Java_app_rowd_NativeBridge_cancel(_env: JNIEnv, _class: JObject) {
     CANCELLED.store(true, Ordering::Relaxed);
+    let _ = idle_wake().signal(idle::CANCEL);
 }
 
 #[no_mangle]
 pub extern "system" fn Java_app_rowd_NativeBridge_resetCancellation(_env: JNIEnv, _class: JObject) {
     CANCELLED.store(false, Ordering::Relaxed);
+    idle_wake().reset_cancel();
 }
 
 #[no_mangle]
@@ -1019,37 +1058,143 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
         .unwrap_or(std::ptr::null_mut())
 }
 
+struct IdleFrameSocket<'a> {
+    socket: &'a mut TcpStream,
+    pending: u8,
+    deadline: Instant,
+}
+impl Read for IdleFrameSocket<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match idle_wake().wait(self.socket, self.deadline, io_cancelled)? {
+                idle::Ready::Socket => {
+                    return rowd_core::io_retry::interrupted_with_control(
+                        "idle_frame_read",
+                        io_cancelled,
+                        || self.socket.read(buf),
+                    )
+                }
+                idle::Ready::Deadline => return Err(std::io::ErrorKind::TimedOut.into()),
+                idle::Ready::Control(reason) => {
+                    if reason & idle::CANCEL != 0 {
+                        return Err(std::io::Error::other(transport::CancelledError));
+                    }
+                    if reason & idle::NETWORK != 0 {
+                        return Err(std::io::ErrorKind::NotConnected.into());
+                    }
+                    self.pending |= reason;
+                }
+            }
+        }
+    }
+}
+impl Write for IdleFrameSocket<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.socket.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.socket.flush()
+    }
+}
+impl Drop for IdleFrameSocket<'_> {
+    fn drop(&mut self) {
+        if self.pending != 0 {
+            let _ = idle_wake().signal(self.pending);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
     env: JNIEnv<'local>,
     _class: JObject<'local>,
+    audit_in_ms: jlong,
 ) -> jstring {
     let mut connection = connection().lock().unwrap();
-    let result = poll_connection(&mut connection);
+    let result = poll_connection(
+        &mut connection,
+        Duration::from_millis(audit_in_ms.max(0) as u64),
+    );
     env.new_string(result.json())
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
 
-fn poll_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream)>) -> PollWake {
+enum IdleInput {
+    First(u8),
+    Event(PollWake),
+    Eof,
+}
+fn wait_application_byte(
+    io: &mut rowd_core::tls::ClientStream,
+    audit_in: Duration,
+) -> Result<IdleInput> {
+    let deadline = Instant::now() + audit_in;
+    loop {
+        let mut byte = [0];
+        match rowd_core::io_retry::interrupted_with_control("idle_tls_reader", io_cancelled, || {
+            io.conn.reader().read(&mut byte)
+        }) {
+            Ok(0) => return Ok(IdleInput::Eof),
+            Ok(_) => return Ok(IdleInput::First(byte[0])),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+        match idle_wake().wait(&io.sock, deadline, io_cancelled)? {
+            idle::Ready::Deadline => return Ok(IdleInput::Event(PollWake::AuditDue)),
+            idle::Ready::Control(reason) => {
+                return Ok(IdleInput::Event(if reason & idle::CANCEL != 0 {
+                    PollWake::Cancelled
+                } else if reason & idle::NETWORK != 0 {
+                    PollWake::Network
+                } else {
+                    PollWake::Local
+                }))
+            }
+            idle::Ready::Socket => {
+                // rustls read_tls performs one read and retains partial TLS records. No
+                // application frame has started yet, so local control may safely return.
+                if rowd_core::io_retry::interrupted_with_control(
+                    "idle_read_tls",
+                    io_cancelled,
+                    || io.conn.read_tls(&mut io.sock),
+                )? == 0
+                {
+                    return Ok(IdleInput::Eof);
+                }
+                io.conn.process_new_packets()?;
+                while io.conn.wants_write() {
+                    io_cancelled()?;
+                    // rustls keeps the unwritten suffix. Never replay a write on error.
+                    ensure!(
+                        io.conn.write_tls(&mut io.sock)? > 0,
+                        "TLS write made no progress"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn poll_connection(
+    connection: &mut Option<(String, rowd_core::tls::ClientStream)>,
+    audit_in: Duration,
+) -> PollWake {
     if CANCELLED.load(Ordering::Relaxed) {
-        return PollWake::None;
+        return PollWake::Cancelled;
     }
     let _context = connection_context().enter();
     POLL_COUNT.fetch_add(1, Ordering::Relaxed);
     let poll_started = Instant::now();
+    let mut frame_started = false;
     let result = if connection.is_some()
         && CONNECTION_GENERATION.load(Ordering::SeqCst) != NETWORK_GENERATION.load(Ordering::SeqCst)
     {
         PollWake::TransportInvalid
     } else if let Some((_, io)) = connection.as_mut() {
-        let _ = io.sock.set_read_timeout(Some(Duration::from_secs(1)));
-        let conn = &mut io.conn;
-        let socket = &io.sock;
-        let ready = transport::wait_for_wake(|buf| conn.reader().read(buf), |buf| socket.peek(buf));
-        match ready {
-            Ok(WakeReadiness::Idle) => PollWake::None,
-            Ok(WakeReadiness::Eof) => {
+        match wait_application_byte(io, audit_in) {
+            Ok(IdleInput::Event(event)) => event,
+            Ok(IdleInput::Eof) => {
                 trace_event!(
                     TraceLevel::Warn,
                     TraceComponent::Connection,
@@ -1058,16 +1203,31 @@ fn poll_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream
                 );
                 PollWake::TransportInvalid
             }
-            Ok(readiness) => {
+            Ok(IdleInput::First(first)) => {
+                frame_started = true;
                 let _ = io.sock.set_read_timeout(Some(Duration::from_secs(90)));
-                let incoming = if let WakeReadiness::Buffered(first) = readiness {
-                    rowd_core::protocol::receive_after_first(io, first)
-                } else {
-                    rowd_core::protocol::receive(io)
+                // A started frame keeps its 90s liveness deadline. Control can cancel its
+                // individual socket reads; local hints are retained until the frame finishes.
+                let mut socket = IdleFrameSocket {
+                    socket: &mut io.sock,
+                    pending: 0,
+                    deadline: Instant::now() + Duration::from_secs(90),
                 };
+                let mut stream = rustls::Stream::new(&mut io.conn, &mut socket);
+                let incoming = rowd_core::protocol::receive_after_first(&mut stream, first);
                 match incoming {
                     Ok(rowd_core::protocol::Message::WakeShare { share_id }) => {
+                        idle_wake().remote.fetch_add(1, Ordering::Relaxed);
                         PollWake::Share(share_id)
+                    }
+                    Err(_) if CANCELLED.load(Ordering::Relaxed) => {
+                        trace_event!(
+                            TraceLevel::Debug,
+                            TraceComponent::Connection,
+                            "IDLE_FRAME_CANCELLED",
+                            serde_json::json!({"stream_reusable":false})
+                        );
+                        PollWake::Cancelled
                     }
                     Err(error) => {
                         trace_event!(
@@ -1089,21 +1249,13 @@ fn poll_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream
                     }
                 }
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                PollWake::None
-            }
+            Err(_) if CANCELLED.load(Ordering::Relaxed) => PollWake::Cancelled,
             Err(error) => {
-                let error = anyhow::Error::new(error);
                 trace_event!(
                     TraceLevel::Error,
                     TraceComponent::Connection,
                     "POLL_WAKE_ERROR",
-                    serde_json::json!({"error":TraceError::new("connection","poll_wake_peek",&error)})
+                    serde_json::json!({"error":TraceError::new("connection","idle_wait_application_byte",&error)})
                 );
                 PollWake::TransportInvalid
             }
@@ -1111,6 +1263,9 @@ fn poll_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream
     } else {
         PollWake::TransportInvalid
     };
+    if result == PollWake::Cancelled && frame_started {
+        clear_connection(connection, "cancelled_partial_frame");
+    }
     let result = if result == PollWake::TransportInvalid
         || (connection.is_some()
             && CONNECTION_GENERATION.load(Ordering::SeqCst)
@@ -1121,24 +1276,12 @@ fn poll_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream
     } else {
         result
     };
-    static IDLE: OnceLock<Mutex<(Instant, u64, Duration)>> = OnceLock::new();
-    let mut idle = IDLE
-        .get_or_init(|| Mutex::new((Instant::now(), 0, Duration::ZERO)))
-        .lock()
-        .unwrap();
-    if result == PollWake::None {
-        idle.1 += 1;
-        idle.2 += poll_started.elapsed();
-    }
-    if idle.1 > 0 && (idle.0.elapsed() >= Duration::from_secs(30) || result != PollWake::None) {
-        trace_event!(
-            TraceLevel::Debug,
-            TraceComponent::Connection,
-            "POLL_WAKE_IDLE_SUMMARY",
-            serde_json::json!({"poll_count":idle.1,"duration_ms":idle.2.as_millis(),"window_ms":idle.0.elapsed().as_millis()})
-        );
-        *idle = (Instant::now(), 0, Duration::ZERO);
-    }
+    trace_event!(
+        TraceLevel::Debug,
+        TraceComponent::Connection,
+        "IDLE_WAIT_END",
+        serde_json::json!({"duration_ms":poll_started.elapsed().as_millis(),"result":serde_json::from_str::<serde_json::Value>(&result.json()).unwrap(),"counters":idle_wake().metrics()})
+    );
     if result != PollWake::None {
         trace_event!(
             TraceLevel::Info,
@@ -1211,8 +1354,11 @@ mod regression_tests {
         let (peer, _) = listener.accept().unwrap();
         let mut connection = Some(("regression".into(), stream));
         let idle_started = Instant::now();
-        assert_eq!(poll_connection(&mut connection), PollWake::None);
-        assert!(idle_started.elapsed() >= Duration::from_millis(750));
+        assert_eq!(
+            poll_connection(&mut connection, Duration::from_millis(100)),
+            PollWake::AuditDue
+        );
+        assert!(idle_started.elapsed() >= Duration::from_millis(80));
         let mut attempts = 0;
         assert_eq!(
             rowd_core::io_retry::interrupted("scan_peek", || {
@@ -1251,9 +1397,15 @@ mod regression_tests {
         assert!(!before.contains("ROUND_FAILED"));
         assert!(!before.contains("transport_invalid"));
         peer.shutdown(std::net::Shutdown::Both).unwrap();
-        assert_eq!(poll_connection(&mut connection), PollWake::TransportInvalid);
+        assert_eq!(
+            poll_connection(&mut connection, Duration::from_millis(100)),
+            PollWake::TransportInvalid
+        );
         assert!(connection.is_none());
-        assert_eq!(poll_connection(&mut connection), PollWake::TransportInvalid);
+        assert_eq!(
+            poll_connection(&mut connection, Duration::from_millis(100)),
+            PollWake::TransportInvalid
+        );
         trace::stop("regression_test").unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
         let records: Vec<serde_json::Value> = after
@@ -1267,16 +1419,120 @@ mod regression_tests {
                 .count(),
             1
         );
-        let summary = records
-            .iter()
-            .find(|v| v["event"] == "POLL_WAKE_IDLE_SUMMARY")
-            .unwrap();
-        assert_eq!(summary["fields"]["poll_count"], 1);
-        assert!(summary["fields"]["duration_ms"].as_u64().unwrap() >= 750);
         assert!(!records.iter().any(|v| v["event"] == "POLL_WAKE_START"
             || (v["event"] == "POLL_WAKE_RESULT" && v["fields"]["kind"] == "none")));
         assert!(records.iter().any(
             |v| v["event"] == "POLL_WAKE_RESULT" && v["fields"]["kind"] == "transport_invalid"
         ));
+        tls_wakes_without_polling();
+    }
+    // Run inside the regression test so native globals/trace state have one owner.
+    fn tls_wakes_without_polling() {
+        use rowd_core::protocol::{self, Message};
+        use std::sync::mpsc;
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let cert = rcgen::generate_simple_self_signed(vec!["rowd.local".into()]).unwrap();
+        let cert_der = hex(cert.cert.der());
+        let server =
+            rowd_core::tls::server_config(&cert_der, &hex(&cert.key_pair.serialize_der())).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let (commands, receive_commands) = mpsc::channel();
+        let (sent, receive_sent) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut io = rowd_core::tls::accept(socket, server).unwrap();
+            assert!(matches!(
+                protocol::receive(&mut io).unwrap(),
+                Message::SessionDone
+            ));
+            protocol::send(&mut io, &Message::SessionDone).unwrap();
+            while let Ok(command) = receive_commands.recv() {
+                match command {
+                    "remote" => protocol::send(
+                        &mut io,
+                        &Message::WakeShare {
+                            share_id: "share-X".into(),
+                        },
+                    )
+                    .unwrap(),
+                    "tls_control" => {
+                        io.conn.refresh_traffic_keys().unwrap();
+                        io.flush().unwrap();
+                    }
+                    "partial" => {
+                        io.write_all(&[0, 0]).unwrap();
+                        io.flush().unwrap();
+                    }
+                    _ => break,
+                }
+                sent.send(()).unwrap();
+            }
+        });
+        let mut stream =
+            rowd_core::tls::connect_pinned(&cert_der, &endpoint, Duration::from_secs(1)).unwrap();
+        protocol::send(&mut stream, &Message::SessionDone).unwrap();
+        assert!(matches!(
+            protocol::receive(&mut stream).unwrap(),
+            Message::SessionDone
+        ));
+        let mut connection = Some(("tls-wake-test".into(), stream));
+        let baseline_timeouts = idle_wake().timeouts.load(Ordering::Relaxed);
+        let baseline_remote = idle_wake().remote.load(Ordering::Relaxed);
+        for (command, reason, expected) in [
+            ("tls_control", idle::LOCAL, PollWake::Local),
+            ("remote", 0, PollWake::Share("share-X".into())),
+            ("", idle::NETWORK, PollWake::Network),
+            ("", idle::CANCEL, PollWake::Cancelled),
+        ] {
+            let waiter = std::thread::spawn(move || {
+                let result = poll_connection(&mut connection, Duration::from_secs(30));
+                (result, connection)
+            });
+            std::thread::sleep(Duration::from_millis(80));
+            if !command.is_empty() {
+                commands.send(command).unwrap();
+                receive_sent.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            if command == "tls_control" {
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            let start = Instant::now();
+            if reason != 0 {
+                idle_wake().signal(reason).unwrap();
+            }
+            let (result, remaining) = waiter.join().unwrap();
+            connection = remaining;
+            assert_eq!(result, expected);
+            assert!(connection.is_some());
+            assert!(start.elapsed() < Duration::from_millis(500));
+        }
+        assert_eq!(
+            idle_wake().remote.load(Ordering::Relaxed) - baseline_remote,
+            1
+        );
+        assert_eq!(
+            idle_wake().timeouts.load(Ordering::Relaxed),
+            baseline_timeouts
+        );
+        // A partial protocol frame cannot be replayed after cancellation.
+        commands.send("partial").unwrap();
+        receive_sent.recv_timeout(Duration::from_secs(2)).unwrap();
+        let waiter = std::thread::spawn(move || {
+            let result = poll_connection(&mut connection, Duration::from_secs(30));
+            (result, connection)
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        CANCELLED.store(true, Ordering::Relaxed);
+        idle_wake().signal(idle::CANCEL).unwrap();
+        let (result, connection) = waiter.join().unwrap();
+        assert_eq!(result, PollWake::Cancelled);
+        assert!(connection.is_none());
+        CANCELLED.store(false, Ordering::Relaxed);
+        idle_wake().reset_cancel();
+        commands.send("stop").unwrap();
+        peer.join().unwrap();
     }
 }

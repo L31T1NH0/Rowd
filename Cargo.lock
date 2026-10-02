@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "rowd"
-version = "0.8.1-alpha"
+version = "0.8.2-alpha"
 dependencies = [
  "anyhow",
  "clap",
@@ -806,18 +806,21 @@ dependencies = [
 
 [[package]]
 name = "rowd-android"
-version = "0.8.1-alpha"
+version = "0.8.2-alpha"
 dependencies = [
  "anyhow",
  "jni",
+ "libc",
+ "rcgen",
  "rowd-core",
+ "rustls",
  "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "rowd-app"
-version = "0.8.1-alpha"
+version = "0.8.2-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -838,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "rowd-core"
-version = "0.8.1-alpha"
+version = "0.8.2-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -855,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "rowd-daemon"
-version = "0.8.1-alpha"
+version = "0.8.2-alpha"
 dependencies = [
  "anyhow",
  "fs2",

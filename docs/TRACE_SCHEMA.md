@@ -141,7 +141,9 @@ A suíte não substitui soak tests de várias horas em aparelho real, especialme
 ## Correções dos traces reais: transporte, watcher e idle
 
 A espera JNI `pollWake` retorna JSON explícito: `{"kind":"none"}`,
-`{"kind":"share","share_id":"..."}` ou `{"kind":"transport_invalid"}`.
+`{"kind":"share","share_id":"..."}`, `{"kind":"transport_invalid"}` ou resultados
+de controle `local`, `network`, `cancelled`, `audit_due`. `none` fica reservado para
+compatibilidade; a espera bloqueante não produz resultados vazios periódicos.
 Isso não altera mensagens PC/Android nem a versão do protocolo. `transport_invalid`
 solicita reconexão sem incrementar gerações de filesystem, limpar o relógio da auditoria
 ou alterar `detectedAt`. `share` conserva `REMOTE_WAKE` e somente a Share indicada.
@@ -150,14 +152,37 @@ ou alterar `detectedAt`. `share` conserva `REMOTE_WAKE` e somente a Share indica
 syscall segura. Não se repetem frames nem writes que possam ter progredido parcialmente.
 `read_exact` mantém o tratamento de EINTR/progresso parcial da biblioteca padrão.
 
-O timeout idle Android é 1 s, limitando a latência de wake local a aproximadamente
-1 s e limitando também a espera de cancelamento/stop a ~1 s. Mudança de rede interrompe
-a espera imediatamente por shutdown.
-WakeShare remoto acorda o socket imediatamente. O timeout normal de 90 s é restaurado
-antes de uma round. Polls vazios geram somente `POLL_WAKE_IDLE_SUMMARY` a cada ~30 s
-ou na próxima atividade, com `poll_count`, `duration_ms` (soma das esperas) e `window_ms` (janela civil monotônica); resultados não vazios,
-EOF e erros preservam eventos individuais. Essas contagens podem cruzar a borda de
-um intervalo de medição por até 30 s.
+O idle Android usa uma única espera `poll(2)` no TCP e em um `socketpair` Unix de
+controle. O worker existente continua sendo o único leitor do stream. Wakes locais,
+mudança de rede e cancel/stop sinalizam o socketpair sem precisar adquirir o mutex da
+conexão. Os motivos ficam em bits atômicos e o byte de sinalização permanece pendente
+se chegar antes de `pollWake`; notificações simultâneas são consolidadas. Um sinal local
+já processado pela round anterior não inicia outra round. Não há timeout periódico de
+1 s nem sleep no idle. O único deadline idle é o tempo restante até a auditoria de 60 s;
+expirar esse deadline retorna `audit_due`, sem filesystem dirty. Durante suspensão o
+sistema pode adiar o agendamento; ao voltar ao Kotlin, o relógio elapsedRealtime decide
+se a auditoria está devida.
+
+TLS records parciais e mensagens de controle (tickets/key updates) são processados
+antes de iniciar um frame de aplicação; isso mantém local/cancel acordáveis mesmo sem
+um WakeShare. Depois do primeiro byte de um frame, não se pode abandonar/repetir o
+frame por causa de um wake local: o hint fica pendente até completá-lo. O deadline de
+90 s para completar esse frame é uma proteção contra peer truncado/sem progresso,
+não polling ocioso. Cancel pode interromper a espera entre reads e descarta um stream
+com frame parcial; cancel antes do frame preserva a conexão. Escritas/frames não são
+repetidos. O helper de syscall seguro verifica cancelamento antes da chamada e entre
+retries EINTR, sem limite de tentativas. O deadline não é estendido pelos retries.
+
+`IDLE_WAIT_END` inclui `duration_ms`, resultado e counters cumulativos. O snapshot JNI
+(e os marcadores IDLE_VALIDATION_BEGIN/END) inclui `idle` com `idle_waits`, `local_wakes`,
+`remote_wakes`, `network_wakes`, `cancel_wakes`, `timeouts`, `polls`, `empty_poll_count`.
+`poll_count` de topo conta chamadas JNI iniciadas; `polls` conta syscalls poll reais,
+inclusive waits adicionais para records TLS/frames e retries EINTR. `idle_waits` conta
+entradas na espera nativa. Wakes de controle contam motivos consumidos (coalescidos),
+e `remote_wakes` conta WakeShare recebido. `timeouts` corresponde a deadlines, não a
+polls vazios; `empty_poll_count` é zero no backend bloqueante. Compare deltas entre os
+marcadores. `POLL_WAKE_IDLE_SUMMARY` pertence a traces antigos. EOF, erro e WakeShare
+mantêm resultados individuais; o volume normal acompanha eventos/auditorias.
 
 `NETWORK_GENERATION_CHANGED` inclui `previous_generation`, `network_generation` e
 `connection_invalidated`. O evento Kotlin `NETWORK_PATH_CHANGED` descreve a detecção;
@@ -177,8 +202,26 @@ A primeira perda de transporte reconecta sem backoff; tentativas repetidas usam 
 Callbacks SAF são classificados como `known_file_uri`, `known_directory_uri`,
 `provider_wide_uri`, `null_uri`, `unknown_specific_uri` ou `unrelated_uri`.
 Provider-wide/null solicitam comparação de metadata da árvore (nome, URI, modificação,
-tamanho); somente caminhos diferentes são hasheados. `PROVIDER_METADATA_DIFF` registra
-enumerated/changed/prefix. Cursor ausente, documento virtual, URI ambígua, limites ou
+tamanho); somente caminhos diferentes são hasheados. Bursts genéricos/null do mesmo
+provider usam uma janela fixa de 100 ms a partir do primeiro callback. Todas as Shares
+e suas primeiras detecções são preservadas; a aplicação do burst ao scheduler é
+atômica. Callbacks específicos seguem imediatamente para o wake focado.
+`OBSERVER_BURST_COALESCED` registra `callbacks`, `shares` (lista de IDs), `window_ms`
+e `provider`. Um provider diferente tem um grupo separado na mesma descarga; um burst
+contínuo não prorroga a janela. Prefixos redundantes cobertos por um ancestral são
+consolidados antes da descoberta.
+
+`PROVIDER_METADATA_DIFF` registra `directories_visited`, `entries_enumerated`,
+`metadata_changed` (inclui remoções), `paths_hashed` (hashes completos dos paths
+selecionados pela descoberta), `duration_ms` (metadata + delta hash),
+`strategy=recursive_metadata_diff` e `result=success|fallback`. Remoções não são
+hasheadas. As entradas enumeradas incluem diretórios/entradas ignoradas que o cursor
+precisou consultar. Falhas preservam as métricas acumuladas e o fallback.
+A poda hierárquica foi rejeitada: sem versão confiável de subárvore, um fingerprint
+calculado só dos filhos diretos não detecta uma alteração em um neto. `mtime` de
+diretório e ordem do cursor SAF não são usados como prova. A árvore continua sendo
+enumerada recursivamente; arquivos com metadata verificada inalterada conservam seu
+hash cached. Cursor ausente, documento virtual, URI ambígua, limites ou
 outra inconsistência conservam o fallback seguro. Callbacks específicos de outra árvore
 ExternalStorage são filtrados. Providers com IDs opacos/genéricos sem associação segura
 podem acordar múltiplas Shares: as descobertas são sequenciais, não full scans simultâneos.
@@ -223,3 +266,34 @@ erros, connection clears e wakes de filesystem no intervalo.
 Nesta sessão, ADB não encontrou aparelhos/emuladores conectados. Portanto não há
 resultado medido de 10 minutos nem prova de execução do APK; JVM/build não substituem
 essa validação. A comparação antes/depois exige ZIPs reais de intervalos equivalentes.
+
+## Estimativa de clock PC ↔ Android
+
+`python3 scripts/summarize-diagnostic.py <diretorio>` inclui `peer_clock` no summary.
+Entradas: `Latest-trace/*.jsonl` ou `performance-trace-pc.jsonl`, e `android-traces.zip`.
+O analisador usa PROTOCOL_SEND/RECEIVE existentes; nenhum byte do protocolo foi alterado.
+Como connection_id é local a cada processo, ele correlaciona janelas únicas de três
+frames por direção, message_type, payload_size e share_id. Repetições ambíguas,
+associações conflitantes, frames ausentes nas trocas e intervalos causais impossíveis
+são descartados. Exige ao menos três trocas bidirecionais válidas; abaixo disso,
+`estimated_peer_clock_offset_ms` e `jitter_ms` são null. Capturas só de um lado não
+servem para estimar offset.
+
+A direção é **Android menos PC**: +1162 ms significa que o relógio Android está
+1162 ms à frente; subtraia 1162 dos wall_ms Android para compará-los ao PC. Para cada
+troca t1=PC send, t2=Android receive, t3=Android send, t4=PC receive, o intervalo causal
+é [t3-t4, t2-t1]. A estimativa é a mediana dos pontos médios, e `jitter_ms` é a mediana
+dos desvios absolutos desses pontos. `median_network_uncertainty_ms` é a mediana das
+meias larguras dos intervalos. Assimetria de latência e emissão do trace após o I/O
+limitam a precisão; jitter baixo não prova precisão absoluta. Saltos de relógio e
+capturas incompletas podem reduzir a quantidade de amostras.
+
+Validação local: `python3 scripts/test-trace-clock-offset.py`,
+`python3 scripts/test-validate-idle-trace.py`, testes Rust do backend socketpair/TLS e
+`testDiagnosticUnitTest` para coalescing/metadata. A árvore sintética tem 10 mil arquivos
+em 100 diretórios: 101 diretórios visitados, 10.100 entradas metadata enumeradas,
+3 paths diferentes e 2 hashes (o path removido não é hasheado). Isso mede seleção de
+hashes, não um ganho de poda hierárquica. `scripts/validate-android-idle.sh` continua
+sendo o cenário reproduzível de 10 minutos em aparelho, com counters exatos e verificação
+de `empty_poll_count=0`. Providers SAF reais, suspend/resume e latência do Handler
+precisam de validação em aparelho. Este ambiente não disponibiliza aparelho/emulador.
