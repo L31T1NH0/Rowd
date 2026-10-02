@@ -6,8 +6,8 @@ android {
         applicationId = "app.rowd"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.7.0-alpha"
+        versionCode = 13
+        versionName = "0.8.0-alpha"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
