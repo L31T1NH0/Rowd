@@ -23,6 +23,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -103,11 +107,47 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum TraceCommand {
+    Show {
+        trace: PathBuf,
+        #[arg(long)]
+        component: Option<String>,
+        #[arg(long)]
+        share: Option<String>,
+        #[arg(long)]
+        errors: bool,
+        #[arg(long)]
+        connection: Option<String>,
+        #[arg(long)]
+        round: Option<String>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        request: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DaemonCommand {
     Run,
     Start,
     Stop,
     Restart,
+    Trace {
+        #[command(subcommand)]
+        command: DaemonTraceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonTraceCommand {
+    Start {
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+    },
+    Status,
+    Stop,
+    Flush,
 }
 
 #[derive(Subcommand)]
@@ -239,11 +279,62 @@ fn run() -> Result<()> {
         return tui::run(&home);
     };
     match command {
+        Command::Trace {
+            command:
+                TraceCommand::Show {
+                    trace,
+                    component,
+                    share,
+                    errors,
+                    connection,
+                    round,
+                    file,
+                    request,
+                },
+        } => {
+            rowd_core::trace_render::show(
+                &trace,
+                &rowd_core::trace_render::Filter {
+                    component,
+                    share,
+                    errors,
+                    connection,
+                    round,
+                    file,
+                    request,
+                },
+                &mut std::io::stdout().lock(),
+            )?;
+        }
         Command::Daemon { command } => match command {
             DaemonCommand::Run => daemon::run(&home)?,
             DaemonCommand::Start => daemon::start(&home)?,
             DaemonCommand::Stop => daemon::stop(&home)?,
             DaemonCommand::Restart => daemon::restart(&home)?,
+            DaemonCommand::Trace { command } => {
+                let (command, args) = match command {
+                    DaemonTraceCommand::Start { output_dir } => {
+                        if let Some(path) = &output_dir {
+                            ensure!(path.is_absolute(), "--output-dir must be absolute");
+                        }
+                        (
+                            "trace_start",
+                            output_dir
+                                .map(|p| serde_json::json!({"output_dir":p}))
+                                .unwrap_or(serde_json::json!({})),
+                        )
+                    }
+                    DaemonTraceCommand::Status => ("trace_status", serde_json::json!({})),
+                    DaemonTraceCommand::Stop => ("trace_stop", serde_json::json!({})),
+                    DaemonTraceCommand::Flush => ("trace_flush", serde_json::json!({})),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &daemon::request_args(&home, command, args)?.data
+                    )?
+                );
+            }
         },
         Command::Autostart { command } => match command {
             AutostartCommand::Enable => daemon::autostart_enable(&home)?,
@@ -343,7 +434,7 @@ fn run() -> Result<()> {
                 |event| println!("{event}"),
             );
             if tracing {
-                trace::disable()?;
+                trace::stop("process_exit")?;
             }
             result?;
         }
@@ -450,7 +541,18 @@ fn print_daemon_status(home: &std::path::Path) -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    trace::process_start();
+    let result = run();
+    rowd_core::trace_event!(
+        trace::Level::Info,
+        trace::Component::CLI,
+        "PROCESS_STOP",
+        serde_json::json!({"result":if result.is_ok(){"success"}else{"failed"}})
+    );
+    if let Err(error) = trace::stop("process_exit") {
+        eprintln!("TRACE_WRITER_FAILED: {error:#}");
+    }
+    if let Err(error) = result {
         eprintln!("Rowd: {error:#}");
         std::process::exit(1);
     }
@@ -459,6 +561,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trace_commands_parse() {
+        assert!(Cli::try_parse_from([
+            "rowd",
+            "daemon",
+            "trace",
+            "start",
+            "--output-dir",
+            "/tmp/traces"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "rowd",
+            "trace",
+            "show",
+            "/tmp/traces",
+            "--component",
+            "watcher",
+            "--share",
+            "camera",
+            "--errors",
+            "--connection",
+            "31",
+            "--round",
+            "812",
+            "--file",
+            "file-id",
+            "--request",
+            "93"
+        ])
+        .is_ok());
+    }
     #[test]
     fn pair_address_is_optional() {
         let cli = Cli::try_parse_from(["rowd", "pair"]).unwrap();

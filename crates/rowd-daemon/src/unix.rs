@@ -4,6 +4,10 @@ use crate::{Reply, Request, DAEMON_IPC_VERSION};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use fs2::FileExt;
 use rowd_app::{App, AppSignal};
+use rowd_core::{
+    trace::{self, Component, Level, TraceError},
+    trace_event,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -67,9 +71,26 @@ fn stream_path(home: &Path, stream: &str) -> Result<PathBuf> {
     }))
 }
 fn send_line<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
-    serde_json::to_writer(&mut *stream, value)?;
-    stream.write_all(b"\n")?;
-    Ok(())
+    let result = (|| -> Result<()> {
+        serde_json::to_writer(&mut *stream, value)?;
+        stream.write_all(b"\n")?;
+        Ok(())
+    })();
+    match &result {
+        Ok(()) => trace_event!(
+            Level::Trace,
+            Component::DaemonIpc,
+            "IPC_RESPONSE_SENT",
+            json!({})
+        ),
+        Err(error) => trace_event!(
+            Level::Error,
+            Component::DaemonIpc,
+            "IPC_WRITE_FAILED",
+            json!({"error":TraceError::new("daemon_ipc","send_response",error)})
+        ),
+    }
+    result
 }
 fn receive_line<T: for<'a> Deserialize<'a>>(stream: &mut UnixStream) -> Result<T> {
     let mut line = Vec::new();
@@ -86,6 +107,9 @@ fn receive_line<T: for<'a> Deserialize<'a>>(stream: &mut UnixStream) -> Result<T
     Ok(serde_json::from_slice(&line)?)
 }
 pub fn request(home: &Path, command: &str) -> Result<Reply> {
+    request_args(home, command, Value::Null)
+}
+pub fn request_args(home: &Path, command: &str, args: Value) -> Result<Reply> {
     let mut stream = UnixStream::connect(socket_path(home)?)?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     send_line(
@@ -94,6 +118,7 @@ pub fn request(home: &Path, command: &str) -> Result<Reply> {
             version: DAEMON_IPC_VERSION,
             command: command.into(),
             stream: None,
+            args,
         },
     )?;
     let reply: Reply = receive_line(&mut stream)?;
@@ -186,15 +211,137 @@ impl Runtime {
             "connected": self.connected.load(Ordering::Relaxed), "app": App::new(&self.home).snapshot()?, }),
         )
     }
-    fn handle(&self, mut stream: UnixStream) -> Result<()> {
+    fn handle(&self, stream: UnixStream) -> Result<()> {
+        let request_id = trace::new_id("request");
+        let _scope = trace::current_context()
+            .with("request_id", request_id)
+            .with("socket", socket_path(&self.home)?.display().to_string())
+            .enter();
+        let result = self.handle_request(stream);
+        if let Err(error) = &result {
+            trace_event!(
+                Level::Error,
+                Component::DaemonIpc,
+                "IPC_HANDLER_FAILED",
+                json!({"error":TraceError::new("daemon_ipc","handle_request",error)})
+            );
+        }
+        result
+    }
+    fn handle_request(&self, mut stream: UnixStream) -> Result<()> {
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
         stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-        let req: Request = receive_line(&mut stream)?;
+        let started = Instant::now();
+        trace_event!(
+            Level::Trace,
+            Component::DaemonIpc,
+            "IPC_ACCEPT",
+            json!({"socket":socket_path(&self.home)?.display().to_string()})
+        );
+        trace_event!(
+            Level::Trace,
+            Component::DaemonIpc,
+            "IPC_REQUEST_RECEIVED",
+            json!({})
+        );
+        let req: Request = receive_line(&mut stream).map_err(|error| {
+            trace_event!(
+                Level::Error,
+                Component::DaemonIpc,
+                if error
+                    .chain()
+                    .any(
+                        |e| e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ))
+                    )
+                {
+                    "IPC_TIMEOUT"
+                } else {
+                    "IPC_READ_FAILED"
+                },
+                json!({"error":TraceError::new("daemon_ipc","read_request",&error)})
+            );
+            error
+        })?;
+        let _command_scope = trace::current_context()
+            .with("command", req.command.clone())
+            .enter();
+        trace_event!(
+            Level::Trace,
+            Component::DaemonIpc,
+            "IPC_REQUEST_PARSED",
+            json!({"command":req.command})
+        );
+        trace_event!(
+            Level::Trace,
+            Component::DaemonIpc,
+            "IPC_RESPONSE_START",
+            json!({"command":req.command})
+        );
         if req.version != DAEMON_IPC_VERSION {
             send_line(&mut stream, &err("incompatible daemon IPC version"))?;
             return Ok(());
         }
         match req.command.as_str() {
+            "trace_start" => {
+                let root = match req.args.get("output_dir") {
+                    Some(Value::String(path)) if Path::new(path).is_absolute() => {
+                        PathBuf::from(path)
+                    }
+                    Some(_) => {
+                        send_line(&mut stream, &err("output_dir must be absolute"))?;
+                        return Ok(());
+                    }
+                    None => self.home.join(".rowd"),
+                };
+                match trace::start(&root, "daemon", None) {
+                    Ok(()) => {
+                        trace_event!(
+                            Level::Trace,
+                            Component::DaemonIpc,
+                            "IPC_ACCEPT",
+                            json!({"socket":socket_path(&self.home)?.display().to_string(),"trace_activation_request":true})
+                        );
+                        trace_event!(
+                            Level::Trace,
+                            Component::DaemonIpc,
+                            "IPC_REQUEST_RECEIVED",
+                            json!({"command":req.command})
+                        );
+                        trace_event!(
+                            Level::Trace,
+                            Component::DaemonIpc,
+                            "IPC_REQUEST_PARSED",
+                            json!({"command":req.command})
+                        );
+                        trace_event!(
+                            Level::Info,
+                            Component::Daemon,
+                            "DAEMON_START",
+                            json!({"started_at":self.started,"trace_activation_snapshot":true})
+                        );
+                        trace_event!(
+                            Level::Info,
+                            Component::Daemon,
+                            "DAEMON_READY",
+                            json!({"ready":self.ready.load(Ordering::Relaxed),"launch_mode":self.mode})
+                        );
+                        send_line(&mut stream, &ok(Some(trace::status())))?;
+                    }
+                    Err(error) => send_line(&mut stream, &err(&format!("{error:#}")))?,
+                }
+            }
+            "trace_status" => send_line(&mut stream, &ok(Some(trace::status())))?,
+            "trace_flush" => {
+                trace::flush()?;
+                send_line(&mut stream, &ok(Some(trace::status())))?;
+            }
+            "trace_stop" => {
+                trace::stop("trace_stop")?;
+                send_line(&mut stream, &ok(Some(trace::status())))?;
+            }
             "ping" if self.ready.load(Ordering::Relaxed) => send_line(&mut stream, &ok(None))?,
             "status" if self.ready.load(Ordering::Relaxed) => {
                 send_line(&mut stream, &ok(Some(self.status()?)))?
@@ -231,6 +378,18 @@ impl Runtime {
             }
             _ => send_line(&mut stream, &err("unknown command"))?,
         }
+        trace_event!(
+            Level::Trace,
+            Component::DaemonIpc,
+            "IPC_RESPONSE_SENT",
+            json!({"command":req.command,"duration_us":started.elapsed().as_micros()})
+        );
+        trace_event!(
+            Level::Trace,
+            Component::DaemonIpc,
+            "IPC_CLIENT_CLOSED",
+            json!({"reason":"handler_finished"})
+        );
         Ok(())
     }
 }
@@ -268,6 +427,7 @@ pub fn follow(home: &Path, stream_name: &str) -> Result<()> {
             version: DAEMON_IPC_VERSION,
             command: "subscribe".into(),
             stream: Some(stream_name.into()),
+            args: Value::Null,
         },
     )?;
     let reply: Reply = receive_line(&mut stream)?;
@@ -349,15 +509,43 @@ pub fn run(home: &Path) -> Result<()> {
             });
         result
     });
+    let mut snapshot_at = Instant::now();
+    let mut trace_failure_logged = None;
     let mut ipc_error = None;
     let mut handlers = Vec::new();
     while !state.stop.load(Ordering::Relaxed) && !worker.is_finished() {
+        let failure = trace::failure();
+        if failure.is_some() && failure != trace_failure_logged {
+            state
+                .logs
+                .emit(format!("{} {}", now(), failure.as_deref().unwrap()));
+            trace_failure_logged = failure;
+        }
+        if trace::enabled() && snapshot_at.elapsed() >= Duration::from_secs(30) {
+            trace_event!(
+                Level::Debug,
+                Component::Daemon,
+                "RUNTIME_STATE_SNAPSHOT",
+                json!({"ready":state.ready.load(Ordering::Relaxed),"connected":state.connected.load(Ordering::Relaxed),"uptime":now().saturating_sub(state.started),"active_ipc_handlers":handlers.iter().filter(|h: &&std::thread::JoinHandle<()>|!h.is_finished()).count(),"trace_active":true,"app_state":if state.ready.load(Ordering::Relaxed){"serving"}else{"starting"}})
+            );
+            snapshot_at = Instant::now();
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 let state = state.clone();
                 handlers.retain(|handle: &std::thread::JoinHandle<()>| !handle.is_finished());
                 handlers.push(std::thread::spawn(move || {
-                    let _ = state.handle(stream);
+                    if let Err(error) = state.handle(stream) {
+                        trace_event!(
+                            Level::Error,
+                            Component::DaemonIpc,
+                            "IPC_HANDLER_FAILED",
+                            json!({"error":TraceError::new("daemon_ipc","handle_request",&error)})
+                        );
+                        state
+                            .logs
+                            .emit(format!("{} IPC handler failed: {error:#}", now()));
+                    }
                 }));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -380,6 +568,12 @@ pub fn run(home: &Path) -> Result<()> {
         state.logs.emit(format!("{} app error: {error:#}", now()));
     }
     state.logs.emit(format!("{} daemon stopped", now()));
+    trace_event!(Level::Info, Component::Daemon, "DAEMON_STOP", json!({}));
+    if let Err(error) = trace::stop("daemon_stop") {
+        state
+            .logs
+            .emit(format!("{} TRACE_WRITER_FAILED: {error:#}", now()));
+    }
     result?;
     if let Some(error) = ipc_error {
         return Err(error.into());
@@ -551,6 +745,7 @@ mod tests {
             version: DAEMON_IPC_VERSION,
             command: "status".into(),
             stream: None,
+            args: Value::Null,
         };
         let decoded: Request =
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
@@ -588,6 +783,30 @@ mod tests {
         assert_eq!(status.data.as_ref().unwrap()["ipc_version"], 1);
         assert!(!serde_json::to_string(&status).unwrap().contains(&secret));
         assert!(run(&home).is_err());
+        assert!(request_args(&home, "trace_start", json!({"output_dir":"relative"})).is_err());
+        let output = home.join("diagnostics");
+        request_args(&home, "trace_start", json!({"output_dir":output})).unwrap();
+        assert_eq!(
+            request(&home, "trace_status").unwrap().data.unwrap()["active"],
+            true
+        );
+        request(&home, "status").unwrap();
+        request(&home, "trace_flush").unwrap();
+        let latest = output.join("Latest-trace");
+        assert!(fs::metadata(latest.join("trace-0001.jsonl")).unwrap().len() > 0);
+        request(&home, "trace_stop").unwrap();
+        let metadata: Value =
+            serde_json::from_slice(&fs::read(latest.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(metadata["complete"], true);
+        assert_eq!(fs::read_dir(output.join("traces")).unwrap().count(), 1);
+        let trace = fs::read_to_string(latest.join("trace-0001.jsonl")).unwrap();
+        assert!(!trace.contains(&secret));
+        assert!(trace.contains("IPC_REQUEST_PARSED"));
+        assert!(trace.contains("request_id"));
+        assert_eq!(
+            request(&home, "trace_status").unwrap().data.unwrap()["active"],
+            false
+        );
 
         let mut stream = UnixStream::connect(&socket).unwrap();
         send_line(
@@ -596,6 +815,7 @@ mod tests {
                 version: 2,
                 command: "status".into(),
                 stream: None,
+                args: Value::Null,
             },
         )
         .unwrap();
@@ -614,6 +834,7 @@ mod tests {
                     version: 1,
                     command: "subscribe".into(),
                     stream: Some(name.into()),
+                    args: Value::Null,
                 },
             )
             .unwrap();
@@ -660,6 +881,7 @@ mod tests {
                     version: 1,
                     command: "subscribe".into(),
                     stream: Some(name.into()),
+                    args: Value::Null,
                 },
             )
             .unwrap();

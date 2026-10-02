@@ -165,6 +165,21 @@ pub fn client_round_on_excluding(
     skipped: &std::collections::BTreeSet<String>,
     failed: &mut Option<String>,
 ) -> Result<Report> {
+    let _round = crate::trace::current_context()
+        .with("round_id", crate::trace::new_id("round"))
+        .enter();
+    crate::trace_event!(
+        crate::trace::Level::Info,
+        crate::trace::Component::Round,
+        "ROUND_CREATED",
+        serde_json::json!({})
+    );
+    crate::trace_event!(
+        crate::trace::Level::Trace,
+        crate::trace::Component::Round,
+        "ROUND_START",
+        serde_json::json!({})
+    );
     protocol::send(io, &Message::StartRound)?;
     let mut queue = None::<std::collections::VecDeque<String>>;
     let mut definitions = None::<Vec<ShareDefinition>>;
@@ -223,6 +238,41 @@ pub fn client_round_on_excluding(
                     );
                 }
                 let mut selected = share_queue(&shares, &available, focus.as_ref());
+                for (index, share) in shares.iter().enumerate() {
+                    let _share = crate::trace::current_context()
+                        .with("share_id", share.share_id.clone())
+                        .with("share_name", share.name.clone())
+                        .with("share_index", index + 1)
+                        .with("share_total", shares.len())
+                        .enter();
+                    let reason = if !share.enabled {
+                        "disabled"
+                    } else if !available.contains(&share.share_id) {
+                        "binding_unavailable"
+                    } else if focus.as_ref().is_some_and(|f| !f.contains(&share.share_id)) {
+                        "outside_focus"
+                    } else if skipped.contains(&share.share_id) {
+                        "previous_failure"
+                    } else {
+                        "enabled_available_requested"
+                    };
+                    crate::trace_event!(
+                        crate::trace::Level::Trace,
+                        crate::trace::Component::Scheduler,
+                        "SHARE_CONSIDERED",
+                        serde_json::json!({"reason":reason})
+                    );
+                    crate::trace_event!(
+                        crate::trace::Level::Trace,
+                        crate::trace::Component::Scheduler,
+                        if reason == "enabled_available_requested" {
+                            "SHARE_SELECTED"
+                        } else {
+                            "SHARE_SKIPPED"
+                        },
+                        serde_json::json!({"reason":reason})
+                    );
+                }
                 selected.retain(|id| !skipped.contains(id));
                 queue = Some(selected);
                 available_snapshot = Some(available);
@@ -280,6 +330,16 @@ pub fn client_round_on_excluding(
                             queue.as_ref().and_then(|items| items.front()) == Some(&share_id),
                             "unexpected Share selection"
                         );
+                        let definition = shares.iter().position(|s| s.share_id == share_id);
+                        let mut context = crate::trace::current_context()
+                            .with("share_id", share_id.clone())
+                            .with("share_total", shares.len());
+                        if let Some(index) = definition {
+                            context = context
+                                .with("share_name", shares[index].name.clone())
+                                .with("share_index", index + 1);
+                        }
+                        let _share = context.enter();
                         *failed = Some(share_id.clone());
                         store.select(&share_id)?;
                         protocol::send(io, &Message::Ready)?;
@@ -344,6 +404,12 @@ pub fn client_round_on_excluding(
         "{} Share(s) failed: {}",
         errors.len(),
         errors.join("; ")
+    );
+    crate::trace_event!(
+        crate::trace::Level::Info,
+        crate::trace::Component::Round,
+        "ROUND_END",
+        serde_json::json!({"transferred":aggregate.transferred,"conflicts":aggregate.conflicts,"round_deferred":aggregate.round_deferred})
     );
     Ok(aggregate)
 }

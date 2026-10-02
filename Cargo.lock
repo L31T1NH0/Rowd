@@ -862,6 +862,7 @@ dependencies = [
  "hex",
  "libc",
  "rowd-app",
+ "rowd-core",
  "serde",
  "serde_json",
  "sha2",

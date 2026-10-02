@@ -150,7 +150,7 @@ fn persist_state(
     file: Option<&str>,
 ) -> Result<()> {
     let started = Instant::now();
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "state_persist_start",
         Some(&state.share_id),
@@ -160,11 +160,13 @@ fn persist_state(
         None,
     );
     let bytes = serde_json::to_vec(state)?;
-    atomic_write(path, &bytes)?;
+    atomic_write(path, &bytes).map_err(|error| {
+        crate::trace_event!(trace::Level::Error,trace::Component::StateStore,"STATE_PERSIST_FAILED",serde_json::json!({"error":trace::TraceError::new("state_store","atomic_write_state",&error)}));error.context("persist Share state")
+    })?;
     metrics.state_persist_ms += started.elapsed().as_millis();
     metrics.state_persist_count += 1;
     metrics.state_bytes_written += bytes.len() as u64;
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "state_persist_end",
         Some(&state.share_id),
@@ -195,7 +197,8 @@ fn remote_snapshot(
     first_byte_ms: &mut Option<u128>,
     round_started: Instant,
 ) -> Result<Snapshot> {
-    trace::event(
+    let _transfer = trace::transfer_context(share_id, path).enter();
+    crate::trace_legacy_event!(
         "sync",
         "get_sent",
         Some(share_id),
@@ -217,7 +220,7 @@ fn remote_snapshot(
     };
     ensure!(actual == *entry, "STALE_SOURCE");
     first_byte_ms.get_or_insert_with(|| round_started.elapsed().as_millis());
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "blob_receive_start",
         Some(share_id),
@@ -227,8 +230,16 @@ fn remote_snapshot(
         None,
     );
     let started = Instant::now();
-    let blob = receive_blob(io, entry)?;
-    trace::event(
+    let blob = receive_blob(io, entry).map_err(|e| {
+        trace::record_error(
+            trace::Component::Transfer,
+            "TRANSFER_FAILED",
+            "transfer",
+            "receive_blob",
+            e,
+        )
+    })?;
+    crate::trace_legacy_event!(
         "sync",
         "blob_receive_end",
         Some(share_id),
@@ -247,11 +258,12 @@ fn remote_install(
     entry: &Entry,
     staged: &Snapshot,
 ) -> Result<()> {
+    let _transfer = trace::transfer_context(share_id, path).enter();
     ensure!(
         staged.entry() == entry,
         "staged entry does not match transfer"
     );
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "put_sent",
         Some(share_id),
@@ -269,7 +281,7 @@ fn remote_install(
             entry: entry.clone(),
         },
     )?;
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "blob_send_start",
         Some(share_id),
@@ -280,7 +292,7 @@ fn remote_install(
     );
     let sending = Instant::now();
     protocol::copy_exact(&mut File::open(staged.path())?, io, entry.size)?;
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "blob_send_end",
         Some(share_id),
@@ -294,7 +306,7 @@ fn remote_install(
         matches!(protocol::receive_for(io, share_id)?, Message::Accept),
         "expected file confirmation"
     );
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "accept_received",
         Some(share_id),
@@ -336,7 +348,9 @@ fn receive_put_batch(
     let (sender, receiver) = sync_channel::<(IncomingPut, Snapshot)>(1);
     let mut installed = Vec::new();
     std::thread::scope(|scope| -> Result<()> {
+        let trace_context = trace::current_context();
         let reader = scope.spawn(move || -> Result<()> {
+            let _trace_context = trace_context.enter();
             let mut next = first;
             let mut count = 0;
             let mut bytes = 0u64;
@@ -349,9 +363,10 @@ fn receive_put_batch(
                     count == 0 || bytes.saturating_add(next.entry.size) <= MAX_STAGED_BYTES,
                     "too many staged bytes"
                 );
+                let _transfer = trace::transfer_context(share_id, &next.path).enter();
                 count += 1;
                 bytes = bytes.saturating_add(next.entry.size);
-                trace::event(
+                crate::trace_legacy_event!(
                     "sync",
                     "blob_receive_start",
                     Some(share_id),
@@ -361,8 +376,16 @@ fn receive_put_batch(
                     None,
                 );
                 let receiving = Instant::now();
-                let staged = receive_blob(io, &next.entry)?;
-                trace::event(
+                let staged = receive_blob(io, &next.entry).map_err(|e| {
+                    trace::record_error(
+                        trace::Component::Transfer,
+                        "TRANSFER_FAILED",
+                        "transfer",
+                        "receive_put_blob",
+                        e,
+                    )
+                })?;
+                crate::trace_legacy_event!(
                     "sync",
                     "blob_receive_end",
                     Some(share_id),
@@ -392,10 +415,11 @@ fn receive_put_batch(
         });
         let mut install_error = None;
         for (job, staged) in receiver {
+            let _transfer = trace::transfer_context(share_id, &job.path).enter();
             if install_error.is_some() {
                 continue;
             }
-            trace::event(
+            crate::trace_legacy_event!(
                 "sync",
                 "install_start",
                 Some(share_id),
@@ -407,7 +431,7 @@ fn receive_put_batch(
             let installing = Instant::now();
             match store.install(&job.path, job.expected.as_deref(), &job.entry, &staged) {
                 Ok(()) => {
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "install_end",
                         Some(share_id),
@@ -418,7 +442,15 @@ fn receive_put_batch(
                     );
                     installed.push(job.path);
                 }
-                Err(error) => install_error = Some(error),
+                Err(error) => {
+                    install_error = Some(trace::record_error(
+                        trace::Component::Transfer,
+                        "TRANSFER_FAILED",
+                        "filesystem",
+                        "install_received_put",
+                        error,
+                    ))
+                }
             }
         }
         let read_result = reader
@@ -445,8 +477,9 @@ fn drain_puts(
     }
     protocol::send_for(io, &state.share_id, Message::PutBatchEnd)?;
     for job in pending.drain(..) {
+        let _transfer = trace::transfer_context(&state.share_id, &job.path).enter();
         let waiting = Instant::now();
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "peer_wait_start",
             Some(&state.share_id),
@@ -459,7 +492,7 @@ fn drain_puts(
             matches!(protocol::receive_for(io, &state.share_id)?, Message::Accept),
             "expected file confirmation"
         );
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "accept_received",
             Some(&state.share_id),
@@ -469,7 +502,7 @@ fn drain_puts(
             None,
         );
         report.metrics.wait_peer_ms += waiting.elapsed().as_millis();
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "peer_wait_end",
             Some(&state.share_id),
@@ -500,8 +533,9 @@ fn drain_gets(
 ) -> Result<()> {
     let mut staged = Vec::with_capacity(pending.len());
     for job in pending.drain(..) {
+        let _transfer = trace::transfer_context(&state.share_id, &job.path).enter();
         let waiting = Instant::now();
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "peer_wait_start",
             Some(&state.share_id),
@@ -513,7 +547,7 @@ fn drain_gets(
         let Message::Blob { entry: actual } = protocol::receive_for(io, &state.share_id)? else {
             anyhow::bail!("expected blob")
         };
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "peer_wait_end",
             Some(&state.share_id),
@@ -529,7 +563,7 @@ fn drain_gets(
             .first_byte_ms
             .get_or_insert_with(|| round_started.elapsed().as_millis());
         let transferring = Instant::now();
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "blob_receive_start",
             Some(&state.share_id),
@@ -538,8 +572,16 @@ fn drain_gets(
             None,
             None,
         );
-        let snapshot = receive_blob(io, &job.entry)?;
-        trace::event(
+        let snapshot = receive_blob(io, &job.entry).map_err(|e| {
+            trace::record_error(
+                trace::Component::Transfer,
+                "TRANSFER_FAILED",
+                "transfer",
+                "receive_get_blob",
+                e,
+            )
+        })?;
+        crate::trace_legacy_event!(
             "sync",
             "blob_receive_end",
             Some(&state.share_id),
@@ -552,8 +594,9 @@ fn drain_gets(
         staged.push((job, snapshot));
     }
     for (job, snapshot) in staged {
+        let _transfer = trace::transfer_context(&state.share_id, &job.path).enter();
         let installing = Instant::now();
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "install_start",
             Some(&state.share_id),
@@ -562,8 +605,18 @@ fn drain_gets(
             None,
             None,
         );
-        store.install(&job.path, job.expected.as_deref(), &job.entry, &snapshot)?;
-        trace::event(
+        store
+            .install(&job.path, job.expected.as_deref(), &job.entry, &snapshot)
+            .map_err(|e| {
+                trace::record_error(
+                    trace::Component::Transfer,
+                    "TRANSFER_FAILED",
+                    "filesystem",
+                    "install_received_file",
+                    e,
+                )
+            })?;
+        crate::trace_legacy_event!(
             "sync",
             "install_end",
             Some(&state.share_id),
@@ -592,7 +645,7 @@ fn flush_ack_batch(
     metrics: &mut ShareMetrics,
 ) -> Result<()> {
     if !batch.is_empty() {
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "ack_sent",
             Some(share_id),
@@ -602,6 +655,11 @@ fn flush_ack_batch(
             None,
         );
         metrics.ack_entries += batch.len() as u64;
+        let acknowledged = if trace::enabled() {
+            batch.keys().cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         protocol::send_for(
             io,
             share_id,
@@ -609,6 +667,9 @@ fn flush_ack_batch(
                 entries: std::mem::take(batch),
             },
         )?;
+        for path in acknowledged {
+            trace::acknowledge_file(share_id, &path, "ack_batch_sent");
+        }
         metrics.ack_messages += 1;
         metrics.control_messages += 1;
     }
@@ -775,6 +836,14 @@ pub fn coordinate_with_progress_and_audit_control(
         &mut progress,
         &mut audit_control,
     );
+    if let Err(error) = &result {
+        crate::trace_event!(
+            trace::Level::Error,
+            trace::Component::Transfer,
+            "TRANSFER_FAILED",
+            serde_json::json!({"error":trace::TraceError::new("transfer","coordinate_share",error)})
+        );
+    }
     if result.as_ref().is_ok_and(|report| !report.round_deferred) {
         *state = candidate;
     } else {
@@ -796,7 +865,7 @@ fn coordinate_candidate(
     let started = Instant::now();
     let share_id = state.share_id.clone();
     let pending_state = state_path.with_extension("pending");
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "round_start",
         Some(&share_id),
@@ -810,7 +879,7 @@ fn coordinate_candidate(
     let session_matches = previous_token.is_some();
     state.base_token = None;
     let manifest_started = Instant::now();
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "manifest_start",
         Some(&share_id),
@@ -819,7 +888,7 @@ fn coordinate_candidate(
         None,
         None,
     );
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "scan_start",
         Some(&share_id),
@@ -873,7 +942,7 @@ fn coordinate_candidate(
                 let request_bytes = serde_json::to_vec(&request)?.len() as u64 + 4;
                 protocol::send(io, &request)?;
                 let remote_started = Instant::now();
-                trace::event(
+                crate::trace_legacy_event!(
                     "sync",
                     "remote_scan_wait_start",
                     Some(&share_id),
@@ -883,7 +952,7 @@ fn coordinate_candidate(
                     None,
                 );
                 let response = protocol::receive_for(io, &share_id)?;
-                trace::event(
+                crate::trace_legacy_event!(
                     "sync",
                     "remote_scan_wait_end",
                     Some(&share_id),
@@ -923,7 +992,7 @@ fn coordinate_candidate(
                     {
                         fallback_reason = Some("scan_paths_failed");
                         let local_started = Instant::now();
-                        trace::event(
+                        crate::trace_legacy_event!(
                             "sync",
                             "local_scan_start",
                             Some(&share_id),
@@ -933,7 +1002,7 @@ fn coordinate_candidate(
                             None,
                         );
                         let scanned = store.scan_paths(&paths).ok().flatten();
-                        trace::event(
+                        crate::trace_legacy_event!(
                             "sync",
                             "local_scan_end",
                             Some(&share_id),
@@ -994,7 +1063,7 @@ fn coordinate_candidate(
             Err(error) => return Err(error),
         };
         let local_started = Instant::now();
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "local_scan_start",
             Some(&share_id),
@@ -1004,7 +1073,7 @@ fn coordinate_candidate(
             None,
         );
         let pc = store.scan()?;
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "local_scan_end",
             Some(&share_id),
@@ -1026,7 +1095,7 @@ fn coordinate_candidate(
             .metrics()
             .full_scans
             .saturating_sub(store_metrics_before.full_scans);
-        trace::event(
+        crate::trace_legacy_event!(
             "sync",
             "manifest_source",
             Some(&share_id),
@@ -1041,7 +1110,7 @@ fn coordinate_candidate(
         );
     }
     let android_count = android.len();
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "scan_end",
         Some(&share_id),
@@ -1054,7 +1123,7 @@ fn coordinate_candidate(
             fallback_reason
         },
     );
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "manifest_end",
         Some(&share_id),
@@ -1133,7 +1202,7 @@ fn coordinate_candidate(
     let mut put_bytes = 0u64;
     let mut get_bytes = 0u64;
     let total = paths.len();
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "reconcile_start",
         Some(&share_id),
@@ -1175,6 +1244,13 @@ fn coordinate_candidate(
                     matches!(action, Action::ToAndroid | Action::Conflict)
                 }
             };
+        let _file = trace::current_context().file(&share_id, &path).enter();
+        crate::trace_event!(
+            trace::Level::Debug,
+            trace::Component::Scheduler,
+            "FILE_RECONCILE_DECISION",
+            serde_json::json!({"relative_path":path,"action":format!("{action:?}"),"mode":format!("{mode:?}"),"prohibited":prohibited,"reason":if prohibited {"direction_policy"}else if bootstrap.is_some(){"remap_bootstrap"}else{"compare_committed_base_with_both_sides"},"base_hash":previous_base,"local_hash":ph,"remote_hash":ah})
+        );
         // A failed scan or idle round has not changed either side's committed base.
         // Once a transfer can begin, retain the crash marker until Done succeeds.
         if !prohibited
@@ -1228,6 +1304,7 @@ fn coordinate_candidate(
                 }
             }
             Action::ToAndroid => {
+                let _transfer = trace::transfer_context(&share_id, &path).enter();
                 report
                     .metrics
                     .first_transfer_ms
@@ -1240,7 +1317,7 @@ fn coordinate_candidate(
                     put_bytes = 0;
                 }
                 let preparing = Instant::now();
-                trace::event(
+                crate::trace_legacy_event!(
                     "sync",
                     "snapshot_start",
                     Some(&share_id),
@@ -1249,8 +1326,16 @@ fn coordinate_candidate(
                     None,
                     None,
                 );
-                let temp = store.snapshot(&path, entry)?;
-                trace::event(
+                let temp = store.snapshot(&path, entry).map_err(|e| {
+                    trace::record_error(
+                        trace::Component::Filesystem,
+                        "SNAPSHOT_FAILED",
+                        "filesystem",
+                        "snapshot_local_file",
+                        e,
+                    )
+                })?;
+                crate::trace_legacy_event!(
                     "sync",
                     "snapshot_end",
                     Some(&share_id),
@@ -1276,7 +1361,7 @@ fn coordinate_candidate(
                     report.metrics.control_messages += 2;
                 } else {
                     let started_transfer = Instant::now();
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "put_sent",
                         Some(&share_id),
@@ -1298,7 +1383,7 @@ fn coordinate_candidate(
                         .metrics
                         .first_byte_ms
                         .get_or_insert_with(|| started.elapsed().as_millis());
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "blob_send_start",
                         Some(&share_id),
@@ -1309,7 +1394,7 @@ fn coordinate_candidate(
                     );
                     let sending = Instant::now();
                     protocol::copy_exact(&mut File::open(temp.path())?, io, entry.size)?;
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "blob_send_end",
                         Some(&share_id),
@@ -1334,6 +1419,7 @@ fn coordinate_candidate(
                 }
             }
             Action::ToPc => {
+                let _transfer = trace::transfer_context(&share_id, &path).enter();
                 report
                     .metrics
                     .first_transfer_ms
@@ -1365,7 +1451,7 @@ fn coordinate_candidate(
                         started,
                     )?;
                     let installing = Instant::now();
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "install_start",
                         Some(&share_id),
@@ -1375,7 +1461,7 @@ fn coordinate_candidate(
                         None,
                     );
                     store.install(&path, ph, entry, &temp)?;
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "install_end",
                         Some(&share_id),
@@ -1395,7 +1481,7 @@ fn coordinate_candidate(
                     report.metrics.bytes_transferred += entry.size;
                     report.metrics.control_messages += 2;
                 } else {
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "get_sent",
                         Some(&share_id),
@@ -1473,7 +1559,7 @@ fn coordinate_candidate(
         started,
     )?;
     flush_ack_batch(io, &share_id, &mut ack_batch, &mut report.metrics)?;
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "reconcile_end",
         Some(&share_id),
@@ -1524,7 +1610,7 @@ fn coordinate_candidate(
         .unwrap()
         .insert(state_path.to_path_buf(), new_token);
     retry_paths().lock().unwrap().remove(state_path);
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "round_end",
         Some(&share_id),
@@ -1547,7 +1633,7 @@ pub fn respond_share(
 ) -> Result<Report> {
     let mut share = expected_share.map(str::to_owned);
     let started = Instant::now();
-    trace::event(
+    crate::trace_legacy_event!(
         "sync",
         "round_start",
         expected_share,
@@ -1568,7 +1654,7 @@ pub fn respond_share(
             }
             match *message {
                 Message::AckBatch { entries } => {
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "ack_received",
                         Some(&share_id),
@@ -1588,7 +1674,7 @@ pub fn respond_share(
                 }
                 Message::Scan => {
                     let scanning = Instant::now();
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "scan_start",
                         Some(&share_id),
@@ -1599,7 +1685,7 @@ pub fn respond_share(
                     );
                     let before = store.metrics();
                     let local_started = Instant::now();
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "local_scan_start",
                         Some(&share_id),
@@ -1661,7 +1747,7 @@ pub fn respond_share(
                     // A completed full scan replaces the peer cache before Done;
                     // a deferred scan leaves the committed token untouched.
                     store.set_base_token(None);
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "local_scan_end",
                         Some(&share_id),
@@ -1670,7 +1756,7 @@ pub fn respond_share(
                         Some(local_started),
                         None,
                     );
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "scan_end",
                         Some(&share_id),
@@ -1680,7 +1766,7 @@ pub fn respond_share(
                         None,
                     );
                     let after = store.metrics();
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "manifest_source",
                         Some(&share_id),
@@ -1693,7 +1779,7 @@ pub fn respond_share(
                             "full_manifest"
                         }),
                     );
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "manifest_start",
                         Some(&share_id),
@@ -1717,7 +1803,7 @@ pub fn respond_share(
                             ..Default::default()
                         },
                     )?;
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "manifest_end",
                         Some(&share_id),
@@ -1772,8 +1858,14 @@ pub fn respond_share(
                                 fallback_reason = Some("dirty_unavailable");
                                 None
                             }
-                            Err(_) => {
-                                trace::event(
+                            Err(error) => {
+                                crate::trace_event!(
+                                    trace::Level::Warn,
+                                    trace::Component::Scanner,
+                                    "DELTA_UNAVAILABLE",
+                                    serde_json::json!({"reason":"jni_or_store_error","fallback":"full_scan","error":trace::TraceError::new("filesystem","delta_paths",&error)})
+                                );
+                                crate::trace_legacy_event!(
                                     "sync",
                                     "delta_unavailable",
                                     Some(&share_id),
@@ -1813,7 +1905,7 @@ pub fn respond_share(
                         )?;
                     } else {
                         protocol::send_for(io, &share_id, Message::NeedFullScan)?;
-                        trace::event(
+                        crate::trace_legacy_event!(
                             "sync",
                             "delta_fallback",
                             Some(&share_id),
@@ -1825,8 +1917,9 @@ pub fn respond_share(
                     }
                 }
                 Message::Get { path, entry } => {
+                    let _transfer = trace::transfer_context(&share_id, &path).enter();
                     crate::model::validate_path(&path)?;
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "get_received",
                         Some(&share_id),
@@ -1836,7 +1929,7 @@ pub fn respond_share(
                         None,
                     );
                     let snapshot_started = Instant::now();
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "snapshot_start",
                         Some(&share_id),
@@ -1846,7 +1939,7 @@ pub fn respond_share(
                         None,
                     );
                     let temp = store.snapshot(&path, &entry)?;
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "snapshot_end",
                         Some(&share_id),
@@ -1862,7 +1955,7 @@ pub fn respond_share(
                             entry: entry.clone(),
                         },
                     )?;
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "blob_send_start",
                         Some(&share_id),
@@ -1873,7 +1966,7 @@ pub fn respond_share(
                     );
                     let sending = Instant::now();
                     protocol::copy_exact(&mut File::open(temp.path())?, io, entry.size)?;
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "blob_send_end",
                         Some(&share_id),
@@ -1899,8 +1992,9 @@ pub fn respond_share(
                         },
                     )?;
                     for path in installed {
+                        let _transfer = trace::transfer_context(&share_id, &path).enter();
                         protocol::send_for(io, &share_id, Message::Accept)?;
-                        trace::event(
+                        crate::trace_legacy_event!(
                             "sync",
                             "accept_sent",
                             Some(&share_id),
@@ -1918,7 +2012,7 @@ pub fn respond_share(
                 } => {
                     crate::model::validate_hash(&base_token)?;
                     store.set_base_token(Some(base_token));
-                    trace::event(
+                    crate::trace_legacy_event!(
                         "sync",
                         "round_end",
                         Some(&share_id),
@@ -1941,18 +2035,17 @@ pub fn respond_share(
         }
     })();
     if let Err(ref e) = result {
-        trace::event(
-            "sync",
-            "error",
-            share.as_deref(),
-            None,
-            None,
-            None,
-            Some(if e.to_string().starts_with("STALE_") {
-                "stale"
-            } else {
-                "round_failed"
-            }),
+        let context = if let Some(share) = share.as_deref() {
+            trace::current_context().with("share_id", share)
+        } else {
+            trace::current_context()
+        };
+        let _scope = context.enter();
+        crate::trace_event!(
+            trace::Level::Error,
+            trace::Component::Round,
+            "ROUND_FAILED",
+            serde_json::json!({"reason":if e.to_string().starts_with("STALE_"){"stale"}else{"round_failed"},"error":trace::TraceError::new("transfer","respond_share",e)})
         );
         let _ = protocol::send(
             io,

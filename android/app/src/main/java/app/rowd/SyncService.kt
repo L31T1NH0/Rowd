@@ -33,6 +33,11 @@ data class RowdStatus(val kind: Kind, val title: String, val detail: String) {
 
 class SyncService : Service() {
     companion object {
+        private fun traceEvent(name: String, share: String?, component: PerformanceTrace.Component,
+            level: String = "trace", detail: JSONObject? = null, function: String = name) {
+            PerformanceTrace.event(name, share, component = component, level = level, detail = detail,
+                function = function, sourceFile = "SyncService.kt")
+        }
         const val STOP = "app.rowd.STOP"
         val busy = AtomicBoolean(false)
         private val listeners = CopyOnWriteArraySet<() -> Unit>()
@@ -63,6 +68,7 @@ class SyncService : Service() {
         private val detectedAt = mutableMapOf<String, Long>()
 
         fun wake(shareId: String? = null) = synchronized(changes) {
+            traceEvent("WATCHER_WAKE_REQUESTED", shareId, component = PerformanceTrace.Component.Watcher, detail = JSONObject().put("reason", if (shareId == null) "all_shares_hint" else "share_hint"))
             generation++
             if (shareId == null) dirtyAllGeneration = generation
             else dirtyShares[shareId] = generation
@@ -74,8 +80,28 @@ class SyncService : Service() {
     }
     private val active = AtomicBoolean(false)
     private var worker: Thread? = null
+    private val traceLifecycle = Any()
+    private var traceWorkerFinished = false
+    private var traceServiceDestroyed = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var networkPath: NetworkPath? = null
+    @Volatile private var observerCount = 0
+    @Volatile private var traceAccess: FolderAccess? = null
+    private val traceHandler = Handler(Looper.getMainLooper())
+    private val traceSnapshot = object : Runnable {
+        override fun run() {
+            if (PerformanceTrace.enabled()) {
+                val snapshot = JSONObject(NativeBridge.traceRuntimeState())
+                    .put("service_active", active.get()).put("worker_alive", worker?.isAlive == true)
+                    .put("observer_count", observerCount).put("dirty_share_count", synchronized(changes) { dirtyShares.size })
+                    .put("network_path", networkPath.toString())
+                traceAccess?.traceSnapshot()?.let { local -> local.keys().forEach { snapshot.put(it, local.get(it)) } }
+                traceEvent("RUNTIME_STATE_SNAPSHOT", null, component = PerformanceTrace.Component.Service, level = "debug", detail = snapshot)
+            }
+            traceHandler.postDelayed(this, 30_000L)
+        }
+    }
+
     private fun observeNetwork() {
         val manager = getSystemService(ConnectivityManager::class.java)
         fun path(): NetworkPath {
@@ -88,20 +114,27 @@ class SyncService : Service() {
         }
         networkPath = path()
         val callback = object : ConnectivityManager.NetworkCallback() {
-            private fun changed() {
+            private fun changed(callbackType: String) {
                 val current = path()
+                val previousPath = networkPath
                 val changed = synchronized(this@SyncService) {
                     val previous = networkPath ?: current
                     networkPath = current.retainingKnown(previous)
                     current.changedFrom(previous)
                 }
+                traceEvent("NETWORK_CALLBACK", null, component = PerformanceTrace.Component.Network, detail = JSONObject()
+                    .put("callback_type", callbackType).put("previous_network_handle", previousPath?.network ?: JSONObject.NULL)
+                    .put("current_network_handle", current.network ?: JSONObject.NULL).put("previous_interface", previousPath?.interfaceName ?: JSONObject.NULL)
+                    .put("current_interface", current.interfaceName ?: JSONObject.NULL).put("previous_ipv4", previousPath?.ipv4 ?: JSONObject.NULL)
+                    .put("current_ipv4", current.ipv4 ?: JSONObject.NULL).put("changed", changed))
                 if (!changed) return
+                traceEvent("NETWORK_CHANGED", null, component = PerformanceTrace.Component.Network, detail = JSONObject().put("operation", "NativeBridge.networkChanged"))
                 NativeBridge.networkChanged()
                 wake()
             }
-            override fun onAvailable(network: Network) = changed()
-            override fun onLost(network: Network) = changed()
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = changed()
+            override fun onAvailable(network: Network) = changed("onAvailable")
+            override fun onLost(network: Network) = changed("onLost")
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = changed("onLinkPropertiesChanged")
         }
         networkCallback = callback
         manager.registerDefaultNetworkCallback(callback)
@@ -120,16 +153,20 @@ class SyncService : Service() {
     }
     override fun onCreate() {
         super.onCreate()
+        PerformanceTrace.serviceStartedWallMs = System.currentTimeMillis()
         observeNetwork()
         if (getSharedPreferences("rowd", MODE_PRIVATE).getBoolean("performanceTrace", false) && !PerformanceTrace.enabled()) {
             runCatching { PerformanceTrace.enable(this) }
                 .onFailure { android.util.Log.e("RowdTrace", "Não foi possível iniciar o trace", it) }
         }
+        traceHandler.postDelayed(traceSnapshot, 30_000L)
+        traceEvent("ANDROID_SERVICE_CREATE", null, component = PerformanceTrace.Component.Service, level = "info")
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("sync", "Sincronização", NotificationManager.IMPORTANCE_LOW)
         )
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        traceEvent("ANDROID_SERVICE_START", null, component = PerformanceTrace.Component.Service, level = "info", detail = JSONObject().put("start_id", startId).put("flags", flags).put("stop_requested", intent?.action == STOP))
         if (intent?.action == STOP) {
             active.set(false)
             publish(RowdStatus.Kind.Paused, "Finalizando a rodada atual", state.detail)
@@ -144,7 +181,9 @@ class SyncService : Service() {
         startForeground(1, notification("Conectando ao PC"))
         NativeBridge.resetCancellation()
         active.set(true)
+        synchronized(traceLifecycle) { traceWorkerFinished = false }
         worker = Thread({
+            traceEvent("WORKER_START", null, component = PerformanceTrace.Component.Service)
             val prefs = getSharedPreferences("rowd", MODE_PRIVATE)
             var failures = 0
             val observers = mutableMapOf<Uri, android.database.ContentObserver>()
@@ -157,24 +196,39 @@ class SyncService : Service() {
             var completedAllGeneration = 0L
             try {
                 val access = FolderAccess(this)
+                traceAccess = access
                 fun refreshObservers() {
+                    traceEvent("OBSERVER_REFRESH_START", null, component = PerformanceTrace.Component.Watcher)
                     val current = access.observedShareTrees()
                     if (current == observedTrees) return
-                    observers.values.forEach(contentResolver::unregisterContentObserver)
+                    observers.forEach { (tree, observer) ->
+                        contentResolver.unregisterContentObserver(observer)
+                        traceEvent("OBSERVER_UNREGISTERED", observedTrees[tree], component = PerformanceTrace.Component.Watcher, detail = JSONObject().put("tree", tree.toString()))
+                    }
+                    PerformanceTrace.observerUnregistered()
                     observers.clear()
+                    observerCount = 0
                     current.forEach { (tree, shareId) ->
                         val observer = object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
                             override fun onChange(selfChange: Boolean) {
+                                traceEvent("OBSERVER_CALLBACK", shareId, component = PerformanceTrace.Component.Watcher, function = "onChange", detail = JSONObject().put("callback_type", "selfChange").put("self_change", selfChange).put("tree", tree.toString()))
                                 if (access.noteChange(shareId, null, selfChange)) wake(shareId) else wake()
                             }
                             override fun onChange(selfChange: Boolean, uri: Uri?) {
+                                traceEvent("OBSERVER_CALLBACK", shareId, component = PerformanceTrace.Component.Watcher, function = "onChange", detail = JSONObject().put("callback_type", "uri").put("self_change", selfChange).put("tree", tree.toString()).put("uri", uri?.toString()))
                                 if (access.noteChange(shareId, uri, selfChange)) wake(shareId) else wake()
                             }
                         }
                         try {
+                            traceEvent("OBSERVER_REGISTER_START", shareId, component = PerformanceTrace.Component.Watcher, detail = JSONObject().put("tree", tree.toString()))
                             contentResolver.registerContentObserver(tree, true, observer)
                             observers[tree] = observer
-                        } catch (_: Exception) { /* Full audit remains the fallback. */ }
+                            observerCount = observers.size
+                            PerformanceTrace.observerRegistered(shareId)
+                            traceEvent("OBSERVER_REGISTERED", shareId, component = PerformanceTrace.Component.Watcher, detail = JSONObject().put("tree", tree.toString()))
+                        } catch (error: Exception) {
+                            traceEvent("OBSERVER_REGISTER_FAILED", shareId, component = PerformanceTrace.Component.Watcher, level = "warn", detail = JSONObject().put("tree", tree.toString()).put("fallback", "full_audit").put("error", PerformanceTrace.error(error, "watcher", "register_observer", false)))
+                        }
                     }
                     observedTrees = current
                 }
@@ -277,6 +331,7 @@ class SyncService : Service() {
                         if (missing == 0 && conflicts > 0) detail += " As versões estão em Rowd Conflicts."
                         publish(if (roundDeferred) RowdStatus.Kind.Working else if (missing > 0 || conflicts > 0) RowdStatus.Kind.NeedsAttention else RowdStatus.Kind.Ready, title, detail)
                     } catch (error: Exception) {
+                        traceEvent("WORKER_OPERATION_FAILED", null, component = PerformanceTrace.Component.Service, level = "error", detail = JSONObject().put("error", PerformanceTrace.error(error, "android_service", "sync_round")))
                         failures++
                         if (!prefs.contains("invitation")) publish(RowdStatus.Kind.Idle, "Celular desvinculado", "Conecte ao computador para parear novamente.")
                         else if (!active.get()) publish(RowdStatus.Kind.Paused, "Sincronização pausada", "A operação foi cancelada em um ponto seguro.")
@@ -316,6 +371,7 @@ class SyncService : Service() {
                     }
                 } while (active.get() && prefs.contains("invitation"))
             } catch (_: InterruptedException) {
+                traceEvent("WORKER_INTERRUPTED", null, component = PerformanceTrace.Component.Service)
                 if (!prefs.contains("invitation")) publish(RowdStatus.Kind.Idle, "Celular desvinculado", "Conecte ao computador para parear novamente.")
                 else publish(RowdStatus.Kind.Paused, "Sincronização pausada", state.detail)
             } catch (error: Exception) {
@@ -323,7 +379,19 @@ class SyncService : Service() {
                 else publish(RowdStatus.Kind.Error, "Não foi possível iniciar a sincronização",
                     error.message ?: "Confira o armazenamento do aplicativo.")
             } finally {
-                observers.values.forEach(contentResolver::unregisterContentObserver)
+                traceEvent("WORKER_STOP", null, component = PerformanceTrace.Component.Service)
+                PerformanceTrace.flush()
+                observers.forEach { (tree, observer) ->
+                    contentResolver.unregisterContentObserver(observer)
+                    traceEvent("OBSERVER_UNREGISTERED", observedTrees[tree], component = PerformanceTrace.Component.Watcher, detail = JSONObject().put("tree", tree.toString()).put("reason", "worker_stop"))
+                }
+                PerformanceTrace.observerUnregistered()
+                observerCount = 0
+                traceEvent("ANDROID_SERVICE_STOP", null, component = PerformanceTrace.Component.Service, level = "info")
+                synchronized(traceLifecycle) {
+                    traceWorkerFinished = true
+                    if (traceServiceDestroyed) finishServiceTrace()
+                }
                 active.set(false); busy.set(false)
                 changed()
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
@@ -338,9 +406,21 @@ class SyncService : Service() {
             "O limite de execução em segundo plano foi atingido. Abra o Rowd para retomar.")
         worker?.interrupt(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
     }
+    private fun finishServiceTrace() {
+        runCatching { PerformanceTrace.disable("service_stop") }
+            .onFailure { android.util.Log.e("RowdTrace", "TRACE_WRITER_FAILED ao finalizar", it) }
+    }
     override fun onDestroy() {
+        traceHandler.removeCallbacks(traceSnapshot)
+        traceEvent("ANDROID_SERVICE_DESTROY", null, component = PerformanceTrace.Component.Service, level = "info")
+        PerformanceTrace.flush()
         networkCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
-        active.set(false); NativeBridge.cancel(); worker?.interrupt(); super.onDestroy()
+        active.set(false); NativeBridge.cancel(); worker?.interrupt()
+        synchronized(traceLifecycle) {
+            traceServiceDestroyed = true
+            if (traceWorkerFinished || worker == null) finishServiceTrace()
+        }
+        super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null
 }

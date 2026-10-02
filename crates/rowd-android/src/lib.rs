@@ -8,6 +8,10 @@ use rowd_core::{
     model::{Entry, Invitation, Manifest},
     storage::{Store, VerifiedStaged},
 };
+use rowd_core::{
+    trace::{self, Component as TraceComponent, Level as TraceLevel, TraceError},
+    trace_event,
+};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +20,29 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::{NamedTempFile, TempPath};
 
+static CONNECTION_TRACE_CONTEXT: OnceLock<Mutex<trace::TraceContext>> = OnceLock::new();
+static CONNECTION_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+fn connection_context() -> trace::TraceContext {
+    let id = CONNECTION_ID
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone();
+    let mut ctx = trace::current_context();
+    ctx.ids.extend(
+        CONNECTION_TRACE_CONTEXT
+            .get_or_init(|| Mutex::new(trace::TraceContext::default()))
+            .lock()
+            .unwrap()
+            .ids
+            .clone(),
+    );
+    if let Some(id) = id {
+        ctx.with("connection_id", id)
+    } else {
+        ctx
+    }
+}
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static BASE_TOKENS: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
 static CONNECTION: OnceLock<Mutex<Option<(String, rowd_core::tls::ClientStream)>>> =
@@ -173,6 +200,17 @@ pub extern "system" fn Java_app_rowd_NativeBridge_finishPairing(
 }
 
 fn clear_connection(connection: &mut Option<(String, rowd_core::tls::ClientStream)>) {
+    let _context = connection_context().enter();
+    trace_event!(
+        TraceLevel::Debug,
+        TraceComponent::Connection,
+        "CONNECTION_CLEARED",
+        serde_json::json!({"reason":"existing_invalidation_path","connection_present":connection.is_some(),"network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst)})
+    );
+    *CONNECTION_ID
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = None;
     *connection = None;
     if let Some(socket) = ACTIVE_SOCKET.get() {
         *socket.lock().unwrap() = None;
@@ -234,7 +272,13 @@ pub extern "system" fn Java_app_rowd_NativeBridge_revokeRemotePairing(
 
 #[no_mangle]
 pub extern "system" fn Java_app_rowd_NativeBridge_networkChanged(_env: JNIEnv, _class: JObject) {
-    NETWORK_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let previous = NETWORK_GENERATION.fetch_add(1, Ordering::SeqCst);
+    trace_event!(
+        TraceLevel::Info,
+        TraceComponent::Network,
+        "NETWORK_CHANGED",
+        serde_json::json!({"previous_generation":previous,"network_generation":previous+1,"operation":"native_network_changed"})
+    );
     if let Some(socket) = ACTIVE_SOCKET.get() {
         if let Ok(mut socket) = socket.lock() {
             if let Some(socket) = socket.take() {
@@ -307,7 +351,14 @@ impl AndroidStore<'_, '_, '_> {
     }
     fn call(&mut self, name: &str, arguments: &[&str]) -> Result<String> {
         let access = self.access;
-        self.env.with_local_frame(16, |env| -> Result<String> {
+        let started = Instant::now();
+        trace_event!(
+            TraceLevel::Trace,
+            TraceComponent::SAF,
+            "SAF_CALL_START",
+            serde_json::json!({"operation":name,"argument_count":arguments.len()})
+        );
+        let result = self.env.with_local_frame(16, |env| -> Result<String> {
             let strings: Vec<_> = arguments
                 .iter()
                 .map(|s| env.new_string(s))
@@ -323,14 +374,56 @@ impl AndroidStore<'_, '_, '_> {
                 let exception = env.exception_occurred()?;
                 env.exception_clear()?;
                 let message = env
-                    .call_method(exception, "toString", "()Ljava/lang/String;", &[])?
+                    .call_method(&exception, "toString", "()Ljava/lang/String;", &[])?
                     .l()?;
                 let text: String = env.get_string(&JString::from(message))?.into();
-                anyhow::bail!("{text}");
+                if trace::enabled() {
+                    let described = env
+                        .call_static_method(
+                            "app/rowd/PerformanceTrace",
+                            "describeError",
+                            "(Ljava/lang/Throwable;)Ljava/lang/String;",
+                            &[JValue::Object(exception.as_ref())],
+                        )
+                        .and_then(|v| v.l());
+                    if let Ok(object) = described {
+                        if let Ok(description) = env.get_string(&JString::from(object)) {
+                            let description: String = description.into();
+                            if let Ok(error) =
+                                serde_json::from_str::<serde_json::Value>(&description)
+                            {
+                                trace_event!(
+                                    TraceLevel::Error,
+                                    TraceComponent::SAF,
+                                    "SAF_CALL_FAILED",
+                                    serde_json::json!({"operation":name,"error":error})
+                                );
+                            }
+                        }
+                    } else {
+                        let _ = env.exception_clear();
+                    }
+                }
+                anyhow::bail!("SAF {name}: {text}");
             }
             let object = result?.l()?;
             Ok(env.get_string(&JString::from(object))?.into())
-        })
+        });
+        match &result {
+            Ok(_) => trace_event!(
+                TraceLevel::Trace,
+                TraceComponent::SAF,
+                "SAF_CALL_END",
+                serde_json::json!({"operation":name,"duration_us":started.elapsed().as_micros()})
+            ),
+            Err(error) => trace_event!(
+                TraceLevel::Error,
+                TraceComponent::SAF,
+                "SAF_CALL_FAILED",
+                serde_json::json!({"operation":name,"error":TraceError::new("filesystem",name,error)})
+            ),
+        }
+        result
     }
 }
 impl Store for AndroidStore<'_, '_, '_> {
@@ -472,7 +565,7 @@ impl Store for AndroidStore<'_, '_, '_> {
         let hash = staged["hash"].as_str().context("snapshot hash missing")?;
         let size = staged["size"].as_u64().context("snapshot size missing")?;
         ensure!(file.metadata()?.len() == size, "STALE_SOURCE: {path}");
-        rowd_core::trace::event(
+        rowd_core::trace_legacy_event!(
             "storage",
             "snapshot_verify_start",
             self.share_id.as_deref(),
@@ -486,7 +579,7 @@ impl Store for AndroidStore<'_, '_, '_> {
         let verified =
             VerifiedStaged::from_digest(NamedTempFile::from_parts(file, owned), entry, hash, size)
                 .with_context(|| format!("STALE_SOURCE: {path}"))?;
-        rowd_core::trace::event(
+        rowd_core::trace_legacy_event!(
             "storage",
             "snapshot_verify_end",
             self.share_id.as_deref(),
@@ -528,17 +621,64 @@ pub extern "system" fn Java_app_rowd_NativeBridge_setTrace(
     mut env: JNIEnv,
     _class: JObject,
     path: JString,
+    session_id: JString,
 ) -> jboolean {
+    let id: String = match env.get_string(&session_id) {
+        Ok(s) => s.into(),
+        Err(_) => return false.into(),
+    };
     if let Ok(path) = env.get_string(&path) {
         let path: String = path.into();
         let result = if path.is_empty() {
             rowd_core::trace::disable()
         } else {
-            rowd_core::trace::enable(std::path::Path::new(&path), "android")
+            rowd_core::trace::start(std::path::Path::new(&path), "android", Some(&id))
         };
         return result.is_ok().into();
     }
     false.into()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_traceEvent(
+    mut env: JNIEnv,
+    _class: JObject,
+    event: JString,
+) -> jboolean {
+    let result = (|| -> Result<()> {
+        let text: String = env.get_string(&event)?.into();
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        rowd_core::trace::ingest_android(value)?;
+        Ok(())
+    })();
+    (result.is_ok() && rowd_core::trace::enabled()).into()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_stopTrace(
+    mut env: JNIEnv,
+    _class: JObject,
+    termination: JString,
+) -> jboolean {
+    let result = (|| -> Result<()> {
+        let termination: String = env.get_string(&termination)?.into();
+        trace::stop(&termination)
+    })();
+    result.is_ok().into()
+}
+#[no_mangle]
+pub extern "system" fn Java_app_rowd_NativeBridge_traceRuntimeState(
+    env: JNIEnv,
+    _class: JObject,
+) -> jstring {
+    let present = ACTIVE_SOCKET
+        .get()
+        .and_then(|s| s.try_lock().ok())
+        .map(|s| s.is_some());
+    let state=serde_json::json!({"connection_present":present,"network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst),"cancellation_state":CANCELLED.load(Ordering::Relaxed),"trace_active":trace::enabled(),"trace_error":trace::status()["error"]}).to_string();
+    env.new_string(state)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -677,6 +817,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
             let mut skipped = std::collections::BTreeSet::new();
             let mut errors = Vec::new();
             loop {
+                let reused = connection.is_some();
                 if connection.is_none() {
                     let generation = NETWORK_GENERATION.load(Ordering::SeqCst);
                     let mut resolver = RESOLVER
@@ -711,11 +852,38 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                         .get_or_init(|| Mutex::new(None))
                         .lock()
                         .unwrap() = Some(io.sock.try_clone()?);
+                    let resolved_context = resolver.trace_context();
+                    let id = resolved_context
+                        .ids
+                        .get("connection_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| trace::new_id("connection"));
+                    *CONNECTION_ID
+                        .get_or_init(|| Mutex::new(None))
+                        .lock()
+                        .unwrap() = Some(id.clone());
+                    let _context = trace::current_context().with("connection_id", id).enter();
+                    trace_event!(
+                        TraceLevel::Info,
+                        TraceComponent::Connection,
+                        "CONNECTION_ESTABLISHED",
+                        serde_json::json!({"endpoint":endpoint,"network_generation":generation,"connection_generation":generation})
+                    );
                     *connection = Some((key.clone(), io));
                     if generation != NETWORK_GENERATION.load(Ordering::SeqCst) {
                         clear_connection(&mut connection);
                         anyhow::bail!("Rede alterada durante a conexão");
                     }
+                }
+                let _connection_context = connection_context().enter();
+                if reused {
+                    trace_event!(
+                        TraceLevel::Debug,
+                        TraceComponent::Connection,
+                        "CONNECTION_REUSED",
+                        serde_json::json!({"reason":"persistent_stream_present","network_generation":NETWORK_GENERATION.load(Ordering::SeqCst),"connection_generation":CONNECTION_GENERATION.load(Ordering::SeqCst)})
+                    );
                 }
                 store.scan_socket = Some(connection.as_ref().unwrap().1.sock.try_clone()?);
                 let mut failed = None;
@@ -764,14 +932,11 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
     let output = match result {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => {
-            rowd_core::trace::event(
-                "sync",
-                "error",
-                None,
-                None,
-                None,
-                None,
-                Some("round_failed"),
+            trace_event!(
+                TraceLevel::Error,
+                TraceComponent::Round,
+                "ROUND_FAILED",
+                serde_json::json!({"error":TraceError::new("scheduler","native_sync",&e)})
             );
             serde_json::json!({"error":format!("{e:#}")}).to_string()
         }
@@ -791,6 +956,14 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
     _class: JObject<'local>,
 ) -> jstring {
     let mut connection = connection().lock().unwrap();
+    let _context = connection_context().enter();
+    let started = Instant::now();
+    trace_event!(
+        TraceLevel::Trace,
+        TraceComponent::Connection,
+        "POLL_WAKE_START",
+        serde_json::json!({"connection_present":connection.is_some()})
+    );
     let result = if connection.is_some()
         && CONNECTION_GENERATION.load(Ordering::SeqCst) != NETWORK_GENERATION.load(Ordering::SeqCst)
     {
@@ -811,7 +984,15 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
             None => Err(std::io::Error::other("TLS receive failed")),
         };
         match ready {
-            Ok(0) => "!".to_string(),
+            Ok(0) => {
+                trace_event!(
+                    TraceLevel::Warn,
+                    TraceComponent::Connection,
+                    "POLL_WAKE_EOF",
+                    serde_json::json!({"reason":"socket_eof"})
+                );
+                "!".to_string()
+            }
             Ok(_) => {
                 let _ = io.sock.set_read_timeout(Some(Duration::from_secs(90)));
                 let incoming = if buffered == Some(true) {
@@ -821,7 +1002,24 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
                 };
                 match incoming {
                     Ok(rowd_core::protocol::Message::WakeShare { share_id }) => share_id,
-                    _ => "!".to_string(),
+                    Err(error) => {
+                        trace_event!(
+                            TraceLevel::Error,
+                            TraceComponent::Connection,
+                            "POLL_WAKE_ERROR",
+                            serde_json::json!({"error":TraceError::new("protocol","poll_wake_receive",&error)})
+                        );
+                        "!".to_string()
+                    }
+                    Ok(message) => {
+                        trace_event!(
+                            TraceLevel::Warn,
+                            TraceComponent::Connection,
+                            "POLL_WAKE_RESULT",
+                            serde_json::json!({"reason":"unexpected_message","message_type":message.trace_type()})
+                        );
+                        "!".to_string()
+                    }
                 }
             }
             Err(error)
@@ -832,7 +1030,16 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
             {
                 String::new()
             }
-            Err(_) => "!".to_string(),
+            Err(error) => {
+                let error = anyhow::Error::new(error);
+                trace_event!(
+                    TraceLevel::Error,
+                    TraceComponent::Connection,
+                    "POLL_WAKE_ERROR",
+                    serde_json::json!({"error":TraceError::new("connection","poll_wake_peek",&error)})
+                );
+                "!".to_string()
+            }
         }
     } else {
         "!".to_string()
@@ -847,6 +1054,12 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollWake<'local>(
     } else {
         result
     };
+    trace_event!(
+        TraceLevel::Trace,
+        TraceComponent::Connection,
+        "POLL_WAKE_RESULT",
+        serde_json::json!({"duration_us":started.elapsed().as_micros(),"result":if result=="!" {"invalidated"}else if result.is_empty(){"no_wake"}else{"share_wake"},"share_id":if result!="!"&&!result.is_empty(){Some(&result)}else{None}})
+    );
     env.new_string(result)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())

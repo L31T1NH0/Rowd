@@ -9,6 +9,8 @@ pub struct Request {
     pub command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<String>,
+    #[serde(default)]
+    pub args: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

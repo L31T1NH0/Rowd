@@ -638,12 +638,16 @@ impl Store for LocalStore {
         }
         let mut files = Manifest::new();
         for path in paths {
+            let _file = crate::trace::current_context().for_path(path).enter();
             if self.excluded(path) {
                 return Ok(None);
             }
             let target = self.checked_path(path, false)?;
             let before = match fs::symlink_metadata(&target) {
-                Ok(meta) if meta.file_type().is_file() => fingerprint(&meta),
+                Ok(meta) if meta.file_type().is_file() => {
+                    crate::trace::observed_file(path, "watcher", &meta);
+                    fingerprint(&meta)
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     self.cache.remove(path);
                     continue;
@@ -721,15 +725,46 @@ impl Store for LocalStore {
                     let mut counts = metrics.get();
                     counts.files_enumerated += 1;
                     metrics.set(counts);
-                    let before = fingerprint(&fs::metadata(&path)?);
+                    let metadata = fs::metadata(&path)?;
+                    crate::trace::observed_file(&rel, "audit_scan", &metadata);
+                    let _file = crate::trace::current_context()
+                        .for_path(&rel)
+                        .with("relative_path", rel.clone())
+                        .enter();
+                    crate::trace_event!(
+                        crate::trace::Level::Trace,
+                        crate::trace::Component::Scanner,
+                        "FILE_ENUMERATED",
+                        serde_json::json!({"relative_path":rel})
+                    );
+                    let before = fingerprint(&metadata);
                     if let Some(cached) = cache
                         .get(&rel)
                         .filter(|c| !before.is_empty() && c.metadata == before)
                     {
+                        crate::trace_event!(
+                            crate::trace::Level::Debug,
+                            crate::trace::Component::Scanner,
+                            "FILE_HASH_REUSED",
+                            serde_json::json!({"relative_path":rel,"reason":"metadata_matches"})
+                        );
                         result.insert(rel, cached.entry.clone());
                         continue;
                     }
+                    crate::trace_event!(
+                        crate::trace::Level::Trace,
+                        crate::trace::Component::Scanner,
+                        "FILE_HASH_START",
+                        serde_json::json!({"relative_path":rel,"reason":"cache_missing_or_metadata_changed"})
+                    );
+                    let hashing = std::time::Instant::now();
                     let (hash, size) = hash_reader(File::open(&path)?)?;
+                    crate::trace_event!(
+                        crate::trace::Level::Trace,
+                        crate::trace::Component::Scanner,
+                        "FILE_HASH_END",
+                        serde_json::json!({"relative_path":rel,"bytes":size,"duration_us":hashing.elapsed().as_micros()})
+                    );
                     let mut counts = metrics.get();
                     counts.files_hashed += 1;
                     counts.bytes_hashed += size;
@@ -770,6 +805,16 @@ impl Store for LocalStore {
                     Ok(metadata) if metadata.is_file()
                 ) || !self.root.join(path).exists()
             });
+        crate::trace_event!(
+            crate::trace::Level::Debug,
+            crate::trace::Component::Scanner,
+            if incremental {
+                "DELTA_SCAN_START"
+            } else {
+                "FULL_SCAN_FALLBACK"
+            },
+            serde_json::json!({"reason":if incremental {"trusted_cache_with_dirty_paths"}else{"cache_or_namespace_requires_full_scan"},"incremental_allowed":self.incremental_allowed,"cache_trusted":self.cache_trusted,"force_full_scan":self.force_full_scan,"policy_matches":policy==self.policy_text,"dirty_path_count":self.dirty_paths.len()})
+        );
         let mut result = if incremental {
             self.cache
                 .iter()
@@ -780,13 +825,16 @@ impl Store for LocalStore {
         };
         if incremental {
             for path in &self.dirty_paths {
+                let _file = crate::trace::current_context().for_path(path).enter();
                 if ignore.matches(path, false) {
                     continue;
                 }
                 let target = self.checked_path(path, false)?;
                 match File::open(&target) {
                     Ok(file) => {
-                        let before = fingerprint(&fs::metadata(&target)?);
+                        let metadata = fs::metadata(&target)?;
+                        crate::trace::observed_file(path, "watcher", &metadata);
+                        let before = fingerprint(&metadata);
                         let (hash, size) = hash_reader(file)?;
                         let after = fingerprint(&fs::metadata(&target)?);
                         ensure!(before == after, "STALE_SOURCE: {path}");

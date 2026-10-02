@@ -9,6 +9,7 @@ pub mod storage;
 pub mod sync;
 pub mod tls;
 pub mod trace;
+pub mod trace_render;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};

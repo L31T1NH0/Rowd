@@ -126,6 +126,12 @@ pub fn collect(
     destination: SocketAddr,
     fingerprint: &[u8; 32],
 ) -> Result<Vec<SocketAddr>> {
+    crate::trace_event!(
+        crate::trace::Level::Trace,
+        crate::trace::Component::Discovery,
+        "DISCOVERY_START",
+        serde_json::json!({"endpoint":destination.to_string()})
+    );
     let mut nonce = [0; 32];
     getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("random: {e}"))?;
     let query = discover_packet(&nonce, fingerprint);
@@ -143,6 +149,12 @@ pub fn collect(
         let now = Instant::now();
         if next_query < query_delays.len() && now >= started + query_delays[next_query] {
             socket.send_to(&query, destination)?;
+            crate::trace_event!(
+                crate::trace::Level::Trace,
+                crate::trace::Component::Discovery,
+                "DISCOVERY_QUERY_SENT",
+                serde_json::json!({"endpoint":destination.to_string(),"attempt":next_query+1})
+            );
             next_query += 1;
             continue;
         }
@@ -158,7 +170,22 @@ pub fn collect(
         ))?;
         match socket.recv_from(&mut packet) {
             Ok((len, source)) => {
-                if let Ok(address) = endpoint(&packet[..len], &nonce, fingerprint, source) {
+                crate::trace_event!(
+                    crate::trace::Level::Trace,
+                    crate::trace::Component::Discovery,
+                    "DISCOVERY_REPLY_RECEIVED",
+                    serde_json::json!({"endpoint":source.to_string(),"payload_size":len})
+                );
+                let candidate = endpoint(&packet[..len], &nonce, fingerprint, source);
+                if let Err(error) = &candidate {
+                    crate::trace_event!(
+                        crate::trace::Level::Warn,
+                        crate::trace::Component::Discovery,
+                        "DISCOVERY_CANDIDATE_REJECTED",
+                        serde_json::json!({"endpoint":source.to_string(),"source":"multicast","reason":"invalid_reply","error":crate::trace::TraceError::new("discovery","validate_reply",error)})
+                    );
+                }
+                if let Ok(address) = candidate {
                     if !candidates.contains(&address) {
                         candidates.push(address);
                     }
@@ -172,6 +199,12 @@ pub fn collect(
             Err(error) => return Err(error.into()),
         }
     }
+    crate::trace_event!(
+        crate::trace::Level::Trace,
+        crate::trace::Component::Discovery,
+        "DISCOVERY_END",
+        serde_json::json!({"candidates":candidates.len(),"duration_us":started.elapsed().as_micros()})
+    );
     Ok(candidates)
 }
 
@@ -314,22 +347,54 @@ struct VerifiedEndpoint {
 pub struct EndpointResolver {
     last: Option<VerifiedEndpoint>,
     generation: u64,
+    trace_context: crate::trace::TraceContext,
 }
 
 impl EndpointResolver {
+    pub fn trace_context(&self) -> crate::trace::TraceContext {
+        self.trace_context.clone()
+    }
     fn authenticate(
         invite: &crate::model::Invitation,
         device: &str,
         address: &str,
         timeout: Duration,
-    ) -> Result<crate::tls::ClientStream> {
-        let mut io = crate::tls::connect_to(invite, address, timeout)?;
-        io.sock.set_read_timeout(Some(timeout))?;
-        io.sock.set_write_timeout(Some(timeout))?;
-        crate::protocol::client_auth(&mut io, &invite.pair_id, &invite.secret, device)?;
-        io.sock.set_read_timeout(Some(Duration::from_secs(90)))?;
-        io.sock.set_write_timeout(Some(Duration::from_secs(90)))?;
-        Ok(io)
+    ) -> Result<(crate::tls::ClientStream, crate::trace::TraceContext)> {
+        let context = crate::trace::current_context()
+            .with("connection_attempt_id", crate::trace::new_id("attempt"));
+        let _scope = context.clone().enter();
+        crate::trace_event!(
+            crate::trace::Level::Debug,
+            crate::trace::Component::Connection,
+            "CONNECTION_ATTEMPT",
+            serde_json::json!({"endpoint":address,"timeout_ms":timeout.as_millis()})
+        );
+        let result = (|| -> Result<_> {
+            let mut io = crate::tls::connect_to(invite, address, timeout)?;
+            io.sock.set_read_timeout(Some(timeout))?;
+            io.sock.set_write_timeout(Some(timeout))?;
+            crate::protocol::client_auth(&mut io, &invite.pair_id, &invite.secret, device)?;
+            io.sock.set_read_timeout(Some(Duration::from_secs(90)))?;
+            io.sock.set_write_timeout(Some(Duration::from_secs(90)))?;
+            let context = context.with("connection_id", crate::trace::new_id("connection"));
+            let _connected = context.clone().enter();
+            crate::trace_event!(
+                crate::trace::Level::Info,
+                crate::trace::Component::Connection,
+                "CONNECTION_ESTABLISHED",
+                serde_json::json!({"endpoint":address})
+            );
+            Ok((io, context))
+        })();
+        if let Err(error) = &result {
+            crate::trace_event!(
+                crate::trace::Level::Warn,
+                crate::trace::Component::Connection,
+                "CONNECTION_ATTEMPT_FAILED",
+                serde_json::json!({"endpoint":address,"error":crate::trace::TraceError::new("connection","authenticate_candidate",error)})
+            );
+        }
+        result
     }
     pub fn connect<F>(
         &mut self,
@@ -341,6 +406,9 @@ impl EndpointResolver {
     where
         F: FnOnce(&[u8; 32]) -> Result<Vec<SocketAddr>>,
     {
+        let _generation = crate::trace::current_context()
+            .with("network_generation", generation)
+            .enter();
         let fingerprint = fingerprint(&invite.cert_der)?;
         let peer_key = format!("{}:{}", invite.pair_id, hex::encode(fingerprint));
         let changed = self.generation != generation;
@@ -350,21 +418,42 @@ impl EndpointResolver {
             .as_ref()
             .is_some_and(|cached| cached.peer_key != peer_key)
         {
+            crate::trace_event!(
+                crate::trace::Level::Debug,
+                crate::trace::Component::Discovery,
+                "DISCOVERY_CACHE_REJECTED",
+                serde_json::json!({"reason":"peer_identity_changed"})
+            );
             self.last = None;
         }
         let mut candidates = Vec::new();
         if !changed {
             if let Some(last) = &self.last {
                 let address = last.address.to_string();
-                if let Ok(io) =
+                crate::trace_event!(
+                    crate::trace::Level::Debug,
+                    crate::trace::Component::Discovery,
+                    "DISCOVERY_CANDIDATE",
+                    serde_json::json!({"endpoint":address,"source":"cache","reason":"network_generation_unchanged"})
+                );
+                if let Ok((io, context)) =
                     Self::authenticate(invite, device, &address, Duration::from_millis(800))
                 {
+                    self.trace_context = context;
                     return Ok((io, address));
                 }
             }
         }
-        if let Ok(found) = discover(&fingerprint) {
-            candidates.extend(found.into_iter().take(8).map(|address| address.to_string()));
+        match discover(&fingerprint) {
+            Ok(found) => {
+                candidates.extend(found.into_iter().take(8).map(|address| address.to_string()))
+            }
+            Err(error) => crate::trace_event!(
+                crate::trace::Level::Warn,
+                crate::trace::Component::Discovery,
+                "DISCOVERY_FAILED",
+                serde_json::json!({"reason":"continue_with_cached_or_invitation_endpoint","error":crate::trace::TraceError::new("discovery","discover",&error)})
+            ),
         }
         if changed {
             if let Some(last) = &self.last {
@@ -381,13 +470,20 @@ impl EndpointResolver {
             .filter(|cached| cached.generation == generation)
             .map(|cached| cached.address);
         for address in candidates.into_iter().take(10) {
+            crate::trace_event!(
+                crate::trace::Level::Debug,
+                crate::trace::Component::Discovery,
+                "DISCOVERY_CANDIDATE",
+                serde_json::json!({"endpoint":address,"network_generation":generation,"source":if address==invite.address {"invitation"}else if cached_address.is_some_and(|a|a.to_string()==address){"cache"}else{"multicast"}})
+            );
             let timeout = if cached_address.is_some_and(|cached| cached.to_string() == address) {
                 Duration::from_millis(800)
             } else {
                 Duration::from_secs(3)
             };
             match Self::authenticate(invite, device, &address, timeout) {
-                Ok(io) => {
+                Ok((io, context)) => {
+                    self.trace_context = context;
                     self.last = Some(VerifiedEndpoint {
                         peer_key: peer_key.clone(),
                         address: address.parse()?,
@@ -395,7 +491,15 @@ impl EndpointResolver {
                     });
                     return Ok((io, address));
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    crate::trace_event!(
+                        crate::trace::Level::Warn,
+                        crate::trace::Component::Discovery,
+                        "DISCOVERY_CANDIDATE_REJECTED",
+                        serde_json::json!({"endpoint":address,"reason":"authentication_or_connection_failed","error":crate::trace::TraceError::new("connection","authenticate_candidate",&error)})
+                    );
+                    last_error = Some(error);
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no PC endpoint available")))

@@ -13,6 +13,7 @@ audits = collections.Counter()
 interesting = {
     "observer_change", "delta_unavailable", "delta_fallback", "manifest_source",
     "physical_audit", "scheduled_audit", "deep_audit", "round_start", "round_end",
+    "observer_callback", "observer_change_classified", "full_scan_fallback", "audit_start", "audit_end", "deep_audit_start",
 }
 
 
@@ -22,17 +23,23 @@ def read(lines, source):
             event = json.loads(line)
         except (ValueError, UnicodeDecodeError):
             continue
-        name = event.get("event")
+        name = event.get("event", "").lower()
+        context = event.get("context", event)
+        fields = event.get("fields", event)
         if name in interesting:
             counts[source, name] += 1
         if name == "delta_unavailable":
-            detail = event.get("detail", {})
+            detail = fields.get("detail", fields)
             reasons[detail.get("reason", "unknown") if isinstance(detail, dict) else detail] += 1
-        if name in ("scheduled_audit", "deep_audit"):
-            audits[event.get("share_id", "unknown")] += 1
-        if event.get("detail") == "dirty_unavailable":
+        if name in ("scheduled_audit", "deep_audit", "audit_start", "deep_audit_start"):
+            audits[context.get("share_id", "unknown")] += 1
+        if fields.get("detail") == "dirty_unavailable":
             reasons["rust_dirty_unavailable"] += 1
 
+
+for chunk in sorted((root / "Latest-trace").glob("*.jsonl")):
+    with chunk.open() as stream:
+        read(stream, "pc")
 
 pc = root / "performance-trace-pc.jsonl"
 if pc.exists():

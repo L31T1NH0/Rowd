@@ -62,6 +62,7 @@ finish() {
     "$adb" logcat -d -s RowdLatency:I Rowd:I RowdDiagnostic:I > "$output/android-logcat.txt" || true
     trace_zip=$("$adb" shell 'ls -t /sdcard/Download/rowd-performance-trace-*.zip 2>/dev/null | head -1' | tr -d '\r') || true
     if test -n "$trace_zip"; then "$adb" pull "$trace_zip" "$output/android-traces.zip" || true; fi
+    if test -d "$pc_home/.rowd/Latest-trace"; then cp -r "$pc_home/.rowd/Latest-trace" "$output/Latest-trace"; fi
     pc_trace="$pc_home/.rowd/performance-trace-pc.jsonl"
     if test -f "$pc_trace"; then cp "$pc_trace" "$output/performance-trace-pc.jsonl"; fi
     python3 scripts/summarize-diagnostic.py "$output" || true

@@ -1,3 +1,7 @@
+use rowd_core::{
+    trace::{self, Component as TraceComponent, Level as TraceLevel, TraceError},
+    trace_event,
+};
 mod compat;
 mod config;
 
@@ -634,14 +638,12 @@ fn device_runtime(home: &Path) -> DeviceRuntime {
 }
 
 fn record_share_error(home: &Path, share_id: &str, operation: &str, error: &anyhow::Error) {
-    rowd_core::trace::event(
-        "sync",
-        "error",
-        Some(share_id),
-        None,
-        None,
-        None,
-        Some(operation),
+    let _context = trace::current_context().with("share_id", share_id).enter();
+    trace_event!(
+        TraceLevel::Error,
+        TraceComponent::Scheduler,
+        "SHARE_FAILED",
+        serde_json::json!({"error":TraceError::new("scheduler",operation,error)})
     );
     let path = runtime_path(home, share_id);
     let mut runtime: ShareRuntime = File::open(&path)
@@ -1726,7 +1728,21 @@ fn session(
     event: &impl Fn(String),
     signal: &impl Fn(AppSignal),
 ) -> Result<()> {
+    let _trace_connection = trace::current_context()
+        .with("connection_id", trace::new_id("connection"))
+        .enter();
+    trace_event!(
+        TraceLevel::Debug,
+        TraceComponent::Connection,
+        "CONNECTION_ATTEMPT",
+        serde_json::json!({"direction":"accepted","endpoint":socket.peer_addr().ok().map(|a|a.to_string())})
+    );
+
+    let _trace_connection_end =
+        trace::Lifecycle::end_event(TraceComponent::Connection, "CONNECTION_CLOSED");
     let cfg = DeviceConfig::load(home)?;
+    trace::register_secret(&cfg.key);
+    trace::register_secret(&cfg.secret);
     let mut io = tls::accept(socket, tls::server_config(&cfg.cert, &cfg.key)?)?;
     let first = protocol::receive(&mut io)?;
     let device = match first {
@@ -1864,6 +1880,12 @@ fn session(
             last_round: device_runtime(home).last_round,
         },
     )?;
+    trace_event!(
+        TraceLevel::Info,
+        TraceComponent::Connection,
+        "CONNECTION_ESTABLISHED",
+        serde_json::json!({"direction":"accepted"})
+    );
     event("Android conectado".into());
     signal(AppSignal::new("connected", None));
     io.sock.set_read_timeout(Some(Duration::from_millis(50)))?;
@@ -1970,6 +1992,20 @@ fn session_round(
     event: &impl Fn(String),
     signal: &impl Fn(AppSignal),
 ) -> Result<()> {
+    let round_context = trace::current_context().with("round_id", trace::new_id("round"));
+    let _trace_round = round_context.enter();
+    trace_event!(
+        TraceLevel::Info,
+        TraceComponent::Round,
+        "ROUND_CREATED",
+        serde_json::json!({})
+    );
+    trace_event!(
+        TraceLevel::Trace,
+        TraceComponent::Round,
+        "ROUND_START",
+        serde_json::json!({})
+    );
     let started = Instant::now();
     let audit_generation = audit_events.lock().unwrap().0;
     let _session = session_guard(home)?;
@@ -2154,6 +2190,42 @@ fn session_round(
         let requested_share: Option<String> = File::open(home.join(".rowd/next-share.json"))
             .ok()
             .and_then(|file| serde_json::from_reader(file).ok());
+        for (index, share) in cfg.shares.iter().enumerate() {
+            let _share = trace::current_context()
+                .with("share_id", share.share_id.clone())
+                .with("share_name", share.name.clone())
+                .with("share_index", index + 1)
+                .with("share_total", cfg.shares.len())
+                .enter();
+            let reason = if !share.enabled {
+                "disabled"
+            } else if !requested_share_ids.contains(&share.share_id) {
+                "not_requested"
+            } else if !available_shares.contains(&share.share_id) {
+                "remote_binding_unavailable"
+            } else if requested_share
+                .as_ref()
+                .is_some_and(|id| id != &share.share_id)
+            {
+                "manual_share_priority"
+            } else {
+                "ready"
+            };
+            trace_event!(
+                TraceLevel::Trace,
+                TraceComponent::Scheduler,
+                "SHARE_CONSIDERED",
+                serde_json::json!({"reason":reason,"audit":audit})
+            );
+            if reason != "ready" {
+                trace_event!(
+                    TraceLevel::Debug,
+                    TraceComponent::Scheduler,
+                    "SHARE_SKIPPED",
+                    serde_json::json!({"reason":reason})
+                );
+            }
+        }
         let ready = cfg
             .shares
             .iter()
@@ -2185,6 +2257,34 @@ fn session_round(
         let mut deferred = false;
         let mut deferred_shares = Vec::new();
         for (index, share) in ready.iter().enumerate() {
+            let _trace_share = trace::current_context()
+                .with("share_id", share.share_id.clone())
+                .with("share_name", share.name.clone())
+                .with("share_index", index + 1)
+                .with("share_total", ready.len())
+                .with(
+                    "discovery_source",
+                    if audit {
+                        "audit_scan"
+                    } else if incremental_allowed {
+                        "watcher"
+                    } else {
+                        "startup_scan"
+                    },
+                )
+                .enter();
+            trace_event!(
+                TraceLevel::Trace,
+                TraceComponent::Scheduler,
+                "SHARE_CONSIDERED",
+                serde_json::json!({"audit":audit})
+            );
+            trace_event!(
+                TraceLevel::Trace,
+                TraceComponent::Scheduler,
+                "SHARE_SELECTED",
+                serde_json::json!({"reason":"ready_and_requested"})
+            );
             if audit && !*audit_preempted {
                 let mut pending = urgent.lock().unwrap();
                 if !pending.is_empty() {
@@ -2283,6 +2383,12 @@ fn session_round(
             let mut report = match result {
                 Ok(report) => report,
                 Err(error) => {
+                    trace_event!(
+                        TraceLevel::Error,
+                        TraceComponent::Scheduler,
+                        "SHARE_FAILED",
+                        serde_json::json!({"operation":operation,"error":TraceError::new("scheduler",operation,&error)})
+                    );
                     record_share_error(home, &share.share_id, operation, &error);
                     signal(AppSignal::new("share_error", Some(share.share_id.clone())));
                     if selected {
@@ -2409,6 +2515,16 @@ fn session_round(
         );
         Ok(())
     })();
+    trace_event!(
+        if result.is_ok() {
+            TraceLevel::Info
+        } else {
+            TraceLevel::Error
+        },
+        TraceComponent::Round,
+        "ROUND_END",
+        serde_json::json!({"duration_us":started.elapsed().as_micros(),"result":if result.is_ok(){"success"}else{"failed"},"error":result.as_ref().err().map(|e|TraceError::new("scheduler","session_round",e))})
+    );
     if let Err(ref error) = result {
         let _ = protocol::send(
             &mut io,
@@ -2570,6 +2686,15 @@ fn serve(
     event: impl Fn(String) + Sync,
     signal: &(impl Fn(AppSignal) + Sync),
 ) -> Result<()> {
+    let event = |message: String| {
+        trace_event!(
+            TraceLevel::Info,
+            TraceComponent::TerminalOutput,
+            "USER_MESSAGE",
+            serde_json::json!({"message":message})
+        );
+        event(message);
+    };
     let _runtime_lock = LocalStore::open(&home.join(".rowd/runtime"))?;
     let cfg = DeviceConfig::load(home)?;
     let listener = TcpListener::bind(listen.unwrap_or(&cfg.listen))?;
@@ -2708,6 +2833,12 @@ fn serve(
                 last_config = Instant::now();
             }
             if overflow.swap(false, Ordering::Relaxed) {
+                trace_event!(
+                    TraceLevel::Warn,
+                    TraceComponent::Watcher,
+                    "WATCHER_QUEUE_OVERFLOW",
+                    serde_json::json!({"reason":"provider_event_queue_overflow","fallback":"full_scan"})
+                );
                 full = true;
             }
             for result in rx.try_iter() {
@@ -2715,6 +2846,12 @@ fn serve(
                     Ok(Event {
                         kind, paths, attrs, ..
                     }) => {
+                        trace_event!(
+                            TraceLevel::Trace,
+                            TraceComponent::Watcher,
+                            "OBSERVER_CALLBACK",
+                            serde_json::json!({"callback_type":format!("{kind:?}"),"path_count":paths.len(),"rescan":attrs.flag()==Some(notify::event::Flag::Rescan)})
+                        );
                         if attrs.flag() == Some(notify::event::Flag::Rescan) {
                             full = true;
                         }
@@ -2735,6 +2872,25 @@ fn serve(
                             for path in &paths {
                                 if let Ok(relative) = path.strip_prefix(&share.root) {
                                     let relative = relative.to_string_lossy().to_string();
+                                    let _share = trace::current_context()
+                                        .file(&share.share_id, &relative)
+                                        .with("share_name", share.name.clone())
+                                        .enter();
+                                    trace_event!(
+                                        TraceLevel::Trace,
+                                        TraceComponent::Watcher,
+                                        "OBSERVER_CHANGE_CLASSIFIED",
+                                        serde_json::json!({"relative_path":relative,"structural":structural,"classification":"known_share_root"})
+                                    );
+                                    if trace::enabled() {
+                                        if let Ok(metadata) = fs::metadata(path) {
+                                            if metadata.is_file() {
+                                                trace::observed_file(
+                                                    &relative, "watcher", &metadata,
+                                                );
+                                            }
+                                        }
+                                    }
                                     if relative.is_empty()
                                         || relative == ".rowdignore"
                                         || !ignore.matches(&relative, path.is_dir())

@@ -14,6 +14,9 @@ object NativeBridge {
     external fun finishPairing(): String
     external fun cancel()
     external fun resetCancellation()
-    external fun setTrace(path: String): Boolean
+    external fun setTrace(path: String, sessionId: String = ""): Boolean
+    external fun traceEvent(event: String): Boolean
+    external fun traceRuntimeState(): String
+    external fun stopTrace(termination: String): Boolean
     external fun flushTrace()
 }

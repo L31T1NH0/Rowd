@@ -46,6 +46,121 @@ fn background_cli_survives_parent_and_stops() {
     assert!(invoke(home, &["logs"]).status.success());
     assert!(invoke(home, &["events"]).status.success());
 
+    let trace_output = home.join("trace-output");
+    assert!(!invoke(
+        home,
+        &["daemon", "trace", "start", "--output-dir", "relative"]
+    )
+    .status
+    .success());
+    let trace_start = invoke(
+        home,
+        &[
+            "daemon",
+            "trace",
+            "start",
+            "--output-dir",
+            trace_output.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        trace_start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trace_start.stderr)
+    );
+    assert!(invoke(home, &["daemon", "trace", "status"])
+        .status
+        .success());
+    assert!(invoke(home, &["status"]).status.success());
+    assert!(invoke(home, &["daemon", "trace", "flush"]).status.success());
+    let latest = trace_output.join("Latest-trace");
+    assert!(fs::metadata(latest.join("trace-0001.jsonl")).unwrap().len() > 0);
+    assert!(invoke(home, &["daemon", "trace", "stop"]).status.success());
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(latest.join("metadata.json")).unwrap()).unwrap();
+    assert_eq!(metadata["complete"], true);
+    assert_eq!(
+        fs::read_dir(trace_output.join("traces")).unwrap().count(),
+        1
+    );
+    let show = invoke(
+        home,
+        &[
+            "trace",
+            "show",
+            latest.to_str().unwrap(),
+            "--component",
+            "Daemon-IPC",
+        ],
+    );
+    assert!(show.status.success());
+    assert!(String::from_utf8_lossy(&show.stdout).contains("IPC_REQUEST_PARSED"));
+    assert!(invoke(
+        home,
+        &[
+            "daemon",
+            "trace",
+            "start",
+            "--output-dir",
+            trace_output.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    // Kill the daemon with an active trace. No stop/Drop/flush hook is run.
+    let pid = rowd_daemon::request(home, "status").unwrap().data.unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    let session: serde_json::Value =
+        serde_json::from_slice(&fs::read(latest.join("metadata.json")).unwrap()).unwrap();
+    let saved = fs::read(latest.join("trace-0001.jsonl")).unwrap();
+    assert!(Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while rowd_daemon::active(home) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(fs::read(latest.join("trace-0001.jsonl"))
+        .unwrap()
+        .starts_with(&saved));
+    let restart = invoke(home, &["daemon", "start"]);
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert!(invoke(
+        home,
+        &[
+            "daemon",
+            "trace",
+            "start",
+            "--output-dir",
+            trace_output.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    let recovered: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            trace_output
+                .join("traces")
+                .join(format!(
+                    "trace-{}",
+                    session["trace_session_id"].as_str().unwrap()
+                ))
+                .join("metadata.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovered["complete"], false);
+    assert_eq!(recovered["recovered"], true);
+    assert!(invoke(home, &["daemon", "trace", "stop"]).status.success());
+
     let fake_home = home.join("systemd-test-home");
     let bin = home.join("test-bin");
     fs::create_dir_all(&bin).unwrap();

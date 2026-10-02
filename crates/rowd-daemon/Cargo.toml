@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rowd-core = { path = "../rowd-core" }
 rowd-app = { path = "../rowd-app" }
 anyhow.workspace = true
 serde.workspace = true

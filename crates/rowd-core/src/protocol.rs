@@ -135,16 +135,108 @@ pub enum Message {
     },
 }
 
+impl Message {
+    pub fn trace_type(&self) -> &'static str {
+        match self {
+            Self::PairRequest { .. } => "PairRequest",
+            Self::PairPending { .. } => "PairPending",
+            Self::PairAccepted { .. } => "PairAccepted",
+            Self::PairRejected { .. } => "PairRejected",
+            Self::Scoped { .. } => "Scoped",
+            Self::Shares { .. } => "Shares",
+            Self::Capabilities { .. } => "Capabilities",
+            Self::ShareRequestStatus { .. } => "ShareRequestStatus",
+            Self::DeviceUnlinked => "DeviceUnlinked",
+            Self::SelectShare { .. } => "SelectShare",
+            Self::StartRound => "StartRound",
+            Self::WakeShare { .. } => "WakeShare",
+            Self::ShareSkipped { .. } => "ShareSkipped",
+            Self::SessionDone => "SessionDone",
+            Self::RoundDeferred { .. } => "RoundDeferred",
+            Self::AckBatch { .. } => "AckBatch",
+            Self::Hello { .. } => "Hello",
+            Self::Challenge { .. } => "Challenge",
+            Self::Proof { .. } => "Proof",
+            Self::Ready => "Ready",
+            Self::Scan => "Scan",
+            Self::AuditPreempt { .. } => "AuditPreempt",
+            Self::ScanReady => "ScanReady",
+            Self::ScanContinue => "ScanContinue",
+            Self::ScanDeferred => "ScanDeferred",
+            Self::DeltaScan { .. } => "DeltaScan",
+            Self::DeltaManifest { .. } => "DeltaManifest",
+            Self::NeedFullScan => "NeedFullScan",
+            Self::ManifestBegin { .. } => "ManifestBegin",
+            Self::ManifestChunk { .. } => "ManifestChunk",
+            Self::ManifestEnd { .. } => "ManifestEnd",
+            Self::Get { .. } => "Get",
+            Self::Blob { .. } => "Blob",
+            Self::Put { .. } => "Put",
+            Self::PutBatchEnd => "PutBatchEnd",
+            Self::Accept => "Accept",
+            Self::Done { .. } => "Done",
+            Self::Error { .. } => "Error",
+        }
+    }
+    fn trace_metadata(&self, bytes: usize) -> serde_json::Value {
+        if let Self::Scoped { share_id, message } = self {
+            serde_json::json!({"message_type":message.trace_type(),"share_id":share_id,"payload_size":bytes})
+        } else {
+            serde_json::json!({"message_type":self.trace_type(),"payload_size":bytes})
+        }
+    }
+}
+
+fn trace_message(name: &str, message: &Message, bytes: usize) {
+    if !crate::trace::enabled() {
+        return;
+    }
+    let (share, message) = match message {
+        Message::Scoped { share_id, message } => (Some(share_id.as_str()), message.as_ref()),
+        _ => (None, message),
+    };
+    let ctx = crate::trace::current_context();
+    let share = share.or_else(|| ctx.ids.get("share_id").and_then(serde_json::Value::as_str));
+    let context = match (share, message) {
+        (Some(share), Message::Get { path, .. } | Message::Put { path, .. }) => {
+            crate::trace::transfer_context(share, path)
+        }
+        _ => share
+            .map(|s| ctx.clone().with("share_id", s))
+            .unwrap_or_else(|| ctx.clone()),
+    };
+    let _scope = context.enter();
+    crate::trace_event!(
+        crate::trace::Level::Trace,
+        crate::trace::Component::Protocol,
+        name,
+        message.trace_metadata(bytes)
+    );
+}
+
 pub fn send(io: &mut impl Write, message: &Message) -> Result<()> {
     let bytes = serde_json::to_vec(message)?;
     ensure!(bytes.len() <= MAX_FRAME, "frame too large");
-    io.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    io.write_all(&bytes)?;
-    io.flush()?;
+    let result = (|| -> Result<()> {
+        io.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        io.write_all(&bytes)?;
+        io.flush()?;
+        Ok(())
+    })();
+    match &result {
+        Ok(()) => trace_message("PROTOCOL_SEND", message, bytes.len()),
+        Err(error) => crate::trace_event!(
+            crate::trace::Level::Error,
+            crate::trace::Component::Protocol,
+            "PROTOCOL_SEND_FAILED",
+            serde_json::json!({"message_type":message.trace_type(),"error":crate::trace::TraceError::new("protocol","send",error)})
+        ),
+    }
+    result?;
     Ok(())
 }
 
-pub fn receive(io: &mut impl Read) -> Result<Message> {
+fn receive_inner(io: &mut impl Read) -> Result<Message> {
     let mut len = [0; 4];
     io.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -152,10 +244,24 @@ pub fn receive(io: &mut impl Read) -> Result<Message> {
     let mut data = vec![0; len];
     io.read_exact(&mut data)?;
     let message: Message = serde_json::from_slice(&data)?;
+    trace_message("PROTOCOL_RECEIVE", &message, len);
     if let Message::Error { message } = message {
         anyhow::bail!("peer: {message}");
     }
     Ok(message)
+}
+
+pub fn receive(io: &mut impl Read) -> Result<Message> {
+    let result = receive_inner(io);
+    if let Err(error) = &result {
+        crate::trace_event!(
+            crate::trace::Level::Error,
+            crate::trace::Component::Protocol,
+            "PROTOCOL_RECEIVE_FAILED",
+            serde_json::json!({"error":crate::trace::TraceError::new("protocol","receive",error)})
+        );
+    }
+    result
 }
 
 pub fn receive_after_first(io: &mut impl Read, first: u8) -> Result<Message> {
@@ -191,6 +297,11 @@ pub fn receive_for(io: &mut impl Read, share_id: &str) -> Result<Message> {
     else {
         anyhow::bail!("missing Share context")
     };
+    crate::trace::invariant(
+        actual == share_id,
+        "protocol_share_context",
+        serde_json::json!({"expected_share":share_id,"actual_share":actual}),
+    );
     ensure!(actual == share_id, "wrong Share context");
     if let Message::Error { message } = *message {
         anyhow::bail!("peer: {message}");
@@ -273,6 +384,11 @@ pub fn receive_manifest_with_metrics(
         anyhow::bail!("expected manifest end")
     };
     crate::model::validate_manifest(&files)?;
+    if crate::trace::enabled() {
+        for path in files.keys() {
+            crate::trace::first_seen(share_id, path, "remote", None, None);
+        }
+    }
     Ok((files, metrics, io.1))
 }
 
@@ -302,7 +418,7 @@ pub fn server_auth(io: &mut (impl Read + Write), pair_id: &str, secret: &str) ->
     server_auth_with_first(io, pair_id, secret, first)
 }
 
-pub fn server_auth_with_first(
+fn server_auth_with_first_inner(
     io: &mut (impl Read + Write),
     pair_id: &str,
     secret: &str,
@@ -345,7 +461,7 @@ pub fn server_auth_with_first(
     Ok(device_id)
 }
 
-pub fn client_auth(
+fn client_auth_inner(
     io: &mut (impl Read + Write),
     pair_id: &str,
     secret: &str,
@@ -493,4 +609,82 @@ mod v2_tests {
         send_for(&mut data, "first", Message::Scan).unwrap();
         assert!(receive_for(&mut std::io::Cursor::new(data), "second").is_err());
     }
+}
+
+pub fn client_auth(
+    io: &mut (impl Read + Write),
+    pair_id: &str,
+    secret: &str,
+    device_id: &str,
+) -> Result<()> {
+    crate::trace::register_secret(secret);
+    crate::trace_event!(
+        crate::trace::Level::Debug,
+        crate::trace::Component::Connection,
+        "AUTH_START",
+        serde_json::json!({})
+    );
+    let result = client_auth_inner(io, pair_id, secret, device_id);
+    match &result {
+        Ok(_) => {
+            crate::trace_event!(
+                crate::trace::Level::Debug,
+                crate::trace::Component::Connection,
+                "TLS_HANDSHAKE_END",
+                serde_json::json!({"result":"authenticated","mode":"lazy"})
+            );
+            crate::trace_event!(
+                crate::trace::Level::Info,
+                crate::trace::Component::Connection,
+                "AUTH_SUCCESS",
+                serde_json::json!({})
+            );
+        }
+        Err(error) => crate::trace_event!(
+            crate::trace::Level::Error,
+            crate::trace::Component::Connection,
+            "AUTH_FAILED",
+            serde_json::json!({"error":crate::trace::TraceError::new("handshake","authenticate",error)})
+        ),
+    }
+    result
+}
+
+pub fn server_auth_with_first(
+    io: &mut (impl Read + Write),
+    pair_id: &str,
+    secret: &str,
+    first: Message,
+) -> Result<String> {
+    crate::trace::register_secret(secret);
+    crate::trace_event!(
+        crate::trace::Level::Debug,
+        crate::trace::Component::Connection,
+        "AUTH_START",
+        serde_json::json!({})
+    );
+    let result = server_auth_with_first_inner(io, pair_id, secret, first);
+    match &result {
+        Ok(_) => {
+            crate::trace_event!(
+                crate::trace::Level::Debug,
+                crate::trace::Component::Connection,
+                "TLS_HANDSHAKE_END",
+                serde_json::json!({"result":"authenticated","mode":"lazy"})
+            );
+            crate::trace_event!(
+                crate::trace::Level::Info,
+                crate::trace::Component::Connection,
+                "AUTH_SUCCESS",
+                serde_json::json!({})
+            );
+        }
+        Err(error) => crate::trace_event!(
+            crate::trace::Level::Error,
+            crate::trace::Component::Connection,
+            "AUTH_FAILED",
+            serde_json::json!({"error":crate::trace::TraceError::new("handshake","authenticate",error)})
+        ),
+    }
+    result
 }

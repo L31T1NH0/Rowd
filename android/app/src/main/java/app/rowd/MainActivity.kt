@@ -199,7 +199,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
     private val tracePicker = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
-        if (uri != null) safely { PerformanceTrace.export(this, uri); message("Trace exportado", "Os dois arquivos de trace foram salvos no ZIP.") }
+        if (uri != null) safely { PerformanceTrace.export(this, uri); message("Trace exportado", "A última sessão de trace foi salva no ZIP.") }
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

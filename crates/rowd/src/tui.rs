@@ -1682,7 +1682,7 @@ pub fn run(home: &Path) -> Result<()> {
     if let Some(worker) = worker {
         let _ = worker.join();
     }
-    trace::disable()?;
+    trace::stop("process_exit")?;
     Ok(())
 }
 
