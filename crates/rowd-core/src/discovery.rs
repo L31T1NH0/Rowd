@@ -168,8 +168,7 @@ pub fn collect(
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1)),
         ))?;
-        match crate::io_retry::interrupted("discovery_recv_from", || socket.recv_from(&mut packet))
-        {
+        match crate::io_retry::poll("discovery_recv_from", || socket.recv_from(&mut packet)) {
             Ok((len, source)) => {
                 crate::trace_event!(
                     crate::trace::Level::Trace,

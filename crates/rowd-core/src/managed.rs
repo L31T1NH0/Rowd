@@ -7,7 +7,7 @@ use crate::{
     storage::Store,
     sync::{self, Report},
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 #[cfg(any(test, feature = "dev-tools"))]
 use std::fs;
 #[cfg(any(test, feature = "dev-tools"))]
@@ -42,6 +42,45 @@ pub trait ManagedClient: Store {
     }
 }
 impl<S: Store> Store for &mut S {
+    fn staging_directory(&self) -> Option<std::path::PathBuf> {
+        (**self).staging_directory()
+    }
+    fn install_received(
+        &mut self,
+        p: &str,
+        expected: Option<&str>,
+        e: &crate::model::Entry,
+        stage: crate::storage::VerifiedStaged,
+    ) -> Result<()> {
+        (**self).install_received(p, expected, e, stage)
+    }
+    fn validate_scan_snapshot(&mut self) -> Result<()> {
+        (**self).validate_scan_snapshot()
+    }
+    fn scan_binding(&mut self) -> Result<String> {
+        (**self).scan_binding()
+    }
+    fn stream_namespace(
+        &mut self,
+        io: &mut (impl std::io::Read + std::io::Write),
+    ) -> Result<Option<crate::model::Namespace>> {
+        (**self).stream_namespace(io)
+    }
+    fn start_hash_stream(&mut self, paths: &std::collections::BTreeSet<String>) -> Result<()> {
+        (**self).start_hash_stream(paths)
+    }
+    fn next_hash_chunk(
+        &mut self,
+        io: &mut (impl std::io::Read + std::io::Write),
+    ) -> Result<Option<crate::model::Manifest>> {
+        (**self).next_hash_chunk(io)
+    }
+    fn release_hash_staging(&mut self, paths: &std::collections::BTreeSet<String>) -> Result<()> {
+        (**self).release_hash_staging(paths)
+    }
+    fn scan_stream_metrics(&mut self) -> Result<crate::storage::ScanStreamMetrics> {
+        (**self).scan_stream_metrics()
+    }
     fn scan_is_staged(&self) -> bool {
         (**self).scan_is_staged()
     }
@@ -56,6 +95,13 @@ impl<S: Store> Store for &mut S {
     }
     fn base_token(&self) -> Option<String> {
         (**self).base_token()
+    }
+    fn delta_scan_with_control(
+        &mut self,
+        io: &mut (impl std::io::Read + std::io::Write),
+        paths: &std::collections::BTreeSet<String>,
+    ) -> Result<Option<(std::collections::BTreeSet<String>, crate::model::Manifest)>> {
+        (**self).delta_scan_with_control(io, paths)
     }
     fn set_base_token(&mut self, token: Option<String>) {
         (**self).set_base_token(token)
@@ -124,6 +170,16 @@ fn share_queue(
         })
         .map(|share| share.share_id.clone())
         .collect()
+}
+// The negotiated queue is a set of remaining eligible Shares. The coordinator
+// chooses their order (including a manual subset); each may be consumed once.
+fn take_share(queue: &mut std::collections::VecDeque<String>, id: &str) -> Result<()> {
+    let index = queue
+        .iter()
+        .position(|candidate| candidate == id)
+        .context("unexpected Share selection: not negotiated or already consumed")?;
+    queue.remove(index);
+    Ok(())
 }
 pub fn client_round(
     invite: &Invitation,
@@ -369,20 +425,34 @@ fn client_round_session(
             let mut report = Report::default();
             let mut deferred_share = None;
             loop {
-                match protocol::receive(io)? {
-                    Message::ShareSkipped { share_id, reason } => {
-                        ensure!(
-                            queue.as_ref().and_then(|items| items.front()) == Some(&share_id),
-                            "unexpected skipped Share"
+                let message = protocol::receive(io)?;
+                if let Message::ShareSkipped { share_id, .. } | Message::SelectShare { share_id } =
+                    &message
+                {
+                    if let Err(error) =
+                        take_share(queue.as_mut().expect("queue initialized"), share_id)
+                    {
+                        protocol::send_share_error(
+                            io,
+                            &error,
+                            if cfg!(target_os = "android") {
+                                "android"
+                            } else {
+                                "responder"
+                            },
+                            Some(share_id),
+                            "select_share",
+                            None,
+                            "protocol",
                         );
-                        queue.as_mut().expect("queue initialized").pop_front();
+                        return Err(error);
+                    }
+                }
+                match message {
+                    Message::ShareSkipped { share_id, reason } => {
                         errors.push(format!("{share_id}: {reason}"));
                     }
                     Message::SelectShare { share_id } => {
-                        ensure!(
-                            queue.as_ref().and_then(|items| items.front()) == Some(&share_id),
-                            "unexpected Share selection"
-                        );
                         let definition = shares.iter().position(|s| s.share_id == share_id);
                         let mut context = crate::trace::current_context()
                             .with("share_id", share_id.clone())
@@ -394,7 +464,25 @@ fn client_round_session(
                         }
                         let _share = context.enter();
                         *failed = Some(share_id.clone());
-                        store.select(&share_id)?;
+                        if let Err(error) = store.select(&share_id) {
+                            // A binding can disappear after Capabilities. Report the
+                            // logical rejection before closing, rather than making
+                            // the coordinator mistake it for a transient TCP EOF.
+                            protocol::send_share_error(
+                                io,
+                                &error,
+                                if cfg!(target_os = "android") {
+                                    "android"
+                                } else {
+                                    "responder"
+                                },
+                                Some(&share_id),
+                                "select_share",
+                                None,
+                                "filesystem",
+                            );
+                            return Err(error);
+                        }
                         protocol::send(io, &Message::Ready)?;
                         let result = sync::respond_share(io, &mut *store, Some(&share_id))?;
                         if result.round_deferred {
@@ -403,7 +491,6 @@ fn client_round_session(
                         report.transferred += result.transferred;
                         report.conflicts += result.conflicts;
                         report.shares_processed += result.shares_processed;
-                        queue.as_mut().expect("queue initialized").pop_front();
                         *failed = None;
                     }
                     Message::Scoped { share_id, message }
@@ -600,6 +687,54 @@ impl ManagedClient for LocalDevice {
 }
 #[cfg(any(test, feature = "dev-tools"))]
 impl Store for LocalDevice {
+    fn scan_binding(&mut self) -> Result<String> {
+        self.active
+            .as_mut()
+            .context("no active Share")?
+            .scan_binding()
+    }
+    fn stream_namespace(
+        &mut self,
+        io: &mut (impl std::io::Read + std::io::Write),
+    ) -> Result<Option<crate::model::Namespace>> {
+        self.active
+            .as_mut()
+            .context("no active Share")?
+            .stream_namespace(io)
+    }
+    fn start_hash_stream(&mut self, paths: &std::collections::BTreeSet<String>) -> Result<()> {
+        self.active
+            .as_mut()
+            .context("no active Share")?
+            .start_hash_stream(paths)
+    }
+    fn next_hash_chunk(
+        &mut self,
+        io: &mut (impl std::io::Read + std::io::Write),
+    ) -> Result<Option<crate::model::Manifest>> {
+        self.active
+            .as_mut()
+            .context("no active Share")?
+            .next_hash_chunk(io)
+    }
+    fn validate_scan_snapshot(&mut self) -> Result<()> {
+        self.active
+            .as_mut()
+            .context("no active Share")?
+            .validate_scan_snapshot()
+    }
+    fn commit_scan(&mut self) -> Result<()> {
+        self.active
+            .as_mut()
+            .context("no active Share")?
+            .commit_scan()
+    }
+    fn discard_scan(&mut self) -> Result<()> {
+        self.active
+            .as_mut()
+            .context("no active Share")?
+            .discard_scan()
+    }
     fn metrics(&self) -> crate::storage::StoreMetrics {
         self.active.as_ref().map(Store::metrics).unwrap_or_default()
     }
@@ -637,7 +772,7 @@ mod tests {
     use super::*;
     use crate::config::SyncMode;
 
-    fn share(path: &str) -> ShareDefinition {
+    pub(super) fn share(path: &str) -> ShareDefinition {
         ShareDefinition {
             share_id: "a".repeat(64),
             name: path.into(),
@@ -667,6 +802,48 @@ mod tests {
             fs::read(directory.path().join("old/keep.txt")).unwrap(),
             b"keep"
         );
+    }
+
+    #[test]
+    fn manual_selection_consumes_only_negotiated_remaining_shares() {
+        let mut shares = vec![
+            share("A"),
+            share("B"),
+            share("C"),
+            share("disabled"),
+            share("unavailable"),
+        ];
+        for (index, share) in shares.iter_mut().enumerate() {
+            share.share_id = format!("{index:064x}");
+        }
+        shares[3].enabled = false;
+        let available = shares[..4]
+            .iter()
+            .map(|share| share.share_id.clone())
+            .collect::<Vec<_>>();
+        let mut queue = share_queue(&shares, &available, None);
+        take_share(&mut queue, &shares[2].share_id).unwrap();
+        assert_eq!(
+            queue,
+            std::collections::VecDeque::from([
+                shares[0].share_id.clone(),
+                shares[1].share_id.clone()
+            ])
+        );
+        for id in [
+            &shares[2].share_id,
+            &shares[3].share_id,
+            &shares[4].share_id,
+            &"f".repeat(64),
+        ] {
+            assert!(take_share(&mut queue, id).is_err());
+        }
+        let focus = std::collections::BTreeSet::from([shares[0].share_id.clone()]);
+        let mut focused = share_queue(&shares, &available, Some(&focus));
+        assert!(take_share(&mut focused, &shares[2].share_id).is_err());
+        take_share(&mut queue, &shares[0].share_id).unwrap();
+        take_share(&mut queue, &shares[1].share_id).unwrap();
+        assert!(take_share(&mut queue, &shares[0].share_id).is_err());
     }
 
     #[test]
@@ -707,6 +884,7 @@ pub(crate) fn check_round_lifecycle() {
     struct Client<'a> {
         device: &'a mut LocalDevice,
         local_failure: bool,
+        selection_failure: bool,
     }
     impl Store for Client<'_> {
         fn scan(&mut self) -> Result<crate::model::Manifest> {
@@ -737,6 +915,13 @@ pub(crate) fn check_round_lifecycle() {
             self.device.session_state()
         }
         fn select(&mut self, id: &str) -> Result<()> {
+            if self.selection_failure {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "SAF binding became unavailable after Capabilities",
+                )
+                .into());
+            }
             self.device.select(id)
         }
         fn acknowledge_share_requests(
@@ -784,16 +969,30 @@ pub(crate) fn check_round_lifecycle() {
             Ok(())
         }
     }
-    for mode in ["eof", "success", "unlink", "local_failure"] {
+    for mode in [
+        "eof",
+        "success",
+        "unlink",
+        "local_failure",
+        "selection_failure",
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let mut device = LocalDevice::open(directory.path()).unwrap();
+        let selected = tests::share("selected");
+        let shares = if mode == "selection_failure" {
+            device.bind(&selected.share_id, "selected").unwrap();
+            vec![selected.clone()]
+        } else {
+            vec![]
+        };
         let mut store = Client {
             device: &mut device,
             local_failure: mode == "local_failure",
+            selection_failure: mode == "selection_failure",
         };
         let mut input = Vec::new();
         if mode != "eof" {
-            protocol::send(&mut input, &Message::Shares { shares: vec![] }).unwrap();
+            protocol::send(&mut input, &Message::Shares { shares }).unwrap();
             protocol::send(
                 &mut input,
                 &if mode == "unlink" {
@@ -807,6 +1006,15 @@ pub(crate) fn check_round_lifecycle() {
                 },
             )
             .unwrap();
+            if mode == "selection_failure" {
+                protocol::send(
+                    &mut input,
+                    &Message::SelectShare {
+                        share_id: selected.share_id.clone(),
+                    },
+                )
+                .unwrap();
+            }
             if mode == "success" || mode == "local_failure" {
                 protocol::send(&mut input, &Message::SessionDone).unwrap();
             }
@@ -829,6 +1037,28 @@ pub(crate) fn check_round_lifecycle() {
                 error.downcast_ref::<std::io::Error>().unwrap().kind(),
                 std::io::ErrorKind::UnexpectedEof
             );
+        } else if mode == "selection_failure" {
+            let error = result.unwrap_err();
+            assert!(
+                !error
+                    .downcast_ref::<RoundFailure>()
+                    .unwrap()
+                    .stream_reusable
+            );
+            let mut output = Cursor::new(io.output);
+            assert!(matches!(
+                protocol::receive(&mut output).unwrap(),
+                Message::StartRound
+            ));
+            assert!(matches!(
+                protocol::receive(&mut output).unwrap(),
+                Message::Capabilities { .. }
+            ));
+            let rejection = protocol::receive(&mut output).unwrap_err();
+            assert!(rejection
+                .to_string()
+                .contains("SAF binding became unavailable"));
+            assert!(!rejection.is::<std::io::Error>()); // PC sees rejection, not EOF.
         } else if mode == "local_failure" {
             assert!(
                 result

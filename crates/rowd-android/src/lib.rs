@@ -149,7 +149,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_pollPairOffer(
         let _ =
             socket.join_multicast_v4(&rowd_core::pairing::GROUP, &std::net::Ipv4Addr::UNSPECIFIED);
         let mut buf = [0u8; 4097];
-        let result = match rowd_core::io_retry::interrupted("pair_offer_recv_from", || {
+        let result = match rowd_core::io_retry::poll("pair_offer_recv_from", || {
             socket.recv_from(&mut buf)
         }) {
             Ok((len, source)) => match rowd_core::pairing::decode(&buf[..len])? {
@@ -360,8 +360,68 @@ struct AndroidStore<'a, 'b, 'c> {
     share_id: Option<String>,
     scan_socket: Option<TcpStream>,
     scan_errors: Vec<String>,
+    completed_shares: std::collections::BTreeSet<String>,
 }
 impl AndroidStore<'_, '_, '_> {
+    fn poll_stream(&mut self, io: &mut (impl Read + Write), operation: &str) -> Result<String> {
+        let socket = self
+            .scan_socket
+            .as_ref()
+            .context("scan socket missing")?
+            .try_clone()?;
+        let share = self.share_id.clone().context("Share not selected")?;
+        let mut alive = Instant::now();
+        let result = (|| loop {
+            check_cancelled()?;
+            let status = self.call(operation, &[])?;
+            if !status.is_empty() {
+                return Ok(status);
+            }
+            if alive.elapsed() >= Duration::from_secs(5) {
+                rowd_core::protocol::send_for(io, &share, rowd_core::protocol::Message::ScanAlive)?;
+                alive = Instant::now();
+            }
+            socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+            let mut first = [0];
+            match rowd_core::io_retry::poll_with_control("stream_control", io_cancelled, || {
+                io.read(&mut first)
+            }) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "peer disconnected during scan stream",
+                    )
+                    .into())
+                }
+                Ok(_) => {
+                    socket.set_read_timeout(Some(Duration::from_secs(90)))?;
+                    let message =
+                        rowd_core::protocol::receive_for_after_first(io, first[0], &share)?;
+                    if let rowd_core::protocol::Message::AuditPreempt { shares } = message {
+                        for id in shares {
+                            rowd_core::model::validate_hash(&id)?;
+                        }
+                        self.call("deferScanJson", &[])?;
+                        return Err(rowd_core::sync::ScanDeferred.into());
+                    }
+                    anyhow::bail!("unexpected scan stream control");
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        })();
+        let _ = socket.set_read_timeout(Some(Duration::from_secs(90)));
+        if result.is_err() {
+            let _ = self.call("deferScanJson", &[]);
+            let _ = self.call("finishScanJson", &[]);
+            let _ = self.call("discardScanJson", &[]);
+        }
+        transport::deferred_scan_result(result, &mut self.scan_errors)
+    }
     fn scan_result(&mut self, result: &str) -> Result<Manifest> {
         let result: serde_json::Value = serde_json::from_str(result)?;
         if result["deferred"] == true {
@@ -377,6 +437,24 @@ impl AndroidStore<'_, '_, '_> {
         self.metrics.full_scans +=
             u64::from(result["full"].as_bool().context("scan mode missing")?);
         Ok(serde_json::from_value(result["files"].clone())?)
+    }
+    fn focused_scan_result(
+        &mut self,
+        result: Option<serde_json::Value>,
+    ) -> Result<Option<Manifest>> {
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        self.metrics.files_enumerated += result["enumerated"]
+            .as_u64()
+            .context("delta scan count missing")?;
+        self.metrics.files_hashed += result["hashed"]
+            .as_u64()
+            .context("delta hash count missing")?;
+        self.metrics.bytes_hashed += result["bytes_hashed"]
+            .as_u64()
+            .context("delta hash bytes missing")?;
+        Ok(Some(serde_json::from_value(result["files"].clone())?))
     }
     fn request_records(&mut self) -> Result<Vec<serde_json::Value>> {
         let requests: Vec<serde_json::Value> =
@@ -423,6 +501,9 @@ impl AndroidStore<'_, '_, '_> {
                     .call_method(&exception, "toString", "()Ljava/lang/String;", &[])?
                     .l()?;
                 let text: String = env.get_string(&JString::from(message))?.into();
+                if text.contains("AUDIT_DEFERRED") {
+                    return Err(rowd_core::sync::ScanDeferred.into());
+                }
                 if trace::enabled() {
                     let described = env
                         .call_static_method(
@@ -462,6 +543,12 @@ impl AndroidStore<'_, '_, '_> {
                 "SAF_CALL_END",
                 serde_json::json!({"operation":name,"duration_us":started.elapsed().as_micros()})
             ),
+            Err(error) if error.is::<rowd_core::sync::ScanDeferred>() => trace_event!(
+                TraceLevel::Debug,
+                TraceComponent::Scanner,
+                "STREAM_PREEMPT_APPLIED",
+                serde_json::json!({"operation":name,"frame_boundary":true})
+            ),
             Err(error) => trace_event!(
                 TraceLevel::Error,
                 TraceComponent::SAF,
@@ -473,6 +560,58 @@ impl AndroidStore<'_, '_, '_> {
     }
 }
 impl Store for AndroidStore<'_, '_, '_> {
+    fn scan_stream_metrics(&mut self) -> Result<rowd_core::storage::ScanStreamMetrics> {
+        Ok(serde_json::from_str(
+            &self.call("scanStreamMetricsJson", &[])?,
+        )?)
+    }
+    fn scan_binding(&mut self) -> Result<String> {
+        self.call("bindingIdentity", &[])
+    }
+    fn stream_namespace(
+        &mut self,
+        io: &mut (impl Read + Write),
+    ) -> Result<Option<rowd_core::model::Namespace>> {
+        self.call("startNamespaceJson", &[])?;
+        let status = self.poll_stream(io, "pollScanJson")?;
+        let result: serde_json::Value = serde_json::from_str(&status)?;
+        if result["deferred"] == true {
+            return Err(rowd_core::sync::ScanDeferred.into());
+        }
+        let namespace: rowd_core::model::Namespace = serde_json::from_value(result)?;
+        self.metrics.files_enumerated += namespace.values().filter(|e| !e.directory).count() as u64;
+        self.metrics.full_scans += 1;
+        Ok(Some(namespace))
+    }
+    fn start_hash_stream(
+        &mut self,
+        stage_paths: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        self.call(
+            "startHashStreamJson",
+            &[&serde_json::to_string(stage_paths)?],
+        )?;
+        Ok(())
+    }
+    fn next_hash_chunk(&mut self, io: &mut (impl Read + Write)) -> Result<Option<Manifest>> {
+        let result = self.poll_stream(io, "pollHashStreamJson")?;
+        if result == "end" {
+            let metrics: serde_json::Value =
+                serde_json::from_str(&self.call("finishHashStreamJson", &[])?)?;
+            self.metrics.files_hashed += metrics["hashed"]
+                .as_u64()
+                .context("stream hashes missing")?;
+            self.metrics.bytes_hashed += metrics["bytes_hashed"]
+                .as_u64()
+                .context("stream hash bytes missing")?;
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&result)?))
+    }
+    fn release_hash_staging(&mut self, paths: &std::collections::BTreeSet<String>) -> Result<()> {
+        self.call("releaseHashStagingJson", &[&serde_json::to_string(paths)?])?;
+        Ok(())
+    }
     fn scan_is_staged(&self) -> bool {
         true
     }
@@ -486,20 +625,24 @@ impl Store for AndroidStore<'_, '_, '_> {
     ) -> Result<Option<Manifest>> {
         check_cancelled()?;
         let response = self.call("scanPathsJson", &[&serde_json::to_string(paths)?])?;
+        self.focused_scan_result(serde_json::from_str(&response)?)
+    }
+    fn delta_scan_with_control(
+        &mut self,
+        io: &mut (impl Read + Write),
+        paths: &std::collections::BTreeSet<String>,
+    ) -> Result<Option<(std::collections::BTreeSet<String>, Manifest)>> {
+        check_cancelled()?;
+        self.call("startDeltaScanJson", &[&serde_json::to_string(paths)?])?;
+        let response = self.poll_stream(io, "pollScanJson")?;
         let result: Option<serde_json::Value> = serde_json::from_str(&response)?;
         let Some(result) = result else {
             return Ok(None);
         };
-        self.metrics.files_enumerated += result["enumerated"]
-            .as_u64()
-            .context("delta scan count missing")?;
-        self.metrics.files_hashed += result["hashed"]
-            .as_u64()
-            .context("delta hash count missing")?;
-        self.metrics.bytes_hashed += result["bytes_hashed"]
-            .as_u64()
-            .context("delta hash bytes missing")?;
-        Ok(Some(serde_json::from_value(result["files"].clone())?))
+        let paths = serde_json::from_value(result["paths"].clone())?;
+        Ok(self
+            .focused_scan_result(Some(result))?
+            .map(|files| (paths, files)))
     }
     fn base_token(&self) -> Option<String> {
         self.token_key
@@ -507,6 +650,11 @@ impl Store for AndroidStore<'_, '_, '_> {
             .and_then(|key| base_tokens().lock().unwrap().get(key).cloned())
     }
     fn set_base_token(&mut self, token: Option<String>) {
+        if token.is_some() {
+            if let Some(id) = &self.share_id {
+                self.completed_shares.insert(id.clone());
+            }
+        }
         if let Some(key) = &self.token_key {
             let mut tokens = base_tokens().lock().unwrap();
             if let Some(token) = token {
@@ -542,6 +690,7 @@ impl Store for AndroidStore<'_, '_, '_> {
             .try_clone()?;
         let share_id = self.share_id.clone().context("Share not selected")?;
         let mut preempted = false;
+        let mut last_alive = std::time::Instant::now();
         let result = (|| -> Result<Manifest> {
             self.call("startScanJson", &[])?;
             loop {
@@ -549,18 +698,23 @@ impl Store for AndroidStore<'_, '_, '_> {
                 let status = self.call("pollScanJson", &[])?;
                 if !status.is_empty() {
                     if preempted {
-                        self.call("discardScanJson", &[])?;
                         return Err(rowd_core::sync::ScanDeferred.into());
                     }
                     return self.scan_result(&status);
                 }
+                if last_alive.elapsed() >= Duration::from_secs(5) && !preempted {
+                    rowd_core::protocol::send_for(
+                        io,
+                        &share_id,
+                        rowd_core::protocol::Message::ScanAlive,
+                    )?;
+                    last_alive = std::time::Instant::now();
+                }
                 socket.set_read_timeout(Some(Duration::from_millis(50)))?;
                 let mut byte = [0];
-                match rowd_core::io_retry::interrupted_with_control(
-                    "scan_peek",
-                    io_cancelled,
-                    || socket.peek(&mut byte),
-                ) {
+                match rowd_core::io_retry::poll_with_control("scan_peek", io_cancelled, || {
+                    socket.peek(&mut byte)
+                }) {
                     Ok(0) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -594,12 +748,7 @@ impl Store for AndroidStore<'_, '_, '_> {
         if result.is_err() {
             let _ = self.call("deferScanJson", &[]);
             // The SAF worker must finish before another Share can be selected.
-            while self
-                .call("pollScanJson", &[])
-                .is_ok_and(|status| status.is_empty())
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            let _ = self.call("finishScanJson", &[]);
             let _ = self.call("discardScanJson", &[]);
         }
         transport::deferred_scan_result(result, &mut self.scan_errors)
@@ -871,6 +1020,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
             share_id: None,
             scan_socket: None,
             scan_errors: Vec::new(),
+            completed_shares: Default::default(),
         };
         // One sync worker per process; private app cache is writable on Android.
         std::env::set_var("TMPDIR", store.call("tempDirectory", &[])?);
@@ -992,13 +1142,15 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                             errors.len(),
                             errors.join("; ")
                         );
-                        break Ok(serde_json::to_string(&report)?);
+                        let mut result = serde_json::to_value(&report)?;
+                        result["completed_shares"] = serde_json::to_value(&store.completed_shares)?;
+                        break Ok(result.to_string());
                     }
                     Err(error) => {
                         store.scan_socket = None;
                         let kind =
                             transport::classify(&error, false, CANCELLED.load(Ordering::Relaxed));
-                        if kind.invalidates() {
+                        if transport::requires_reconnect(&error, kind) {
                             clear_connection(&mut connection, kind.label());
                         }
                         if matches!(
@@ -1025,7 +1177,7 @@ pub extern "system" fn Java_app_rowd_NativeBridge_sync<'local>(
                     != NETWORK_GENERATION.load(Ordering::SeqCst),
                 CANCELLED.load(Ordering::Relaxed),
             );
-            if kind.invalidates() {
+            if transport::requires_reconnect(result.as_ref().unwrap_err(), kind) {
                 clear_connection(&mut connection, kind.label());
             }
         }
@@ -1132,7 +1284,7 @@ fn wait_application_byte(
     let deadline = Instant::now() + audit_in;
     loop {
         let mut byte = [0];
-        match rowd_core::io_retry::interrupted_with_control("idle_tls_reader", io_cancelled, || {
+        match rowd_core::io_retry::poll_with_control("idle_tls_reader", io_cancelled, || {
             io.conn.reader().read(&mut byte)
         }) {
             Ok(0) => return Ok(IdleInput::Eof),
@@ -1361,7 +1513,7 @@ mod regression_tests {
         assert!(idle_started.elapsed() >= Duration::from_millis(80));
         let mut attempts = 0;
         assert_eq!(
-            rowd_core::io_retry::interrupted("scan_peek", || {
+            rowd_core::io_retry::poll("scan_peek", || {
                 attempts += 1;
                 if attempts == 1 {
                     Err(std::io::ErrorKind::Interrupted.into())

@@ -4,6 +4,7 @@ use rowd_core::{
 };
 mod compat;
 mod config;
+mod watcher;
 
 pub use config::{backup_config, DeviceConfig, CURRENT_DEVICE_VERSION};
 
@@ -1033,6 +1034,66 @@ fn set_ignore_text(home: &Path, id: &str, text: &str) -> Result<()> {
     scan_share(home, share, true, None)
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+enum ManualShareRequest {
+    Request {
+        share_id: String,
+        request_id: String,
+    },
+    Legacy(String),
+}
+impl ManualShareRequest {
+    fn share_id(&self) -> &str {
+        match self {
+            Self::Request { share_id, .. } | Self::Legacy(share_id) => share_id,
+        }
+    }
+}
+fn manual_trace(request: &ManualShareRequest, event: &str, reason: &str) {
+    trace_event!(
+        TraceLevel::Info,
+        TraceComponent::Scheduler,
+        event,
+        serde_json::json!({"share_id":request.share_id(),"request":request,"reason":reason})
+    );
+}
+fn finish_manual_request(
+    home: &Path,
+    request: &ManualShareRequest,
+    event: &str,
+    reason: &str,
+) -> Result<()> {
+    let _lock = config_guard(home)?;
+    let path = home.join(".rowd/next-share.json");
+    let current = File::open(&path)
+        .ok()
+        .and_then(|f| serde_json::from_reader::<_, ManualShareRequest>(f).ok());
+    // Do not erase a newer UI request that arrived during this round.
+    if current.as_ref() == Some(request) {
+        fs::remove_file(path)?;
+    }
+    manual_trace(request, event, reason);
+    Ok(())
+}
+fn manual_transport_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::Interrupted
+            )
+        })
+    })
+}
+
 fn request_share_sync(home: &Path, id: &str) -> Result<()> {
     let cfg = DeviceConfig::load(home)?;
     let share = cfg
@@ -1041,7 +1102,14 @@ fn request_share_sync(home: &Path, id: &str) -> Result<()> {
         .find(|share| share.share_id == id)
         .context("unknown Share")?;
     ensure!(share.enabled, "Share is paused");
-    atomic_json(&home.join(".rowd/next-share.json"), &id)
+    let request = ManualShareRequest::Request {
+        share_id: id.into(),
+        request_id: random_id()?,
+    };
+    let _lock = config_guard(home)?;
+    atomic_json(&home.join(".rowd/next-share.json"), &request)?;
+    manual_trace(&request, "MANUAL_SHARE_REQUESTED", "ui");
+    Ok(())
 }
 
 fn revoke_device_unlocked(home: &Path) -> Result<()> {
@@ -1727,6 +1795,7 @@ fn session(
     once: bool,
     event: &impl Fn(String),
     signal: &impl Fn(AppSignal),
+    authenticated: &impl Fn(&TcpStream) -> Result<()>,
 ) -> Result<()> {
     let _trace_connection = trace::current_context()
         .with("connection_id", trace::new_id("connection"))
@@ -1857,7 +1926,6 @@ fn session(
         other => protocol::server_auth_with_first(&mut io, &cfg.pair_id, &cfg.secret, other)?,
     };
     {
-        let _session = session_guard(home)?;
         let _config = config_guard(home)?;
         let mut latest = DeviceConfig::load(home)?;
         ensure!(latest.pair_id == cfg.pair_id, "pairing credentials revoked");
@@ -1872,7 +1940,11 @@ fn session(
             latest.peer_device = Some(device.clone());
             latest.save(home)?;
         }
+        // Keep revocation and promotion under the same configuration guard.
+        // Unauthenticated sockets never touch the active session.
+        authenticated(&io.sock)?;
     }
+    io.sock.set_read_timeout(Some(Duration::from_secs(90)))?;
     atomic_json(
         &device_runtime_path(home),
         &DeviceRuntime {
@@ -1895,7 +1967,7 @@ fn session(
             return Ok(());
         }
         let mut first = [0u8; 1];
-        let buffered = match rowd_core::io_retry::interrupted("idle_tls_read", || {
+        let buffered = match rowd_core::io_retry::poll("idle_tls_read", || {
             io.conn.reader().read(&mut first)
         }) {
             Ok(1) => true,
@@ -1907,7 +1979,7 @@ fn session(
         let ready = if buffered {
             true
         } else {
-            match rowd_core::io_retry::interrupted("idle_peek", || io.sock.peek(&mut first)) {
+            match rowd_core::io_retry::poll("idle_peek", || io.sock.peek(&mut first)) {
                 Ok(0) => return Ok(()),
                 Ok(_) => true,
                 Err(error)
@@ -2023,6 +2095,7 @@ fn session_round(
         cfg.peer_device.as_deref() == Some(device),
         "Android peer revoked"
     );
+    let mut manual_attempt = None;
     let result = (|| -> Result<()> {
         let mut advertised = Vec::with_capacity(cfg.shares.len());
         for share in &cfg.shares {
@@ -2189,9 +2262,56 @@ fn session_round(
             return Ok(());
         }
 
-        let requested_share: Option<String> = File::open(home.join(".rowd/next-share.json"))
-            .ok()
-            .and_then(|file| serde_json::from_reader(file).ok());
+        let requested_share: Option<ManualShareRequest> = {
+            let _lock = config_guard(home)?;
+            let path = home.join(".rowd/next-share.json");
+            match File::open(&path) {
+                Ok(file) => match serde_json::from_reader(file) {
+                    Ok(request) => Some(request),
+                    Err(error) => {
+                        fs::remove_file(path)?;
+                        event(format!("Solicitação manual inválida removida: {error}"));
+                        trace_event!(
+                            TraceLevel::Warn,
+                            TraceComponent::Scheduler,
+                            "MANUAL_SHARE_REJECTED",
+                            serde_json::json!({"share_id":null,"reason":"invalid_request_file","error":error.to_string()})
+                        );
+                        None
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let requested_share = if let Some(request) = requested_share {
+            let id = request.share_id();
+            let reason = match cfg.shares.iter().find(|share| share.share_id == id) {
+                None => Some("unknown_share"),
+                Some(share) if !share.enabled => Some("disabled"),
+                Some(_) if !available_shares.iter().any(|available| available == id) => {
+                    Some("remote_binding_unavailable")
+                }
+                Some(_) if !requested_share_ids.iter().any(|wanted| wanted == id) => {
+                    Some("not_negotiated")
+                }
+                Some(_) => None,
+            };
+            if let Some(reason) = reason {
+                finish_manual_request(home, &request, "MANUAL_SHARE_REJECTED", reason)?;
+                event(format!(
+                    "Solicitação manual {} rejeitada: {reason}",
+                    request.share_id()
+                ));
+                None
+            } else {
+                manual_trace(&request, "MANUAL_SHARE_ACCEPTED", "negotiated_share");
+                manual_attempt = Some(request.clone());
+                Some(request)
+            }
+        } else {
+            None
+        };
         for (index, share) in cfg.shares.iter().enumerate() {
             let _share = trace::current_context()
                 .with("share_id", share.share_id.clone())
@@ -2207,7 +2327,7 @@ fn session_round(
                 "remote_binding_unavailable"
             } else if requested_share
                 .as_ref()
-                .is_some_and(|id| id != &share.share_id)
+                .is_some_and(|id| id.share_id() != share.share_id)
             {
                 "manual_share_priority"
             } else {
@@ -2237,7 +2357,7 @@ fn session_round(
                     && available_shares.contains(&share.share_id)
                     && requested_share
                         .as_ref()
-                        .is_none_or(|requested| requested == &share.share_id)
+                        .is_none_or(|requested| requested.share_id() == share.share_id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2339,7 +2459,7 @@ fn session_round(
                     "Share not ready"
                 );
                 let mut last_progress = Instant::now() - Duration::from_secs(1);
-                let preempt_scan = audit && !*audit_preempted;
+                let preempt_scan = !*audit_preempted;
                 sync::coordinate_with_progress_and_audit_control(
                     &mut io,
                     &mut store,
@@ -2393,8 +2513,18 @@ fn session_round(
                     );
                     record_share_error(home, &share.share_id, operation, &error);
                     signal(AppSignal::new("share_error", Some(share.share_id.clone())));
-                    if selected {
-                        return Err(error);
+                    if selected || requested_share.is_some() {
+                        protocol::send_share_error(
+                            &mut io,
+                            &error,
+                            "pc",
+                            Some(&share.share_id),
+                            operation,
+                            None,
+                            "protocol",
+                        );
+                        let message = format!("{error:#}");
+                        return Err(error.context(protocol::ErrorReported(message)));
                     }
                     protocol::send(
                         &mut io,
@@ -2426,6 +2556,14 @@ fn session_round(
                 deferred = true;
                 *audit_preempted = true;
                 break;
+            }
+            if let Some(request) = manual_attempt.take() {
+                finish_manual_request(
+                    home,
+                    &request,
+                    "MANUAL_SHARE_COMPLETED",
+                    "share_sync_completed",
+                )?;
             }
             report.metrics.share_queue_wait_ms = share_started_ms;
             resolve_share_error(home, &share.share_id);
@@ -2468,7 +2606,6 @@ fn session_round(
             }
         }
         round_metrics.total_ms = started.elapsed().as_millis();
-        let processed_any = round_metrics.shares_processed > 0;
         event(format!(
             "round_completed_at={} first_byte_ms={:?}",
             std::time::SystemTime::now()
@@ -2491,9 +2628,6 @@ fn session_round(
             }
             Ok(())
         })?;
-        if requested_share.is_some() && processed_any {
-            let _ = fs::remove_file(home.join(".rowd/next-share.json"));
-        }
         protocol::send(
             &mut io,
             &if deferred {
@@ -2517,6 +2651,31 @@ fn session_round(
         );
         Ok(())
     })();
+    if let Some(request) = manual_attempt {
+        match &result {
+            Err(error) if !manual_transport_failure(error) => {
+                finish_manual_request(
+                    home,
+                    &request,
+                    "MANUAL_SHARE_REJECTED",
+                    &format!("{error:#}"),
+                )?;
+                event(format!(
+                    "Solicitação manual {} rejeitada: {error:#}",
+                    request.share_id()
+                ));
+            }
+            _ => manual_trace(
+                &request,
+                "MANUAL_SHARE_RETRY",
+                &result
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:#}"))
+                    .unwrap_or_else(|| "round_deferred".into()),
+            ),
+        }
+    }
     trace_event!(
         if result.is_ok() {
             TraceLevel::Info
@@ -2528,11 +2687,14 @@ fn session_round(
         serde_json::json!({"duration_us":started.elapsed().as_micros(),"result":if result.is_ok(){"success"}else{"failed"},"error":result.as_ref().err().map(|e|TraceError::new("scheduler","session_round",e))})
     );
     if let Err(ref error) = result {
-        let _ = protocol::send(
+        protocol::send_share_error(
             &mut io,
-            &Message::Error {
-                message: format!("{error:#}"),
-            },
+            error,
+            "pc",
+            None,
+            "session_round",
+            None,
+            "protocol",
         );
     }
     result
@@ -2575,9 +2737,7 @@ fn pairing_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<()
                 }
                 refreshed = Instant::now();
             }
-            match rowd_core::io_retry::interrupted("pairing_recv_from", || {
-                socket.recv_from(&mut buf)
-            }) {
+            match rowd_core::io_retry::poll("pairing_recv_from", || socket.recv_from(&mut buf)) {
                 Ok((len, source)) => {
                     let Ok(pairing::Packet::Discover {
                         nonce,
@@ -2659,9 +2819,7 @@ fn discovery_responder(home: &Path, tcp_port: u16, stop: &AtomicBool) -> Result<
             next_refresh = Instant::now() + Duration::from_secs(1);
         }
 
-        match rowd_core::io_retry::interrupted("discovery_recv_from", || {
-            socket.recv_from(&mut packet)
-        }) {
+        match rowd_core::io_retry::poll("discovery_recv_from", || socket.recv_from(&mut packet)) {
             Ok((len, peer)) => {
                 if let Ok(cfg) = DeviceConfig::load(home) {
                     if let Ok(fingerprint) = discovery::fingerprint(&cfg.cert) {
@@ -2755,12 +2913,10 @@ fn serve(
         }
     });
     let (tx, rx) = mpsc::sync_channel(1024);
-    let overflow = Arc::new(AtomicBool::new(false));
-    let watcher_overflow = overflow.clone();
-    let mut watcher: Option<RecommendedWatcher> = match notify::recommended_watcher(move |e| {
-        if tx.try_send(e).is_err() {
-            watcher_overflow.store(true, Ordering::Relaxed);
-        }
+    let watcher_ingress = Arc::new(watcher::Ingress::default());
+    let callback_ingress = watcher_ingress.clone();
+    let mut watcher: Option<RecommendedWatcher> = match notify::recommended_watcher(move |event| {
+        callback_ingress.send(&tx, event);
     }) {
         Ok(watcher) => Some(watcher),
         Err(e) => {
@@ -2772,31 +2928,34 @@ fn serve(
     let mut watched: BTreeMap<String, ShareConfig> = BTreeMap::new();
     let mut dirty: BTreeMap<String, (Instant, BTreeSet<String>)> = BTreeMap::new();
     let mut full = false;
+    let mut last_watcher_metrics = Instant::now();
     let mut last_fallback = Instant::now();
     let mut last_full = Instant::now();
     let mut last_config = Instant::now() - Duration::from_secs(2);
     let urgent = Mutex::new(BTreeMap::new());
     let audit_events = Mutex::new((0u64, BTreeMap::new()));
     signal(AppSignal::new("ready", None));
+    let active = Mutex::new(None::<(u64, TcpStream, mpsc::Sender<String>)>);
     let result = std::thread::scope(|scope| -> Result<()> {
-        let mut connected = None;
-        let mut connected_socket: Option<TcpStream> = None;
-        let mut wake_tx: Option<mpsc::Sender<String>> = None;
+        let mut candidates: Vec<std::thread::ScopedJoinHandle<'_, Result<()>>> = Vec::new();
+        let mut candidate_id = 0u64;
         while !stop.load(Ordering::Relaxed) {
             for message in responder_error_rx.try_iter() {
                 event(message);
             }
-            if connected
-                .as_ref()
-                .is_some_and(std::thread::ScopedJoinHandle::is_finished)
-            {
-                if let Some(handle) = connected.take() {
-                    if let Err(error) = handle.join().expect("session thread panicked") {
-                        event(format!("Rodada interrompida: {error:#}"));
+            let mut index = 0;
+            while index < candidates.len() {
+                if candidates[index].is_finished() {
+                    if let Err(error) = candidates
+                        .swap_remove(index)
+                        .join()
+                        .expect("session thread panicked")
+                    {
+                        event(format!("Conexão encerrada: {error:#}"));
                     }
+                } else {
+                    index += 1;
                 }
-                wake_tx = None;
-                connected_socket = None;
             }
             if last_config.elapsed() >= Duration::from_secs(1) {
                 let cfg = DeviceConfig::load(home)?;
@@ -2836,16 +2995,47 @@ fn serve(
                     .filter(|share| share.enabled)
                     .map(|s| (s.share_id.clone(), s))
                     .collect();
+                *watcher_ingress.roots.lock().unwrap() = watched
+                    .iter()
+                    .map(|(id, share)| (id.clone(), share.root.clone()))
+                    .collect();
                 last_config = Instant::now();
             }
-            if overflow.swap(false, Ordering::Relaxed) {
-                trace_event!(
-                    TraceLevel::Warn,
-                    TraceComponent::Watcher,
+            if last_watcher_metrics.elapsed() >= Duration::from_secs(1) {
+                let counts = watcher_ingress.drain_metrics();
+                for (name, count) in [
+                    "WATCHER_EVENTS_RECEIVED",
+                    "WATCHER_EVENTS_DROPPED_IRRELEVANT",
+                    "WATCHER_EVENTS_QUEUED",
                     "WATCHER_QUEUE_OVERFLOW",
-                    serde_json::json!({"reason":"provider_event_queue_overflow","fallback":"full_scan"})
-                );
-                full = true;
+                ]
+                .into_iter()
+                .zip(counts)
+                {
+                    if count > 0 {
+                        trace_event!(
+                            if name == "WATCHER_QUEUE_OVERFLOW" {
+                                TraceLevel::Warn
+                            } else {
+                                TraceLevel::Info
+                            },
+                            TraceComponent::Watcher,
+                            name,
+                            serde_json::json!({"count":count,"interval_ms":last_watcher_metrics.elapsed().as_millis(),
+                                "fallback":"affected_share_cache_invalidation"})
+                        );
+                    }
+                }
+                // Coalesce lost relevant events once per interval. Persist a full
+                // invalidation for affected roots; the usual debounce sends one wake.
+                for id in watcher_ingress.take_recovery() {
+                    let entry = dirty
+                        .entry(id)
+                        .or_insert_with(|| (Instant::now(), BTreeSet::new()));
+                    entry.1.clear();
+                    entry.1.insert(String::new());
+                }
+                last_watcher_metrics = Instant::now();
             }
             for result in rx.try_iter() {
                 match result {
@@ -2876,6 +3066,19 @@ fn serve(
                                     .unwrap_or_default(),
                             );
                             for path in &paths {
+                                if rowd_core::internal_writes::matches(
+                                    path,
+                                    matches!(
+                                        kind,
+                                        notify::EventKind::Create(
+                                            notify::event::CreateKind::Folder
+                                        )
+                                    ),
+                                ) {
+                                    // install() already invalidates its physical cache. Do not
+                                    // promote this functional internal event into AuditPreempt.
+                                    continue;
+                                }
                                 if let Ok(relative) = path.strip_prefix(&share.root) {
                                     let relative = relative.to_string_lossy().to_string();
                                     let _share = trace::current_context()
@@ -2970,7 +3173,7 @@ fn serve(
                         paths.insert(String::new());
                         continue;
                     }
-                    if changed && connected.is_some() {
+                    if changed && active.lock().unwrap().is_some() {
                         urgent.lock().unwrap().insert(share.share_id.clone(), false);
                     }
                     invalidate_share_cache_serialized(
@@ -2987,7 +3190,7 @@ fn serve(
                         .remove(&share.share_id)
                         .unwrap_or(false);
                     if wake && !delivered {
-                        if let Some(tx) = &wake_tx {
+                        if let Some((_, _, tx)) = &*active.lock().unwrap() {
                             let _ = tx.send(share.share_id.clone());
                             event(format!("{}: wake enviado", share.name));
                         }
@@ -3003,27 +3206,16 @@ fn serve(
             }
             match rowd_core::io_retry::interrupted("accept", || listener.accept()) {
                 Ok((socket, _)) => {
-                    if let Some(old) = connected_socket.take() {
-                        let _ = old.shutdown(std::net::Shutdown::Both);
+                    // Bound unauthenticated candidates; each has a five-second deadline.
+                    if candidates.len() >= 5 {
+                        continue;
                     }
-                    if let Some(handle) = connected.take() {
-                        if let Err(error) = handle.join().expect("session thread panicked") {
-                            event(format!("Sessão anterior encerrada: {error:#}"));
-                        }
-                    }
-                    for (id, (_, paths)) in std::mem::take(&mut dirty) {
-                        if let Some(share) = watched.get(&id) {
-                            if !share.root.is_dir() {
-                                dirty.insert(id, (Instant::now(), BTreeSet::from([String::new()])));
-                                continue;
-                            }
-                            invalidate_share_cache_serialized(home, share, false, Some(&paths))
-                                .with_context(|| format!("watcher hint for {}", share.name))?;
-                        }
-                    }
+                    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
                     let (tx, wakes) = mpsc::channel();
-                    wake_tx = Some(tx);
-                    connected_socket = Some(socket.try_clone()?);
+                    candidate_id += 1;
+                    let id = candidate_id;
+                    let active = &active;
                     let urgent = &urgent;
                     let audit_events = &audit_events;
                     let stop = &stop;
@@ -3040,14 +3232,29 @@ fn serve(
                             once,
                             event,
                             signal,
+                            &|socket| {
+                                let mut active = active.lock().unwrap();
+                                let next = (id, socket.try_clone()?, tx.clone());
+                                if let Some((_, old, _)) = active.replace(next) {
+                                    let _ = old.shutdown(std::net::Shutdown::Both);
+                                }
+                                Ok(())
+                            },
                         );
-                        signal(AppSignal::new("disconnected", None));
+                        let mut active = active.lock().unwrap();
+                        if active
+                            .as_ref()
+                            .is_some_and(|(current, _, _)| *current == id)
+                        {
+                            *active = None;
+                            signal(AppSignal::new("disconnected", None));
+                        }
                         result
                     });
                     if once {
                         return handle.join().expect("session thread panicked");
                     }
-                    connected = Some(handle);
+                    candidates.push(handle);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(50))
@@ -3055,9 +3262,11 @@ fn serve(
                 Err(e) => return Err(e.into()),
             }
         }
-        drop(wake_tx);
-        if let Some(handle) = connected {
-            handle.join().expect("session thread panicked")?;
+        if let Some((_, socket, _)) = active.lock().unwrap().take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        for handle in candidates {
+            let _ = handle.join().expect("session thread panicked");
         }
         Ok(())
     });
@@ -3095,6 +3304,145 @@ fn pairing_payload(cfg: &DeviceConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_manual_round(home: &Path, android: &Path, failure: &str) -> Result<()> {
+        use rowd_core::managed::{client_round_on, LocalDevice};
+        let cfg = DeviceConfig::load(home)?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let (mut server, _) = listener.accept()?;
+        server.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let scan_socket = server.try_clone()?;
+        let mut store = LocalDevice::open(android)?;
+        for share in &cfg.shares {
+            store.bind(&share.share_id, &share.name)?;
+        }
+        std::thread::scope(|scope| -> Result<()> {
+            let peer = scope.spawn(move || -> Result<()> {
+                if failure != "none" {
+                    protocol::send(&mut client, &Message::StartRound)?;
+                    let Message::Shares { .. } = protocol::receive(&mut client)? else { anyhow::bail!("expected Shares") };
+                    protocol::send(&mut client, &Message::Capabilities {
+                        device_id: "android-test".into(), share_requests: vec![], cancel_intents: vec![],
+                        available_shares: cfg.shares.iter().map(|s| s.share_id.clone()).collect(),
+                        requested_share_ids: cfg.shares.iter().map(|s| s.share_id.clone()).collect(),
+                        audit: false, unlink_requested: false,
+                    })?;
+                    assert!(matches!(protocol::receive(&mut client)?, Message::ShareRequestStatus { .. }));
+                    assert!(matches!(protocol::receive(&mut client)?, Message::SelectShare { share_id } if share_id == cfg.shares[2].share_id));
+                    if failure == "transport" {
+                        client.shutdown(std::net::Shutdown::Both)?;
+                    } else {
+                        protocol::send(&mut client, &Message::Error { message: "unexpected Share selection".into() })?;
+                    }
+                    return Ok(());
+                }
+                let report = client_round_on(&mut client, "android-test", &mut store)?;
+                assert_eq!(report.shares_processed, 1);
+                // A second round on this same connection proves the stream remains valid.
+                let report = client_round_on(&mut client, "android-test", &mut store)?;
+                assert_eq!(report.shares_processed, 3);
+                Ok(())
+            });
+            let round = |io: &mut TcpStream| -> Result<()> {
+                ensure!(
+                    matches!(protocol::receive(io)?, Message::StartRound),
+                    "expected StartRound"
+                );
+                session_round(
+                    home,
+                    io,
+                    &scan_socket,
+                    "android-test",
+                    &DeviceConfig::load(home).unwrap().pair_id,
+                    false,
+                    &Mutex::new(BTreeMap::new()),
+                    &Mutex::new((0, BTreeMap::new())),
+                    &mut false,
+                    &|_| {},
+                    &|_| {},
+                )
+            };
+            let result = round(&mut server);
+            let result = if failure != "none" {
+                result
+            } else {
+                result.and_then(|()| round(&mut server))
+            };
+            peer.join().unwrap()?;
+            result
+        })
+    }
+
+    #[test]
+    fn manual_c_sync_retries_transport_then_completes_on_reusable_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("pc");
+        let android = directory.path().join("android");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&android).unwrap();
+        let app = App::new(&home);
+        app.pair("127.0.0.1:43821").unwrap();
+        let mut ids = vec![];
+        for name in ["A", "B", "C"] {
+            let root = directory.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("file.txt"), name).unwrap();
+            ids.push(
+                app.add_share(name.into(), root, SyncMode::Bidirectional)
+                    .unwrap(),
+            );
+        }
+        update_runtime(&home, |cfg| {
+            cfg.peer_device = Some("android-test".into());
+            Ok(())
+        })
+        .unwrap();
+        app.request_share_sync(&ids[2]).unwrap();
+        let path = home.join(".rowd/next-share.json");
+        let request = fs::read(&path).unwrap();
+        let error = run_manual_round(&home, &android, "transport").unwrap_err();
+        assert!(manual_transport_failure(&error), "{error:#}");
+        assert_eq!(fs::read(&path).unwrap(), request);
+        run_manual_round(&home, &android, "none").unwrap();
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(android.join("C/file.txt")).unwrap(), "C");
+        app.request_share_sync(&ids[2]).unwrap();
+        let error = run_manual_round(&home, &android, "protocol").unwrap_err();
+        assert!(!manual_transport_failure(&error), "{error:#}");
+        assert!(
+            !path.exists(),
+            "A protocol rejection must not pin the request"
+        );
+    }
+
+    #[test]
+    fn manual_request_terminal_failure_and_newer_request_are_preserved_correctly() {
+        let (directory, app, root) = configured_app();
+        let id = app
+            .add_share("A".into(), root, SyncMode::Bidirectional)
+            .unwrap();
+        let home = app.home();
+        app.request_share_sync(&id).unwrap();
+        let old: ManualShareRequest =
+            serde_json::from_slice(&fs::read(home.join(".rowd/next-share.json")).unwrap()).unwrap();
+        app.request_share_sync(&id).unwrap();
+        finish_manual_request(home, &old, "MANUAL_SHARE_COMPLETED", "completed").unwrap();
+        assert!(home.join(".rowd/next-share.json").exists());
+        let current: ManualShareRequest =
+            serde_json::from_slice(&fs::read(home.join(".rowd/next-share.json")).unwrap()).unwrap();
+        let error = anyhow::anyhow!("unexpected Share selection");
+        assert!(!manual_transport_failure(&error));
+        finish_manual_request(home, &current, "MANUAL_SHARE_REJECTED", &error.to_string()).unwrap();
+        assert!(!home.join(".rowd/next-share.json").exists());
+        // Legacy string requests written by earlier versions still deserialize.
+        atomic_json(&directory.path().join("legacy.json"), &id).unwrap();
+        let legacy: ManualShareRequest =
+            serde_json::from_reader(File::open(directory.path().join("legacy.json")).unwrap())
+                .unwrap();
+        assert_eq!(legacy.share_id(), id);
+    }
 
     #[test]
     fn pairing_discover_and_offer_use_runtime_port() {
@@ -3170,6 +3518,7 @@ mod tests {
                 true,
                 &|_| {},
                 &|_| {},
+                &|_| Ok(()),
             );
         });
         (endpoint, worker)

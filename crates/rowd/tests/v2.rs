@@ -338,8 +338,9 @@ fn watcher_defers_offline_hashing_until_connection() {
     let runtime: serde_json::Value =
         serde_json::from_slice(&fs::read(home.join(".rowd/device-runtime.json")).unwrap()).unwrap();
     let metrics = &runtime["last_round"]["per_share"][&id];
-    assert_eq!(metrics["full_scans"], 1);
-    assert_eq!(metrics["files_enumerated"], 1);
+    // Full streaming closes both physical namespaces even when hashes are cached.
+    assert_eq!(metrics["full_scans"], 2);
+    assert_eq!(metrics["files_enumerated"], 2);
     assert_eq!(metrics["manifest_entries"], 1);
 }
 
@@ -797,6 +798,40 @@ fn persistent_connection_wakes_a_focused_share_and_reuses_auth_for_two_shares() 
             .shares_processed,
         1
     );
+    // TCP acceptance is not takeover authority. Probe while the original
+    // authenticated session remains live, then reuse that very same TLS stream.
+    let silent = std::net::TcpStream::connect(&invitation.address).unwrap();
+    for _ in 0..3 {
+        drop(std::net::TcpStream::connect(&invitation.address).unwrap());
+    }
+    let mut invalid = rowd_core::tls::connect(&invitation).unwrap();
+    invalid
+        .sock
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    assert!(protocol::client_auth(
+        &mut invalid,
+        &invitation.pair_id,
+        &"0".repeat(64),
+        &device_id
+    )
+    .is_err());
+    drop(invalid);
+    let mut other_device = rowd_core::tls::connect(&invitation).unwrap();
+    other_device
+        .sock
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let _ = protocol::client_auth(
+        &mut other_device,
+        &invitation.pair_id,
+        &invitation.secret,
+        &random_id().unwrap(),
+    );
+    let _ = protocol::send(&mut other_device, &Message::StartRound);
+    assert!(protocol::receive(&mut other_device).is_err());
+    drop(other_device);
+    drop(silent);
     fs::write(first.join("new.txt"), b"wake").unwrap();
     for index in 0..3 {
         fs::write(first.join(format!("burst-{index}.txt")), b"burst").unwrap();

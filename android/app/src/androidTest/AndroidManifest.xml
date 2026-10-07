@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <uses-library android:name="android.test.base" />
+        <uses-library android:name="android.test.mock" />
+        <uses-library android:name="android.test.runner" />
+    </application>
+</manifest>

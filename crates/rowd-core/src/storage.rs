@@ -17,6 +17,7 @@ use tempfile::NamedTempFile;
 pub struct VerifiedStaged {
     file: NamedTempFile,
     entry: Entry,
+    metadata: Vec<u64>,
 }
 
 impl VerifiedStaged {
@@ -30,9 +31,12 @@ impl VerifiedStaged {
             hash == expected.hash && size == expected.size,
             "HASH_MISMATCH"
         );
+        let metadata = file.as_file().metadata()?;
+        ensure!(metadata.len() == size, "staged size changed");
         Ok(Self {
             file,
             entry: expected.clone(),
+            metadata: fingerprint(&metadata),
         })
     }
 
@@ -42,6 +46,18 @@ impl VerifiedStaged {
 
     pub fn entry(&self) -> &Entry {
         &self.entry
+    }
+
+    fn validate(&self) -> Result<()> {
+        let metadata = fs::symlink_metadata(self.path())?;
+        ensure!(
+            metadata.is_file()
+                && metadata.len() == self.entry.size
+                && fingerprint(&metadata) == self.metadata
+                && fingerprint(&self.file.as_file().metadata()?) == self.metadata,
+            "staged file changed after verification"
+        );
+        Ok(())
     }
 }
 
@@ -55,7 +71,66 @@ pub struct StoreMetrics {
     pub staging_copies: u64,
     pub full_scans: u64,
 }
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScanStreamMetrics {
+    // Wire milliseconds: u64 covers over 584 million years and is supported
+    // by serde's internally tagged Message decoder. Producers must check narrowing.
+    pub namespace_ms: u64,
+    pub time_to_first_hash_ms: Option<u64>,
+    pub hashes_calculated: u64,
+    pub hashes_reused: u64,
+    pub files_staged_during_hash: u64,
+    pub duplicate_reads_avoided: u64,
+    pub queue_peak_chunks: u64,
+    pub queue_wait_ms: u64,
+    pub saf_source_lookup_fallback_count: u64,
+}
 pub trait Store {
+    /// Receive on the destination filesystem when the store can publish a local file.
+    fn staging_directory(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Consume a received payload; borrowed snapshots remain available for conflict forwarding.
+    fn install_received(
+        &mut self,
+        path: &str,
+        expected: Option<&str>,
+        entry: &Entry,
+        staged: VerifiedStaged,
+    ) -> Result<()> {
+        self.install(path, expected, entry, &staged)
+    }
+    fn validate_scan_snapshot(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn scan_stream_metrics(&mut self) -> Result<ScanStreamMetrics> {
+        Ok(ScanStreamMetrics::default())
+    }
+    fn scan_binding(&mut self) -> Result<String> {
+        Ok(String::new())
+    }
+    /// None retains the synchronous implementation for simple stores. SAF overrides
+    /// this with enumeration only; hash production starts after global validation.
+    fn stream_namespace(
+        &mut self,
+        _io: &mut (impl Read + Write),
+    ) -> Result<Option<crate::model::Namespace>> {
+        Ok(None)
+    }
+    fn start_hash_stream(
+        &mut self,
+        _stage_paths: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn next_hash_chunk(&mut self, _io: &mut (impl Read + Write)) -> Result<Option<Manifest>> {
+        Ok(None)
+    }
+    fn release_hash_staging(&mut self, _paths: &std::collections::BTreeSet<String>) -> Result<()> {
+        Ok(())
+    }
     fn scan_is_staged(&self) -> bool {
         false
     }
@@ -78,6 +153,26 @@ pub trait Store {
         _paths: &std::collections::BTreeSet<String>,
     ) -> Result<Option<Manifest>> {
         Ok(None)
+    }
+    fn delta_scan_with_control(
+        &mut self,
+        _io: &mut (impl Read + Write),
+        paths: &std::collections::BTreeSet<String>,
+    ) -> Result<Option<(std::collections::BTreeSet<String>, Manifest)>> {
+        let Some(dirty) = self.delta_paths()? else {
+            return Ok(None);
+        };
+        let union: std::collections::BTreeSet<_> = paths.union(&dirty).cloned().collect();
+        if union.len() > 1024 || union.iter().any(|path| validate_path(path).is_err()) {
+            return Ok(None);
+        }
+        // A failed local focused read falls back to full namespace validation.
+        // Controlled implementations must propagate errors from their transport.
+        Ok(self
+            .scan_paths(&union)
+            .ok()
+            .flatten()
+            .map(|files| (union, files)))
     }
     fn base_token(&self) -> Option<String> {
         None
@@ -177,6 +272,12 @@ pub struct LocalStore {
     pending_cache_invalidation: bool,
     metrics: Cell<StoreMetrics>,
     base_token: Option<String>,
+    stream_queue: Option<std::collections::VecDeque<(String, Vec<u64>)>>,
+    stream_paths: std::collections::BTreeSet<String>,
+    stream_original: Option<crate::model::Namespace>,
+    stream_fingerprints: std::collections::BTreeMap<String, Vec<u64>>,
+    stream_installed: Manifest,
+    stream_installed_fingerprints: std::collections::BTreeMap<String, Vec<u64>>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -219,6 +320,64 @@ fn fingerprint(meta: &fs::Metadata) -> Vec<u64> {
 #[cfg(not(unix))]
 fn fingerprint(_meta: &fs::Metadata) -> Vec<u64> {
     vec![]
+}
+
+fn enumerate_namespace(
+    root: &Path,
+    ignore: &crate::ignore::Ignore,
+) -> Result<crate::model::Namespace> {
+    fn walk(
+        base: &Path,
+        dir: &Path,
+        ignore: &crate::ignore::Ignore,
+        result: &mut crate::model::Namespace,
+    ) -> Result<()> {
+        for item in fs::read_dir(dir)? {
+            let item = item?;
+            if dir == base && item.file_name() == ".rowd" {
+                continue;
+            }
+            let path = item.path();
+            let rel = path
+                .strip_prefix(base)?
+                .to_str()
+                .context("non UTF-8 filename")?
+                .replace('\\', "/");
+            let kind = item.file_type()?;
+            if ignore.matches(&rel, kind.is_dir()) {
+                continue;
+            }
+            validate_path(&rel)?;
+            ensure!(
+                !kind.is_symlink() && (kind.is_dir() || kind.is_file()),
+                "unsupported file: {rel}"
+            );
+            let metadata = fs::metadata(&path)?;
+            result.insert(
+                rel,
+                crate::model::NamespaceEntry {
+                    size: metadata.len(),
+                    modified: metadata
+                        .modified()?
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis() as u64,
+                    directory: kind.is_dir(),
+                },
+            );
+            ensure!(
+                result.len() <= crate::model::MAX_FILES * 2,
+                "too many namespace entries"
+            );
+            if kind.is_dir() {
+                walk(base, &path, ignore, result)?;
+            }
+        }
+        Ok(())
+    }
+    let mut result = crate::model::Namespace::new();
+    walk(root, root, ignore, &mut result)?;
+    crate::model::validate_namespace(&result)?;
+    Ok(result)
 }
 
 impl LocalStore {
@@ -313,6 +472,12 @@ impl LocalStore {
             pending_cache_invalidation: false,
             metrics: Cell::new(StoreMetrics::default()),
             base_token: None,
+            stream_queue: None,
+            stream_paths: Default::default(),
+            stream_original: None,
+            stream_fingerprints: Default::default(),
+            stream_installed: Default::default(),
+            stream_installed_fingerprints: Default::default(),
             policy_override: policy.map(str::to_owned),
         };
         let invalidation_path = store.private.join("cache-dirty.json");
@@ -613,6 +778,135 @@ impl LocalStore {
         }
         Ok(())
     }
+    fn remember_installed(
+        &mut self,
+        path: &str,
+        entry: &Entry,
+        target: &Path,
+        metadata: Vec<u64>,
+    ) -> Result<()> {
+        ensure!(
+            metadata == fingerprint(&fs::metadata(target)?),
+            "STALE_TARGET: installed file edited: {path}"
+        );
+        if self.stream_original.is_some() {
+            self.stream_installed.insert(path.into(), entry.clone());
+            self.stream_installed_fingerprints
+                .insert(path.into(), metadata);
+        }
+        Ok(())
+    }
+
+    fn install_file(
+        &mut self,
+        path: &str,
+        expected: Option<&str>,
+        entry: &Entry,
+        temp: NamedTempFile,
+        verified_metadata: Vec<u64>,
+    ) -> Result<()> {
+        ensure!(!self.excluded(path), "ignored path: {path}");
+        validate_path(path)?;
+        let internal = crate::internal_writes::register(&self.root.join(path), &self.root, entry);
+        let target = self.checked_path(path, true)?;
+        let target_before = fs::symlink_metadata(&target).ok().map(|m| fingerprint(&m));
+        let current = self.current(path)?;
+        ensure!(
+            target_before == fs::symlink_metadata(&target).ok().map(|m| fingerprint(&m)),
+            "STALE_TARGET: changed during validation: {path}"
+        );
+        // A repeated operation after a lost acknowledgment is harmless.
+        if current.as_ref() == Some(entry) {
+            crate::trace::remote_installed(path, &entry.hash);
+            self.remember_installed(path, entry, &target, target_before.unwrap())?;
+            internal.complete();
+            return Ok(());
+        }
+        ensure!(
+            current.as_ref().map(|e| e.hash.as_str()) == expected,
+            "STALE_TARGET: {path}"
+        );
+        temp.as_file().sync_all()?;
+        let id = random_id()?;
+        let journal_path = self.private.join("recovery").join(format!("{id}.json"));
+        let backup = self.private.join("recovery").join(&id);
+        let mut journal = Journal {
+            path: path.into(),
+            backup: id,
+            finished: false,
+            new_hash: Some(entry.hash.clone()),
+            old_hash: current.as_ref().map(|entry| entry.hash.clone()),
+        };
+        atomic_json(&journal_path, &journal)?;
+        if current.is_some() {
+            // Keep the actual displaced inode, including writes through already-open handles.
+            fs::rename(&target, &backup)?;
+            sync_dir(target.parent().unwrap())?;
+            sync_dir(backup.parent().unwrap())?;
+            let (displaced, _) = hash_reader(File::open(&backup)?)?;
+            let mut metrics = self.metrics.get();
+            metrics.files_hashed += 1;
+            metrics.bytes_hashed += backup.metadata()?.len();
+            self.metrics.set(metrics);
+            if Some(displaced.as_str()) != expected {
+                self.recover()?;
+                bail!("STALE_TARGET: changed at commit; preserved in recovery: {path}");
+            }
+        }
+        // No clobber: if an editor recreated the path, preserve it and the displaced version.
+        let before_publish = fingerprint(&temp.as_file().metadata()?);
+        ensure!(
+            before_publish == verified_metadata
+                && fingerprint(&fs::symlink_metadata(temp.path())?) == verified_metadata
+                && temp.as_file().metadata()?.len() == entry.size,
+            "staged file changed before publication"
+        );
+        let published = match temp.persist_noclobber(&target) {
+            Ok(file) => file,
+            Err(e) => {
+                self.recover()?;
+                return Err(anyhow::anyhow!("STALE_TARGET: {path}: {e}"));
+            }
+        };
+        let installed = fingerprint(&published.metadata()?);
+        // Publication can change ctime; inode, size and mtime must still describe the verified bytes.
+        ensure!(
+            before_publish.get(..5) == installed.get(..5),
+            "STALE_TARGET: file changed at publication: {path}"
+        );
+        sync_dir(target.parent().unwrap())?;
+        journal.finished = true;
+        atomic_json(&journal_path, &journal)?;
+        crate::trace::remote_installed(path, &entry.hash);
+        self.remember_installed(path, entry, &target, installed)?;
+        internal.complete();
+        self.invalidate_path(path);
+        Self::queue_cache_invalidation(
+            &self.root,
+            false,
+            Some(&std::collections::BTreeSet::from([path.to_owned()])),
+        )?;
+        Ok(())
+    }
+    fn validate_installed(&self, path: &str, entry: &Entry) -> Result<()> {
+        let target = self.checked_path(path, false)?;
+        let before = fingerprint(&fs::metadata(&target)?);
+        if !before.is_empty() && self.stream_installed_fingerprints.get(path) == Some(&before) {
+            return Ok(());
+        }
+        let (hash, size) = hash_reader(File::open(&target)?)?;
+        let mut metrics = self.metrics.get();
+        metrics.files_hashed += 1;
+        metrics.bytes_hashed += size;
+        self.metrics.set(metrics);
+        ensure!(
+            entry.hash == hash
+                && entry.size == size
+                && before == fingerprint(&fs::metadata(&target)?),
+            "STALE_TARGET: installed file edited during stream: {path}"
+        );
+        Ok(())
+    }
 }
 
 impl Store for LocalStore {
@@ -690,6 +984,195 @@ impl Store for LocalStore {
     }
     fn excluded(&self, path: &str) -> bool {
         self.ignore.matches(path, false)
+    }
+    fn scan_binding(&mut self) -> Result<String> {
+        let policy = self
+            .policy_override
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| read_root_policy(&self.root))?;
+        let root_metadata = fs::symlink_metadata(&self.root)?;
+        ensure!(
+            root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+            "Share root changed"
+        );
+        let identity = fingerprint(&root_metadata)
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        Ok(format!("{}|{identity:?}|{}", self.root.display(), policy))
+    }
+    fn stream_namespace(
+        &mut self,
+        _io: &mut (impl Read + Write),
+    ) -> Result<Option<crate::model::Namespace>> {
+        let policy = self
+            .policy_override
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| read_root_policy(&self.root))?;
+        crate::ignore::Ignore::validate(&policy)?;
+        self.ignore = crate::ignore::Ignore::parse(&policy);
+        let result = enumerate_namespace(&self.root, &self.ignore)?;
+        self.stream_queue = Some(
+            result
+                .iter()
+                .filter(|(_, e)| !e.directory)
+                .map(|(p, _)| {
+                    Ok((
+                        p.clone(),
+                        fingerprint(&fs::metadata(self.checked_path(p, false)?)?),
+                    ))
+                })
+                .collect::<Result<_>>()?,
+        );
+        self.stream_fingerprints = self
+            .stream_queue
+            .as_ref()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        self.stream_original = Some(result.clone());
+        self.stream_installed.clear();
+        self.stream_installed_fingerprints.clear();
+        self.stream_paths = result
+            .iter()
+            .filter(|(_, e)| !e.directory)
+            .map(|(p, _)| p.clone())
+            .collect();
+        self.policy_text = policy;
+        Ok(Some(result))
+    }
+    fn validate_scan_snapshot(&mut self) -> Result<()> {
+        let Some(original) = &self.stream_original else {
+            return Ok(());
+        };
+        let mut expected = original.clone();
+        for (path, entry) in &self.stream_installed {
+            expected.insert(
+                path.clone(),
+                crate::model::NamespaceEntry {
+                    size: entry.size,
+                    modified: 0,
+                    directory: false,
+                },
+            );
+            for (index, _) in path.match_indices('/') {
+                expected
+                    .entry(path[..index].into())
+                    .or_insert(crate::model::NamespaceEntry {
+                        size: 0,
+                        modified: 0,
+                        directory: true,
+                    });
+            }
+        }
+        let observed = enumerate_namespace(&self.root, &self.ignore)?;
+        ensure!(
+            observed.len() == expected.len()
+                && observed
+                    .iter()
+                    .all(|(p, e)| expected.get(p).is_some_and(
+                        |n| n.directory == e.directory && (n.directory || n.size == e.size)
+                    )),
+            "STALE_SOURCE: namespace changed during stream"
+        );
+        for (path, old) in &self.stream_fingerprints {
+            let target = self.checked_path(path, false)?;
+            if let Some(entry) = self.stream_installed.get(path) {
+                self.validate_installed(path, entry)?;
+            } else {
+                ensure!(
+                    *old == fingerprint(&fs::metadata(&target)?),
+                    "STALE_SOURCE: file changed during stream: {path}"
+                );
+            }
+        }
+        for (path, entry) in self
+            .stream_installed
+            .iter()
+            .filter(|(p, _)| !self.stream_fingerprints.contains_key(*p))
+        {
+            self.validate_installed(path, entry)?;
+        }
+        Ok(())
+    }
+    fn start_hash_stream(
+        &mut self,
+        _stage_paths: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let mut metrics = self.metrics.get();
+        metrics.full_scans += 1;
+        metrics.files_enumerated += self.stream_paths.len() as u64;
+        self.metrics.set(metrics);
+        Ok(())
+    }
+    fn next_hash_chunk(&mut self, _io: &mut (impl Read + Write)) -> Result<Option<Manifest>> {
+        let mut files = Manifest::new();
+        while files.len() < crate::protocol::SCAN_STREAM_CHUNK_FILES {
+            let Some((path, original)) = self
+                .stream_queue
+                .as_mut()
+                .context("no namespace scan")?
+                .pop_front()
+            else {
+                break;
+            };
+            let source = self.checked_path(&path, false)?;
+            let before = fingerprint(
+                &fs::metadata(&source).with_context(|| format!("STALE_SOURCE: {path}"))?,
+            );
+            ensure!(before == original, "STALE_SOURCE: {path}");
+            let entry = if let Some(cached) = self
+                .cache
+                .get(&path)
+                .filter(|c| !before.is_empty() && c.metadata == before)
+            {
+                cached.entry.clone()
+            } else {
+                let (hash, size) = hash_reader(File::open(&source)?)?;
+                ensure!(
+                    fingerprint(&fs::metadata(&source)?) == before,
+                    "STALE_SOURCE: {path}"
+                );
+                let entry = Entry { hash, size };
+                self.cache.insert(
+                    path.clone(),
+                    CachedEntry {
+                        metadata: before,
+                        entry: entry.clone(),
+                    },
+                );
+                let mut metrics = self.metrics.get();
+                metrics.files_hashed += 1;
+                metrics.bytes_hashed += size;
+                self.metrics.set(metrics);
+                entry
+            };
+            files.insert(path, entry);
+        }
+        Ok((!files.is_empty()).then_some(files))
+    }
+    fn discard_scan(&mut self) -> Result<()> {
+        self.stream_queue = None;
+        self.stream_original = None;
+        self.stream_fingerprints.clear();
+        self.stream_installed.clear();
+        self.stream_installed_fingerprints.clear();
+        self.persist_cache()
+    }
+    fn commit_scan(&mut self) -> Result<()> {
+        self.validate_scan_snapshot()?;
+        self.stream_queue = None;
+        self.cache.retain(|p, _| self.stream_paths.contains(p));
+        self.cache_trusted = true;
+        self.force_full_scan = false;
+        self.cache_modified = false;
+        self.pending_cache_invalidation = false;
+        self.dirty_paths.clear();
+        self.known_dirty_paths.clear();
+        self.persist_cache()
     }
     fn scan(&mut self) -> Result<Manifest> {
         fn walk(
@@ -920,6 +1403,27 @@ impl Store for LocalStore {
         VerifiedStaged::from_digest(temp, expected, &hash, size)
     }
 
+    fn staging_directory(&self) -> Option<PathBuf> {
+        Some(self.private.clone())
+    }
+
+    fn install_received(
+        &mut self,
+        path: &str,
+        expected: Option<&str>,
+        entry: &Entry,
+        staged: VerifiedStaged,
+    ) -> Result<()> {
+        ensure!(staged.entry() == entry, "staged entry mismatch");
+        staged.validate()?;
+        if staged.path().parent() == Some(self.private.as_path()) && !staged.metadata.is_empty() {
+            self.install_file(path, expected, entry, staged.file, staged.metadata)
+        } else {
+            // SAF and foreign/cross-filesystem sources keep the verified-copy fallback.
+            self.install(path, expected, entry, &staged)
+        }
+    }
+
     fn install(
         &mut self,
         path: &str,
@@ -928,73 +1432,166 @@ impl Store for LocalStore {
         staged: &VerifiedStaged,
     ) -> Result<()> {
         ensure!(staged.entry() == entry, "staged entry mismatch");
+        staged.validate()?;
         let mut temp = NamedTempFile::new_in(&self.private)?;
-        let size = std::io::copy(&mut File::open(staged.path())?, &mut temp)?;
+        let (hash, size) = copy_and_hash(File::open(staged.path())?, &mut temp)?;
         let mut metrics = self.metrics.get();
         metrics.staging_copies += 1;
+        metrics.files_hashed += 1;
+        metrics.bytes_hashed += size;
         self.metrics.set(metrics);
-        ensure!(size == entry.size, "staged size changed");
-        ensure!(!self.excluded(path), "ignored path: {path}");
-        let target = self.checked_path(path, true)?;
-        let current = self.current(path)?;
-        // A repeated operation after a lost acknowledgment is harmless.
-        if current.as_ref() == Some(entry) {
-            crate::trace::remote_installed(path, &entry.hash);
-            return Ok(());
-        }
         ensure!(
-            current.as_ref().map(|e| e.hash.as_str()) == expected,
-            "STALE_TARGET: {path}"
+            hash == entry.hash && size == entry.size,
+            "staged content changed"
         );
-        temp.as_file().sync_all()?;
-        let id = random_id()?;
-        let journal_path = self.private.join("recovery").join(format!("{id}.json"));
-        let backup = self.private.join("recovery").join(&id);
-        let mut journal = Journal {
-            path: path.into(),
-            backup: id,
-            finished: false,
-            new_hash: Some(entry.hash.clone()),
-            old_hash: current.as_ref().map(|entry| entry.hash.clone()),
-        };
-        atomic_json(&journal_path, &journal)?;
-        if current.is_some() {
-            // Keep the actual displaced inode, including writes through already-open handles.
-            fs::rename(&target, &backup)?;
-            sync_dir(target.parent().unwrap())?;
-            sync_dir(backup.parent().unwrap())?;
-            let (displaced, _) = hash_reader(File::open(&backup)?)?;
-            let mut metrics = self.metrics.get();
-            metrics.files_hashed += 1;
-            metrics.bytes_hashed += backup.metadata()?.len();
-            self.metrics.set(metrics);
-            if Some(displaced.as_str()) != expected {
-                self.recover()?;
-                bail!("STALE_TARGET: changed at commit; preserved in recovery: {path}");
-            }
-        }
-        // No clobber: if an editor recreated the path, preserve it and the displaced version.
-        if let Err(e) = temp.persist_noclobber(&target) {
-            self.recover()?;
-            return Err(anyhow::anyhow!("STALE_TARGET: {path}: {e}"));
-        }
-        sync_dir(target.parent().unwrap())?;
-        journal.finished = true;
-        atomic_json(&journal_path, &journal)?;
-        crate::trace::remote_installed(path, &entry.hash);
-        self.invalidate_path(path);
-        Self::queue_cache_invalidation(
-            &self.root,
-            false,
-            Some(&std::collections::BTreeSet::from([path.to_owned()])),
-        )?;
-        Ok(())
+        staged.validate()?;
+        let metadata = fingerprint(&temp.as_file().metadata()?);
+        self.install_file(path, expected, entry, temp, metadata)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn received(directory: &Path, bytes: &[u8]) -> VerifiedStaged {
+        let mut file = NamedTempFile::new_in(directory).unwrap();
+        let (hash, size) = copy_and_hash(bytes, &mut file).unwrap();
+        let entry = Entry { hash, size };
+        VerifiedStaged::from_digest(file, &entry, &entry.hash, size).unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn received_install_preserves_inode_and_skips_unchanged_final_hash() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        store
+            .stream_namespace(&mut std::io::Cursor::new(Vec::new()))
+            .unwrap();
+        let staged = received(&store.private, b"received bytes");
+        let entry = staged.entry().clone();
+        let inode = staged.path().metadata().unwrap().ino();
+        let path = staged.path().to_owned();
+        store
+            .install_received("nested/file", None, &entry, staged)
+            .unwrap();
+        assert_eq!(
+            root.path().join("nested/file").metadata().unwrap().ino(),
+            inode
+        );
+        assert!(!path.exists());
+        store.validate_scan_snapshot().unwrap();
+        assert_eq!(store.metrics().staging_copies, 0);
+        assert_eq!(store.metrics().files_hashed, 0);
+        assert_eq!(
+            fs::read(root.path().join("nested/file")).unwrap(),
+            b"received bytes"
+        );
+        // Unknown identity must fall back to reading and checking the payload.
+        store.stream_installed_fingerprints.clear();
+        store.validate_scan_snapshot().unwrap();
+        assert_eq!(store.metrics().files_hashed, 1);
+        assert_eq!(store.metrics().bytes_hashed, entry.size);
+        fs::write(root.path().join("nested/file"), b"modified bytes").unwrap();
+        assert!(store
+            .validate_scan_snapshot()
+            .unwrap_err()
+            .to_string()
+            .contains("STALE_TARGET"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn received_overwrite_preserves_displaced_inode_for_recovery() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        fs::write(root.path().join("file"), b"old").unwrap();
+        let old_inode = root.path().join("file").metadata().unwrap().ino();
+        let old = store.current("file").unwrap().unwrap();
+        let staged = received(&store.private, b"new");
+        let entry = staged.entry().clone();
+        let new_inode = staged.path().metadata().unwrap().ino();
+        store
+            .install_received("file", Some(&old.hash), &entry, staged)
+            .unwrap();
+        assert_eq!(
+            root.path().join("file").metadata().unwrap().ino(),
+            new_inode
+        );
+        assert!(fs::read_dir(store.private.join("recovery"))
+            .unwrap()
+            .any(|item| {
+                let path = item.unwrap().path();
+                path.metadata().unwrap().ino() == old_inode && fs::read(path).unwrap() == b"old"
+            }));
+        store.recover().unwrap();
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"new");
+        assert_eq!(store.metrics().staging_copies, 0);
+    }
+
+    #[test]
+    fn foreign_received_stage_uses_verified_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        let staged = received(foreign.path(), b"payload");
+        let entry = staged.entry().clone();
+        let path = staged.path().to_owned();
+        store
+            .install_received("file", None, &entry, staged)
+            .unwrap();
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"payload");
+        assert_eq!(store.metrics().staging_copies, 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn changed_verified_stage_never_replaces_target() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        fs::write(root.path().join("file"), b"old").unwrap();
+        let old = store.current("file").unwrap().unwrap();
+        let staged = received(&store.private, b"new");
+        let entry = staged.entry().clone();
+        fs::write(staged.path(), b"bad").unwrap();
+        assert!(store
+            .install_received("file", Some(&old.hash), &entry, staged)
+            .is_err());
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"old");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edited_installed_file_is_rehashed_and_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        store
+            .stream_namespace(&mut std::io::Cursor::new(Vec::new()))
+            .unwrap();
+        let staged = received(&store.private, b"good");
+        let entry = staged.entry().clone();
+        store
+            .install_received("file", None, &entry, staged)
+            .unwrap();
+        let target = root.path().join("file");
+        let modified = target.metadata().unwrap().modified().unwrap();
+        fs::write(&target, b"evil").unwrap();
+        File::open(&target)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(store
+            .validate_scan_snapshot()
+            .unwrap_err()
+            .to_string()
+            .contains("STALE_TARGET"));
+        assert_eq!(store.metrics().files_hashed, 1);
+    }
+
     #[test]
     fn verified_staging_carries_the_checked_entry_and_cleans_up() {
         let mut file = NamedTempFile::new().unwrap();

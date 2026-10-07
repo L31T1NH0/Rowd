@@ -275,7 +275,7 @@ pub fn discover(
             continue;
         }
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-        match crate::io_retry::interrupted("recv_from", || socket.recv_from(&mut buf)) {
+        match crate::io_retry::poll("recv_from", || socket.recv_from(&mut buf)) {
             Ok((len, source)) => {
                 if let Ok(candidate) =
                     decode(&buf[..len]).and_then(|packet| peer(packet, &nonce, source))

@@ -15,6 +15,81 @@ pub struct Entry {
 }
 pub type Manifest = BTreeMap<String, Entry>;
 
+/// Physical namespace evidence, independent of content hashes and committed base.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamespaceEntry {
+    pub size: u64,
+    pub modified: u64,
+    pub directory: bool,
+}
+pub type Namespace = BTreeMap<String, NamespaceEntry>;
+
+pub fn manifest_namespace(files: &Manifest) -> Namespace {
+    files
+        .iter()
+        .map(|(p, e)| {
+            (
+                p.clone(),
+                NamespaceEntry {
+                    size: e.size,
+                    modified: 0,
+                    directory: false,
+                },
+            )
+        })
+        .collect()
+}
+
+pub fn validate_namespace(files: &Namespace) -> Result<()> {
+    ensure!(
+        files.values().filter(|e| !e.directory).count() <= MAX_FILES,
+        "too many files"
+    );
+    // Bound directories too: an adversarial peer must not exhaust memory with empty directories.
+    ensure!(files.len() <= MAX_FILES * 2, "too many namespace entries");
+    let mut names = BTreeMap::<String, (String, bool)>::new();
+    for (path, entry) in files {
+        validate_path(path)?;
+        ensure!(
+            entry.directory || entry.size <= MAX_FILE,
+            "file exceeds 8 GiB: {path}"
+        );
+        for end in path
+            .match_indices('/')
+            .map(|(i, _)| i)
+            .chain(std::iter::once(path.len()))
+        {
+            let name = &path[..end];
+            let directory = end != path.len() || entry.directory;
+            if let Some((previous, was_directory)) =
+                names.insert(name.to_lowercase(), (name.into(), directory))
+            {
+                ensure!(previous == name, "case collision: {name}");
+                ensure!(
+                    was_directory == directory,
+                    "file/directory collision: {name}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_cross_namespace(pc: &Namespace, android: &Namespace) -> Result<()> {
+    validate_namespace(pc)?;
+    validate_namespace(android)?;
+    let mut union = pc.clone();
+    for (path, entry) in android {
+        if let Some(previous) = union.insert(path.clone(), entry.clone()) {
+            ensure!(
+                previous.directory == entry.directory,
+                "file/directory collision: {path}"
+            );
+        }
+    }
+    validate_namespace(&union)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -76,7 +151,13 @@ pub fn validate_path(path: &str) -> Result<()> {
             bail!("reserved filename");
         }
     }
-    ensure!(path.split('/').next() != Some(".rowd"), "reserved path");
+    ensure!(
+        !path
+            .split('/')
+            .next()
+            .is_some_and(|part| part.eq_ignore_ascii_case(".rowd")),
+        "reserved path"
+    );
     Ok(())
 }
 

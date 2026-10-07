@@ -10,7 +10,9 @@ use std::io::{Read, Write};
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MANIFEST_CHUNK_FILES: usize = 1024;
-pub const PROTOCOL_VERSION: u32 = 12;
+/// Small batches bound latency to first transfer independently of ACK batching.
+pub const SCAN_STREAM_CHUNK_FILES: usize = 32;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -86,9 +88,69 @@ pub enum Message {
     },
     Ready,
     Scan,
+    ScanStreamBegin {
+        scan_id: String,
+        binding: String,
+    },
+    NamespaceChunk {
+        scan_id: String,
+        sequence: u64,
+        entries: crate::model::Namespace,
+    },
+    NamespaceEnd {
+        scan_id: String,
+        last_sequence: u64,
+        total_entries: usize,
+        namespace_digest: String,
+    },
+    HashStreamBegin {
+        scan_id: String,
+        binding: String,
+    },
+    HashStageHint {
+        scan_id: String,
+        paths: std::collections::BTreeSet<String>,
+    },
+    HashRelease {
+        scan_id: String,
+        paths: std::collections::BTreeSet<String>,
+    },
+    HashNext {
+        scan_id: String,
+        sequence: u64,
+    },
+    HashChunk {
+        scan_id: String,
+        sequence: u64,
+        files: Manifest,
+    },
+    HashStreamEnd {
+        scan_id: String,
+        last_sequence: u64,
+        total_entries: usize,
+        metrics: crate::storage::StoreMetrics,
+        pipeline: crate::storage::ScanStreamMetrics,
+    },
+    /// Receipt only: bytes are verified in private staging, never installed or ACKed.
+    StagePut {
+        scan_id: String,
+        sequence: u64,
+        path: String,
+        entry: Entry,
+        expected: Option<String>,
+    },
+    StageReceived {
+        scan_id: String,
+        sequence: u64,
+    },
+    InstallStaged {
+        scan_id: String,
+        sequence: u64,
+    },
     AuditPreempt {
         shares: Vec<String>,
     },
+    ScanAlive,
     ScanReady,
     ScanContinue,
     ScanDeferred,
@@ -130,6 +192,9 @@ pub enum Message {
         conflicts: usize,
         base_token: String,
     },
+    ShareError {
+        error: ShareError,
+    },
     Error {
         message: String,
     },
@@ -159,7 +224,21 @@ impl Message {
             Self::Proof { .. } => "Proof",
             Self::Ready => "Ready",
             Self::Scan => "Scan",
+            Self::ScanStreamBegin { .. } => "ScanStreamBegin",
+            Self::NamespaceChunk { .. } => "NamespaceChunk",
+            Self::NamespaceEnd { .. } => "NamespaceEnd",
+            Self::HashStreamBegin { .. } => "HashStreamBegin",
+            Self::HashStageHint { .. } => "HashStageHint",
+            Self::HashRelease { .. } => "HashRelease",
+            Self::HashNext { .. } => "HashNext",
+            Self::HashChunk { .. } => "HashChunk",
+            Self::HashStreamEnd { .. } => "HashStreamEnd",
+            Self::StagePut { .. } => "StagePut",
+            Self::StageReceived { .. } => "StageReceived",
+            Self::InstallStaged { .. } => "InstallStaged",
             Self::AuditPreempt { .. } => "AuditPreempt",
+            Self::ScanAlive => "ScanAlive",
+            Self::ShareError { .. } => "ShareError",
             Self::ScanReady => "ScanReady",
             Self::ScanContinue => "ScanContinue",
             Self::ScanDeferred => "ScanDeferred",
@@ -181,9 +260,150 @@ impl Message {
     fn trace_metadata(&self, bytes: usize) -> serde_json::Value {
         if let Self::Scoped { share_id, message } = self {
             serde_json::json!({"message_type":message.trace_type(),"share_id":share_id,"payload_size":bytes})
+        } else if let Self::ShareError { error } = self {
+            serde_json::json!({"message_type":self.trace_type(),"payload_size":bytes,"share_error":error})
         } else {
             serde_json::json!({"message_type":self.trace_type(),"payload_size":bytes})
         }
+    }
+}
+
+/// Remote errors remain typed through anyhow contexts; never reflect them back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareError {
+    pub side: String,
+    pub share_id: Option<String>,
+    pub operation: String,
+    pub relative_path: Option<String>,
+    pub kind: String,
+    pub message: String,
+    pub stream_reusable: bool,
+}
+impl std::fmt::Display for ShareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "peer: {} share={:?} operation={} path={:?} kind={}: {}",
+            self.side, self.share_id, self.operation, self.relative_path, self.kind, self.message
+        )
+    }
+}
+impl std::error::Error for ShareError {}
+
+#[derive(Debug)]
+struct PeerError(String);
+impl std::fmt::Display for PeerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "peer: {}", self.0)
+    }
+}
+impl std::error::Error for PeerError {}
+
+/// A failed frame/Blob cannot carry another control frame safely.
+#[derive(Debug)]
+pub struct IncompleteFrame;
+impl std::fmt::Display for IncompleteFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("incomplete transport frame")
+    }
+}
+impl std::error::Error for IncompleteFrame {}
+
+#[derive(Debug)]
+pub struct LocalOperation {
+    pub operation: String,
+    pub path: Option<String>,
+    pub kind: String,
+    message: String,
+}
+impl std::fmt::Display for LocalOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {:?}: {}", self.operation, self.path, self.message)
+    }
+}
+impl std::error::Error for LocalOperation {}
+impl LocalOperation {
+    pub fn attach(error: anyhow::Error, operation: &str, path: Option<&str>) -> anyhow::Error {
+        let context = Self {
+            operation: operation.into(),
+            path: path.map(str::to_owned),
+            kind: "filesystem".into(),
+            message: format!("{error:#}"),
+        };
+        error.context(context)
+    }
+}
+
+#[derive(Debug)]
+pub struct ErrorReported(pub String);
+impl std::fmt::Display for ErrorReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for ErrorReported {}
+
+pub fn is_peer_error(error: &anyhow::Error) -> bool {
+    error.is::<ShareError>() || error.is::<PeerError>()
+}
+
+pub fn transport_dead(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+        )
+    })
+}
+
+/// Best effort only at a control-frame boundary, never inside an unfinished Blob.
+pub fn send_share_error(
+    io: &mut impl Write,
+    error: &anyhow::Error,
+    side: &str,
+    share_id: Option<&str>,
+    operation: &str,
+    path: Option<&str>,
+    kind: &str,
+) {
+    if is_peer_error(error)
+        || transport_dead(error)
+        || error.is::<IncompleteFrame>()
+        || error.is::<ErrorReported>()
+    {
+        return;
+    }
+    let local = error.downcast_ref::<LocalOperation>();
+    let operation = local.map(|l| l.operation.as_str()).unwrap_or(operation);
+    let path = local.and_then(|l| l.path.as_deref()).or(path);
+    let kind = local.map(|l| l.kind.as_str()).unwrap_or(kind);
+    let _ = send(
+        io,
+        &Message::ShareError {
+            error: ShareError {
+                side: side.into(),
+                share_id: share_id.map(str::to_owned),
+                operation: operation.into(),
+                relative_path: path.map(str::to_owned),
+                kind: kind.into(),
+                message: format!("{error:#}"),
+                // No recovery handshake exists for a failed, unfinished Share round.
+                stream_reusable: false,
+            },
+        },
+    );
+}
+
+pub(crate) fn check_peer_error(message: Message) -> Result<Message> {
+    match message {
+        Message::Error { message } => Err(PeerError(message).into()),
+        Message::ShareError { error } => Err(error.into()),
+        other => Ok(other),
     }
 }
 
@@ -212,6 +432,60 @@ fn trace_message(name: &str, message: &Message, bytes: usize) {
         name,
         message.trace_metadata(bytes)
     );
+    let event = match message {
+        Message::ScanStreamBegin { scan_id, binding } => Some((
+            "NAMESPACE_BEGIN",
+            serde_json::json!({"scan_id":scan_id,"binding":binding}),
+        )),
+        Message::NamespaceChunk {
+            scan_id,
+            sequence,
+            entries,
+        } => Some((
+            "NAMESPACE_CHUNK",
+            serde_json::json!({"scan_id":scan_id,"sequence":sequence,"entries":entries.len()}),
+        )),
+        Message::NamespaceEnd {
+            scan_id,
+            last_sequence,
+            total_entries,
+            ..
+        } => Some((
+            "NAMESPACE_END",
+            serde_json::json!({"scan_id":scan_id,"last_sequence":last_sequence,"entries":total_entries}),
+        )),
+        Message::HashStreamBegin { scan_id, .. } => {
+            Some(("HASH_STREAM_BEGIN", serde_json::json!({"scan_id":scan_id})))
+        }
+        Message::HashChunk {
+            scan_id,
+            sequence,
+            files,
+        } => Some((
+            "HASH_CHUNK",
+            serde_json::json!({"scan_id":scan_id,"sequence":sequence,"files":files.len()}),
+        )),
+        Message::HashStreamEnd {
+            scan_id,
+            last_sequence,
+            total_entries,
+            pipeline,
+            ..
+        } => Some((
+            "HASH_STREAM_END",
+            serde_json::json!({"scan_id":scan_id,"last_sequence":last_sequence,"files":total_entries,"metrics":pipeline}),
+        )),
+        _ => None,
+    };
+    if let Some((event, mut metadata)) = event {
+        metadata["protocol_event"] = name.into();
+        crate::trace_event!(
+            crate::trace::Level::Debug,
+            crate::trace::Component::Scanner,
+            event,
+            metadata
+        );
+    }
 }
 
 pub fn send(io: &mut impl Write, message: &Message) -> Result<()> {
@@ -232,7 +506,7 @@ pub fn send(io: &mut impl Write, message: &Message) -> Result<()> {
             serde_json::json!({"message_type":message.trace_type(),"error":crate::trace::TraceError::new("protocol","send",error)})
         ),
     }
-    result?;
+    result.context(IncompleteFrame)?;
     Ok(())
 }
 
@@ -245,10 +519,7 @@ fn receive_inner(io: &mut impl Read) -> Result<Message> {
     io.read_exact(&mut data)?;
     let message: Message = serde_json::from_slice(&data)?;
     trace_message("PROTOCOL_RECEIVE", &message, len);
-    if let Message::Error { message } = message {
-        anyhow::bail!("peer: {message}");
-    }
-    Ok(message)
+    check_peer_error(message)
 }
 
 pub fn receive(io: &mut impl Read) -> Result<Message> {
@@ -280,6 +551,14 @@ pub fn receive_after_first(io: &mut impl Read, first: u8) -> Result<Message> {
     receive(&mut Prefixed(io, Some(first)))
 }
 
+pub fn receive_for_after_first(io: &mut impl Read, first: u8, share: &str) -> Result<Message> {
+    let Message::Scoped { share_id, message } = receive_after_first(io, first)? else {
+        anyhow::bail!("missing Share context")
+    };
+    ensure!(share_id == share, "wrong Share context");
+    check_peer_error(*message)
+}
+
 pub fn send_for(io: &mut impl Write, share_id: &str, message: Message) -> Result<()> {
     send(
         io,
@@ -303,10 +582,236 @@ pub fn receive_for(io: &mut impl Read, share_id: &str) -> Result<Message> {
         serde_json::json!({"expected_share":share_id,"actual_share":actual}),
     );
     ensure!(actual == share_id, "wrong Share context");
-    if let Message::Error { message } = *message {
-        anyhow::bail!("peer: {message}");
+    check_peer_error(*message)
+}
+
+pub fn namespace_digest(namespace: &crate::model::Namespace) -> Result<String> {
+    use sha2::Digest;
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(namespace)?)))
+}
+
+/// Per-round receiver. A new connection never inherits sequence or scan identity.
+pub struct ScanStream {
+    pub scan_id: String,
+    pub binding: String,
+    pub namespace: crate::model::Namespace,
+    pub sequence: u64,
+    pub seen: std::collections::BTreeSet<String>,
+    pub ended: bool,
+}
+impl ScanStream {
+    pub fn receive_namespace(io: &mut (impl Read + Write), share: &str) -> Result<Self> {
+        let first = loop {
+            match receive_for(io, share)? {
+                Message::ScanAlive => continue,
+                Message::ScanDeferred => return Err(crate::sync::ScanDeferred.into()),
+                message => break message,
+            }
+        };
+        let Message::ScanStreamBegin { scan_id, binding } = first else {
+            anyhow::bail!("expected scan stream begin")
+        };
+        crate::model::validate_hash(&scan_id)?;
+        ensure!(binding.len() <= 65536, "invalid scan binding");
+        let mut stream = Self {
+            scan_id,
+            binding,
+            namespace: Default::default(),
+            sequence: 0,
+            seen: Default::default(),
+            ended: false,
+        };
+        loop {
+            match receive_for(io, share)? {
+                Message::NamespaceChunk {
+                    scan_id,
+                    sequence,
+                    entries,
+                } => {
+                    ensure!(
+                        scan_id == stream.scan_id && sequence == stream.sequence,
+                        "misaligned namespace chunk"
+                    );
+                    ensure!(
+                        !entries.is_empty() && entries.len() <= SCAN_STREAM_CHUNK_FILES,
+                        "invalid namespace chunk size"
+                    );
+                    for (path, entry) in entries {
+                        ensure!(
+                            stream.namespace.insert(path, entry).is_none(),
+                            "duplicate namespace path"
+                        );
+                    }
+                    ensure!(
+                        stream.namespace.len() <= crate::model::MAX_FILES * 2,
+                        "too many namespace entries"
+                    );
+                    stream.sequence += 1;
+                }
+                Message::NamespaceEnd {
+                    scan_id,
+                    last_sequence,
+                    total_entries,
+                    namespace_digest: digest,
+                } => {
+                    ensure!(
+                        scan_id == stream.scan_id
+                            && last_sequence == stream.sequence
+                            && total_entries == stream.namespace.len(),
+                        "misaligned namespace end"
+                    );
+                    ensure!(
+                        digest == namespace_digest(&stream.namespace)?,
+                        "namespace digest mismatch"
+                    );
+                    crate::model::validate_namespace(&stream.namespace)?;
+                    stream.sequence = 0;
+                    return Ok(stream);
+                }
+                Message::ScanAlive => {}
+                Message::ScanDeferred => return Err(crate::sync::ScanDeferred.into()),
+                _ => anyhow::bail!("unexpected namespace frame"),
+            }
+        }
     }
-    Ok(*message)
+    pub fn next(
+        &mut self,
+        io: &mut (impl Read + Write),
+        share: &str,
+    ) -> Result<(Option<Manifest>, crate::storage::StoreMetrics)> {
+        self.next_with_control(io, share, &mut || None)
+            .map(|(files, metrics, _)| (files, metrics))
+    }
+    pub fn next_with_control(
+        &mut self,
+        io: &mut (impl Read + Write),
+        share: &str,
+        control: &mut impl FnMut() -> Option<Vec<String>>,
+    ) -> Result<(
+        Option<Manifest>,
+        crate::storage::StoreMetrics,
+        crate::storage::ScanStreamMetrics,
+    )> {
+        struct Waiting<'a, T, F> {
+            io: &'a mut T,
+            share: &'a str,
+            control: &'a mut F,
+            preempted: bool,
+            alive: std::time::Instant,
+        }
+        impl<T: Read + Write, F: FnMut() -> Option<Vec<String>>> Read for Waiting<'_, T, F> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                loop {
+                    match crate::io_retry::poll("hash_stream_read", || self.io.read(bytes)) {
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            if self.alive.elapsed() >= std::time::Duration::from_secs(90) {
+                                return Err(std::io::ErrorKind::TimedOut.into());
+                            }
+                            if !self.preempted {
+                                if let Some(shares) = (self.control)().filter(|s| !s.is_empty()) {
+                                    send_for(self.io, self.share, Message::AuditPreempt { shares })
+                                        .map_err(std::io::Error::other)?;
+                                    crate::trace_event!(
+                                        crate::trace::Level::Info,
+                                        crate::trace::Component::Scanner,
+                                        "STREAM_PREEMPT_REQUESTED",
+                                        serde_json::json!({"phase":"hash_wait","frame_boundary":true})
+                                    );
+                                    self.preempted = true;
+                                }
+                            }
+                        }
+                        result => return result,
+                    }
+                }
+            }
+        }
+        ensure!(!self.ended, "hash stream already ended");
+        send_for(
+            io,
+            share,
+            Message::HashNext {
+                scan_id: self.scan_id.clone(),
+                sequence: self.sequence,
+            },
+        )?;
+        let mut waiting = Waiting {
+            io,
+            share,
+            control,
+            preempted: false,
+            alive: std::time::Instant::now(),
+        };
+        loop {
+            match receive_for(&mut waiting, share)? {
+                Message::HashChunk {
+                    scan_id,
+                    sequence,
+                    files,
+                } => {
+                    if waiting.preempted {
+                        continue;
+                    }
+                    ensure!(
+                        scan_id == self.scan_id && sequence == self.sequence,
+                        "misaligned hash chunk"
+                    );
+                    ensure!(
+                        !files.is_empty() && files.len() <= SCAN_STREAM_CHUNK_FILES,
+                        "invalid hash chunk size"
+                    );
+                    crate::model::validate_manifest(&files)?;
+                    for (path, entry) in &files {
+                        let physical = self
+                            .namespace
+                            .get(path)
+                            .context("hash path absent from namespace")?;
+                        ensure!(
+                            !physical.directory
+                                && physical.size == entry.size
+                                && self.seen.insert(path.clone()),
+                            "hash differs from namespace or is duplicated"
+                        );
+                    }
+                    self.sequence += 1;
+                    return Ok((Some(files), Default::default(), Default::default()));
+                }
+                Message::HashStreamEnd {
+                    scan_id,
+                    last_sequence,
+                    total_entries,
+                    metrics,
+                    pipeline,
+                } => {
+                    if waiting.preempted {
+                        continue;
+                    }
+                    ensure!(
+                        scan_id == self.scan_id
+                            && last_sequence == self.sequence
+                            && total_entries == self.seen.len(),
+                        "misaligned hash stream end"
+                    );
+                    ensure!(
+                        self.seen.len() == self.namespace.values().filter(|e| !e.directory).count(),
+                        "incomplete hash stream"
+                    );
+                    self.ended = true;
+                    return Ok((None, metrics, pipeline));
+                }
+                Message::ScanAlive => {
+                    waiting.alive = std::time::Instant::now();
+                }
+                Message::ScanDeferred => return Err(crate::sync::ScanDeferred.into()),
+                _ => anyhow::bail!("unexpected hash frame"),
+            }
+        }
+    }
 }
 
 pub fn send_manifest(io: &mut impl Write, share_id: &str, files: &Manifest) -> Result<()> {
@@ -399,11 +904,14 @@ pub fn receive_manifest_with_metrics(
 }
 
 pub fn copy_exact(reader: &mut impl Read, writer: &mut impl Write, size: u64) -> Result<()> {
-    ensure!(size <= MAX_FILE, "file too large");
-    let n = std::io::copy(&mut reader.take(size), writer)?;
-    ensure!(n == size, "truncated transfer: {n}/{size}");
-    writer.flush()?;
-    Ok(())
+    (|| -> Result<()> {
+        ensure!(size <= MAX_FILE, "file too large");
+        let n = std::io::copy(&mut reader.take(size), writer)?;
+        ensure!(n == size, "truncated transfer: {n}/{size}");
+        writer.flush()?;
+        Ok(())
+    })()
+    .context(IncompleteFrame)
 }
 
 fn auth_mac(secret: &str, nonce: &str, pair_id: &str, device_id: &str) -> Result<Hmac<Sha256>> {
@@ -693,4 +1201,68 @@ pub fn server_auth_with_first(
         ),
     }
     result
+}
+
+#[cfg(test)]
+mod error_regressions {
+    use super::*;
+    #[test]
+    fn local_pc_cause_survives_context_and_remote_errors_never_echo() {
+        let local = LocalOperation::attach(
+            anyhow::anyhow!("storage permission denied"),
+            "snapshot",
+            Some("screenshots/a.png"),
+        );
+        let mut bytes = vec![];
+        send_share_error(
+            &mut bytes,
+            &local,
+            "pc",
+            Some("share"),
+            "round",
+            None,
+            "protocol",
+        );
+        let remote = receive(&mut std::io::Cursor::new(bytes))
+            .unwrap_err()
+            .context("round failed");
+        let cause = remote.downcast_ref::<ShareError>().unwrap();
+        assert_eq!(cause.side, "pc");
+        assert_eq!(cause.operation, "snapshot");
+        assert_eq!(cause.kind, "filesystem");
+        assert_eq!(cause.share_id.as_deref(), Some("share"));
+        assert_eq!(cause.relative_path.as_deref(), Some("screenshots/a.png"));
+        assert!(cause.message.contains("storage permission denied"));
+        assert!(!cause.stream_reusable);
+        let mut reflected = vec![];
+        send_share_error(
+            &mut reflected,
+            &remote,
+            "responder",
+            None,
+            "round",
+            None,
+            "protocol",
+        );
+        assert!(reflected.is_empty());
+    }
+    #[test]
+    fn disconnect_and_incomplete_blob_do_not_invent_logical_errors() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let error = anyhow::Error::from(std::io::Error::from(kind));
+            let mut bytes = vec![];
+            send_share_error(&mut bytes, &error, "pc", None, "blob", None, "transport");
+            assert!(bytes.is_empty());
+            assert!(transport_dead(&error));
+        }
+        let error = copy_exact(&mut &b"partial"[..], &mut Vec::new(), 100).unwrap_err();
+        let mut bytes = vec![];
+        send_share_error(&mut bytes, &error, "pc", None, "blob", None, "filesystem");
+        assert!(bytes.is_empty());
+        assert!(error.is::<IncompleteFrame>());
+    }
 }

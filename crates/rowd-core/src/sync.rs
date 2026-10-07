@@ -49,6 +49,7 @@ pub struct Report {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShareMetrics {
     pub activation_ms: u128,
     pub share_queue_wait_ms: u128,
@@ -81,6 +82,13 @@ pub struct ShareMetrics {
     pub socket_idle_ms: u128,
     pub peak_in_flight_files: u64,
     pub peak_staged_bytes: u64,
+    pub hash_stream_ms: u128,
+    pub transfers_completed_before_hash_end: u64,
+    pub transfers_started_before_hash_end: u64,
+    pub files_received_for_deferred_install: u64,
+    pub time_to_first_transfer_ms: Option<u128>,
+    #[serde(flatten)]
+    pub scan_stream: crate::storage::ScanStreamMetrics,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -178,10 +186,15 @@ fn persist_state(
     Ok(())
 }
 
-fn receive_blob(io: &mut impl Read, entry: &Entry) -> Result<Snapshot> {
-    let mut temp = NamedTempFile::new()?;
+fn receive_blob(io: &mut impl Read, entry: &Entry, directory: Option<&Path>) -> Result<Snapshot> {
+    let mut temp = match directory {
+        Some(directory) => NamedTempFile::new_in(directory),
+        None => NamedTempFile::new(),
+    }
+    .context(protocol::IncompleteFrame)?;
     anyhow::ensure!(entry.size <= crate::model::MAX_FILE, "file too large");
-    let (hash, size) = crate::copy_and_hash(io.take(entry.size), &mut temp)?;
+    let (hash, size) =
+        crate::copy_and_hash(io.take(entry.size), &mut temp).context(protocol::IncompleteFrame)?;
     ensure!(
         size == entry.size,
         "truncated transfer: {size}/{}",
@@ -196,6 +209,7 @@ fn remote_snapshot(
     entry: &Entry,
     first_byte_ms: &mut Option<u128>,
     round_started: Instant,
+    directory: Option<&Path>,
 ) -> Result<Snapshot> {
     let _transfer = trace::transfer_context(share_id, path).enter();
     crate::trace_legacy_event!(
@@ -218,7 +232,9 @@ fn remote_snapshot(
     let Message::Blob { entry: actual } = protocol::receive_for(io, share_id)? else {
         anyhow::bail!("expected blob")
     };
-    ensure!(actual == *entry, "STALE_SOURCE");
+    if actual != *entry {
+        return Err(anyhow::anyhow!("STALE_SOURCE").context(protocol::IncompleteFrame));
+    }
     first_byte_ms.get_or_insert_with(|| round_started.elapsed().as_millis());
     crate::trace_legacy_event!(
         "sync",
@@ -230,7 +246,7 @@ fn remote_snapshot(
         None,
     );
     let started = Instant::now();
-    let blob = receive_blob(io, entry).map_err(|e| {
+    let blob = receive_blob(io, entry, directory).map_err(|e| {
         trace::record_error(
             trace::Component::Transfer,
             "TRANSFER_FAILED",
@@ -272,6 +288,7 @@ fn remote_install(
         None,
         None,
     );
+    let mut source = File::open(staged.path())?;
     protocol::send_for(
         io,
         share_id,
@@ -291,7 +308,7 @@ fn remote_install(
         None,
     );
     let sending = Instant::now();
-    protocol::copy_exact(&mut File::open(staged.path())?, io, entry.size)?;
+    protocol::copy_exact(&mut source, io, entry.size)?;
     crate::trace_legacy_event!(
         "sync",
         "blob_send_end",
@@ -327,6 +344,85 @@ struct PendingPut {
     staged: Snapshot,
 }
 
+struct StagedPut {
+    sequence: u64,
+    path: String,
+    entry: Entry,
+}
+
+struct ReceivedStage {
+    job: IncomingPut,
+    staged: Snapshot,
+}
+
+/// A receipt proves a private, verified copy only. InstallStaged is the separate
+/// operation that performs the target precondition check and returns its ACK.
+fn remote_stage(
+    io: &mut (impl Read + Write),
+    share_id: &str,
+    scan_id: &str,
+    sequence: u64,
+    path: &str,
+    expected: Option<&str>,
+    entry: &Entry,
+    staged: &Snapshot,
+) -> Result<()> {
+    let mut source = File::open(staged.path())?;
+    protocol::send_for(
+        io,
+        share_id,
+        Message::StagePut {
+            scan_id: scan_id.into(),
+            sequence,
+            path: path.into(),
+            entry: entry.clone(),
+            expected: expected.map(str::to_owned),
+        },
+    )?;
+    // There is deliberately no control callback between the header and its bytes.
+    protocol::copy_exact(&mut source, io, entry.size)?;
+    ensure!(
+        matches!(protocol::receive_for(io, share_id)?, Message::StageReceived {
+        scan_id: id, sequence: actual,
+    } if id == scan_id && actual == sequence),
+        "misaligned staging receipt"
+    );
+    Ok(())
+}
+
+fn install_remote_stages(
+    io: &mut (impl Read + Write),
+    store: &mut impl Store,
+    state: &mut State,
+    scan_id: &str,
+    stages: &mut Vec<StagedPut>,
+    report: &mut Report,
+) -> Result<()> {
+    for staged in stages.drain(..) {
+        protocol::send_for(
+            io,
+            &state.share_id,
+            Message::InstallStaged {
+                scan_id: scan_id.into(),
+                sequence: staged.sequence,
+            },
+        )?;
+        let waiting = Instant::now();
+        ensure!(
+            matches!(protocol::receive_for(io, &state.share_id)?, Message::Accept),
+            "expected staged install ACK"
+        );
+        report.metrics.wait_peer_ms += waiting.elapsed().as_millis();
+        state
+            .files
+            .insert(staged.path.clone(), staged.entry.hash.clone());
+        store.acknowledge(&staged.path, &staged.entry)?;
+        report.transferred += 1;
+        report.metrics.control_messages += 2;
+    }
+    Ok(())
+}
+
 struct PendingGet {
     path: String,
     entry: Entry,
@@ -345,9 +441,11 @@ fn receive_put_batch(
     share_id: &str,
     first: IncomingPut,
 ) -> Result<Vec<String>> {
+    let staging_directory = store.staging_directory();
     let (sender, receiver) = sync_channel::<(IncomingPut, Snapshot)>(1);
     let mut installed = Vec::new();
-    std::thread::scope(|scope| -> Result<()> {
+    let result = std::thread::scope(|scope| -> Result<()> {
+        let reader_io = &mut *io;
         let trace_context = trace::current_context();
         let reader = scope.spawn(move || -> Result<()> {
             let _trace_context = trace_context.enter();
@@ -376,15 +474,16 @@ fn receive_put_batch(
                     None,
                 );
                 let receiving = Instant::now();
-                let staged = receive_blob(io, &next.entry).map_err(|e| {
-                    trace::record_error(
-                        trace::Component::Transfer,
-                        "TRANSFER_FAILED",
-                        "transfer",
-                        "receive_put_blob",
-                        e,
-                    )
-                })?;
+                let staged = receive_blob(reader_io, &next.entry, staging_directory.as_deref())
+                    .map_err(|e| {
+                        trace::record_error(
+                            trace::Component::Transfer,
+                            "TRANSFER_FAILED",
+                            "transfer",
+                            "receive_put_blob",
+                            e,
+                        )
+                    })?;
                 crate::trace_legacy_event!(
                     "sync",
                     "blob_receive_end",
@@ -397,7 +496,7 @@ fn receive_put_batch(
                 sender
                     .send((next, staged))
                     .map_err(|_| anyhow::anyhow!("install worker stopped"))?;
-                next = match protocol::receive_for(io, share_id)? {
+                next = match protocol::receive_for(reader_io, share_id)? {
                     Message::Put {
                         path,
                         entry,
@@ -429,7 +528,7 @@ fn receive_put_batch(
                 None,
             );
             let installing = Instant::now();
-            match store.install(&job.path, job.expected.as_deref(), &job.entry, &staged) {
+            match store.install_received(&job.path, job.expected.as_deref(), &job.entry, staged) {
                 Ok(()) => {
                     crate::trace_legacy_event!(
                         "sync",
@@ -448,7 +547,7 @@ fn receive_put_batch(
                         "TRANSFER_FAILED",
                         "filesystem",
                         "install_received_put",
-                        error,
+                        protocol::LocalOperation::attach(error, "install", Some(&job.path)),
                     ))
                 }
             }
@@ -456,11 +555,30 @@ fn receive_put_batch(
         let read_result = reader
             .join()
             .map_err(|_| anyhow::anyhow!("network receiver panicked"))?;
+        read_result.context(protocol::IncompleteFrame)?;
         if let Some(error) = install_error {
             return Err(error);
         }
-        read_result
-    })?;
+        Ok(())
+    });
+    if let Err(error) = &result {
+        if error.is::<protocol::LocalOperation>() {
+            protocol::send_share_error(
+                io,
+                error,
+                if cfg!(target_os = "android") {
+                    "android"
+                } else {
+                    "responder"
+                },
+                Some(share_id),
+                "install",
+                None,
+                "filesystem",
+            );
+        }
+    }
+    result?;
     Ok(installed)
 }
 
@@ -556,7 +674,9 @@ fn drain_gets(
             Some(waiting),
             None,
         );
-        ensure!(actual == job.entry, "STALE_SOURCE");
+        if actual != job.entry {
+            return Err(anyhow::anyhow!("STALE_SOURCE").context(protocol::IncompleteFrame));
+        }
         report.metrics.wait_peer_ms += waiting.elapsed().as_millis();
         report
             .metrics
@@ -572,15 +692,16 @@ fn drain_gets(
             None,
             None,
         );
-        let snapshot = receive_blob(io, &job.entry).map_err(|e| {
-            trace::record_error(
-                trace::Component::Transfer,
-                "TRANSFER_FAILED",
-                "transfer",
-                "receive_get_blob",
-                e,
-            )
-        })?;
+        let snapshot =
+            receive_blob(io, &job.entry, store.staging_directory().as_deref()).map_err(|e| {
+                trace::record_error(
+                    trace::Component::Transfer,
+                    "TRANSFER_FAILED",
+                    "transfer",
+                    "receive_get_blob",
+                    e,
+                )
+            })?;
         crate::trace_legacy_event!(
             "sync",
             "blob_receive_end",
@@ -606,14 +727,14 @@ fn drain_gets(
             None,
         );
         store
-            .install(&job.path, job.expected.as_deref(), &job.entry, &snapshot)
+            .install_received(&job.path, job.expected.as_deref(), &job.entry, snapshot)
             .map_err(|e| {
                 trace::record_error(
                     trace::Component::Transfer,
                     "TRANSFER_FAILED",
                     "filesystem",
                     "install_received_file",
-                    e,
+                    protocol::LocalOperation::attach(e, "install", Some(&job.path)),
                 )
             })?;
         crate::trace_legacy_event!(
@@ -734,25 +855,52 @@ fn receive_scan_gate(
     share_id: &str,
     audit_control: &mut impl FnMut(AuditWait) -> Option<Vec<String>>,
 ) -> Result<Option<Vec<String>>> {
+    receive_scan_gate_with_clock(
+        io,
+        share_id,
+        audit_control,
+        || Instant::now(),
+        Duration::from_secs(90),
+    )
+}
+
+fn receive_scan_gate_with_clock(
+    io: &mut (impl Read + Write),
+    share_id: &str,
+    audit_control: &mut impl FnMut(AuditWait) -> Option<Vec<String>>,
+    clock: impl Fn() -> Instant,
+    inactivity: Duration,
+) -> Result<Option<Vec<String>>> {
     struct Waiting<'a, T, F> {
         io: &'a mut T,
         share_id: &'a str,
         control: &'a mut F,
         sent: Vec<String>,
-        started: Instant,
+        last_alive: Instant,
+        clock: &'a dyn Fn() -> Instant,
+        inactivity: Duration,
     }
     impl<T: Read + Write, F: FnMut(AuditWait) -> Option<Vec<String>>> Read for Waiting<'_, T, F> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             loop {
-                match crate::io_retry::interrupted("scan_gate_read", || self.io.read(buf)) {
+                if (self.clock)().duration_since(self.last_alive) >= self.inactivity {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "scan liveness timeout",
+                    ));
+                }
+                match crate::io_retry::poll("scan_gate_read", || self.io.read(buf)) {
                     Err(error)
                         if matches!(
                             error.kind(),
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                         ) =>
                     {
-                        if self.started.elapsed() >= Duration::from_secs(90) {
-                            return Err(error);
+                        if (self.clock)().duration_since(self.last_alive) >= self.inactivity {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "scan liveness timeout",
+                            ));
                         }
                         if self.sent.is_empty() {
                             if let Some(shares) =
@@ -780,38 +928,48 @@ fn receive_scan_gate(
         share_id,
         control: audit_control,
         sent: Vec::new(),
-        started: Instant::now(),
+        last_alive: clock(),
+        clock: &clock,
+        inactivity,
     };
-    match protocol::receive_for(&mut waiting, share_id)? {
-        Message::ScanDeferred => Ok(Some(waiting.sent)),
-        Message::ScanReady => {
-            if waiting.sent.is_empty() {
-                if let Some(shares) = (waiting.control)(AuditWait::Tick).filter(|s| !s.is_empty()) {
-                    protocol::send_for(
-                        waiting.io,
-                        share_id,
-                        Message::AuditPreempt {
-                            shares: shares.clone(),
-                        },
-                    )?;
-                    waiting.sent = shares;
+    loop {
+        match protocol::receive_for(&mut waiting, share_id)? {
+            Message::ScanAlive => {
+                waiting.last_alive = clock();
+                continue;
+            }
+            Message::ScanDeferred => return Ok(Some(waiting.sent)),
+            Message::ScanReady => {
+                if waiting.sent.is_empty() {
+                    if let Some(shares) =
+                        (waiting.control)(AuditWait::Tick).filter(|s| !s.is_empty())
+                    {
+                        protocol::send_for(
+                            waiting.io,
+                            share_id,
+                            Message::AuditPreempt {
+                                shares: shares.clone(),
+                            },
+                        )?;
+                        waiting.sent = shares;
+                    }
+                }
+                if !waiting.sent.is_empty() {
+                    ensure!(
+                        matches!(
+                            protocol::receive_for(&mut waiting, share_id)?,
+                            Message::ScanDeferred
+                        ),
+                        "expected deferred scan"
+                    );
+                    return Ok(Some(waiting.sent));
+                } else {
+                    protocol::send_for(waiting.io, share_id, Message::ScanContinue)?;
+                    return Ok(None);
                 }
             }
-            if !waiting.sent.is_empty() {
-                ensure!(
-                    matches!(
-                        protocol::receive_for(&mut waiting, share_id)?,
-                        Message::ScanDeferred
-                    ),
-                    "expected deferred scan"
-                );
-                Ok(Some(waiting.sent))
-            } else {
-                protocol::send_for(waiting.io, share_id, Message::ScanContinue)?;
-                Ok(None)
-            }
+            _ => anyhow::bail!("expected scan readiness"),
         }
-        _ => anyhow::bail!("expected scan readiness"),
     }
 }
 
@@ -844,6 +1002,9 @@ pub fn coordinate_with_progress_and_audit_control(
             serde_json::json!({"error":trace::TraceError::new("transfer","coordinate_share",error)})
         );
     }
+    // Clean per-round physical scan evidence on every outcome, without promoting base.
+    // Cache persistence is best effort after the protocol's own result is settled.
+    let _ = store.discard_scan();
     if result.as_ref().is_ok_and(|report| !report.round_deferred) {
         *state = candidate;
     } else {
@@ -951,6 +1112,16 @@ fn coordinate_candidate(
                     None,
                     None,
                 );
+                audit_control(AuditWait::Start);
+                let gate = receive_scan_gate(io, &share_id, &mut audit_control);
+                audit_control(AuditWait::End);
+                if let Some(shares) = gate? {
+                    return Ok(Report {
+                        pending_wakes: shares,
+                        round_deferred: true,
+                        ..Default::default()
+                    });
+                }
                 let response = protocol::receive_for(io, &share_id)?;
                 crate::trace_legacy_event!(
                     "sync",
@@ -1037,7 +1208,12 @@ fn coordinate_candidate(
         }
     }
     let used_delta = delta.is_some();
-    let (pc, android, paths, peer_scan_metrics, manifest_bytes) = if let Some(delta) = delta {
+    let mut hash_stream: Option<protocol::ScanStream> = None;
+    let mut namespace_ms = 0;
+    let mut hash_started = None;
+    let mut scan_binding = None;
+    let (pc, mut android, paths, mut peer_scan_metrics, manifest_bytes) = if let Some(delta) = delta
+    {
         delta
     } else {
         protocol::send_for(io, &share_id, Message::Scan)?;
@@ -1051,44 +1227,110 @@ fn coordinate_candidate(
                 ..Report::default()
             });
         }
-        let (android, metrics, bytes) = match protocol::receive_manifest_with_metrics(io, &share_id)
-        {
-            Ok(manifest) => manifest,
+        let stream = match protocol::ScanStream::receive_namespace(io, &share_id) {
+            Ok(stream) => stream,
             Err(error) if error.is::<ScanDeferred>() => {
                 return Ok(Report {
                     round_deferred: true,
-                    ..Report::default()
+                    ..Default::default()
                 })
             }
             Err(error) => return Err(error),
         };
-        let local_started = Instant::now();
-        crate::trace_legacy_event!(
-            "sync",
-            "local_scan_start",
-            Some(&share_id),
-            None,
-            None,
-            None,
-            None,
-        );
-        let pc = store.scan()?;
-        crate::trace_legacy_event!(
-            "sync",
-            "local_scan_end",
-            Some(&share_id),
-            None,
-            None,
-            Some(local_started),
-            None,
-        );
-        let paths = pc
-            .keys()
-            .chain(android.keys())
-            .chain(state.files.keys())
-            .cloned()
+        let local_binding = store.scan_binding()?;
+        let local_namespace = store.stream_namespace(io)?;
+        let pc = if local_namespace.is_none() {
+            store.scan()?
+        } else {
+            crate::model::Manifest::new()
+        };
+        let local_namespace =
+            local_namespace.unwrap_or_else(|| crate::model::manifest_namespace(&pc));
+        crate::model::validate_cross_namespace(&local_namespace, &stream.namespace)?;
+        // The entire structural union, including committed paths, is checked before
+        // starting hashing or scheduling any transfer.
+        let paths: BTreeSet<String> = local_namespace
+            .iter()
+            .chain(stream.namespace.iter())
+            .filter(|(_, e)| !e.directory)
+            .map(|(p, _)| p.clone())
+            .chain(state.files.keys().cloned())
             .collect();
-        (pc, android, paths, metrics, bytes)
+        let mut folded = BTreeSet::new();
+        for path in &paths {
+            ensure!(folded.insert(path.to_lowercase()), "case collision: {path}");
+        }
+        namespace_ms = u64::try_from(started.elapsed().as_millis())
+            .context("namespace duration exceeds wire milliseconds range")?;
+        store.require_full_scan()?;
+        let pc = if pc.is_empty() { store.scan()? } else { pc };
+        scan_binding = Some(local_binding.clone());
+        validate_manifest(&pc)?;
+        ensure!(
+            store.scan_binding()? == local_binding,
+            "scan binding changed"
+        );
+        ensure!(
+            pc.len() == local_namespace.values().filter(|e| !e.directory).count()
+                && pc.iter().all(|(p, e)| local_namespace
+                    .get(p)
+                    .is_some_and(|n| !n.directory && n.size == e.size)),
+            "STALE_SOURCE: PC namespace changed during scan"
+        );
+        store.validate_scan_snapshot()?;
+        let hints: Vec<String> = stream
+            .namespace
+            .iter()
+            .filter(|(p, e)| {
+                !e.directory
+                    && !store.excluded(p)
+                    && mode != crate::config::SyncMode::ToAndroid
+                    && (pc.get(*p).is_none()
+                        || pc
+                            .get(*p)
+                            .is_some_and(|e| state.files.get(*p) == Some(&e.hash)))
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for paths in hints.chunks(protocol::SCAN_STREAM_CHUNK_FILES) {
+            protocol::send_for(
+                io,
+                &share_id,
+                Message::HashStageHint {
+                    scan_id: stream.scan_id.clone(),
+                    paths: paths.iter().cloned().collect(),
+                },
+            )?;
+        }
+        protocol::send_for(
+            io,
+            &share_id,
+            Message::HashStreamBegin {
+                scan_id: stream.scan_id.clone(),
+                binding: stream.binding.clone(),
+            },
+        )?;
+        hash_started = Some(Instant::now());
+        crate::trace_event!(
+            trace::Level::Info,
+            trace::Component::Scanner,
+            "HASH_STREAM_BEGIN",
+            serde_json::json!({"scan_id":stream.scan_id})
+        );
+        crate::trace_event!(
+            trace::Level::Info,
+            trace::Component::Scanner,
+            "NAMESPACE_END",
+            serde_json::json!({"namespace_ms":namespace_ms,"entries":stream.namespace.len()})
+        );
+        hash_stream = Some(stream);
+        (
+            pc,
+            crate::model::Manifest::new(),
+            paths,
+            crate::storage::StoreMetrics::default(),
+            0,
+        )
     };
     if !used_delta {
         let local_audits = store
@@ -1109,7 +1351,9 @@ fn coordinate_candidate(
             }),
         );
     }
-    let android_count = android.len();
+    let android_count = hash_stream.as_ref().map_or(android.len(), |s| {
+        s.namespace.values().filter(|e| !e.directory).count()
+    });
     crate::trace_legacy_event!(
         "sync",
         "scan_end",
@@ -1137,7 +1381,7 @@ fn coordinate_candidate(
     } else {
         android.len().div_ceil(protocol::MANIFEST_CHUNK_FILES)
     };
-    let android: crate::model::Manifest = android
+    android = android
         .into_iter()
         .filter(|(p, _)| !store.excluded(p))
         .collect();
@@ -1170,7 +1414,7 @@ fn coordinate_candidate(
             );
         }
     }
-    if !used_delta {
+    if !used_delta && hash_stream.is_none() {
         state
             .conflicts
             .retain(|path| pc.contains_key(path) || android.contains_key(path));
@@ -1199,6 +1443,8 @@ fn coordinate_candidate(
     let mut ack_batch = crate::model::Manifest::new();
     let mut pending_puts = Vec::new();
     let mut pending_gets = Vec::new();
+    let mut staged_puts = Vec::new();
+    let mut deferred_stage_bytes = 0u64;
     let mut put_bytes = 0u64;
     let mut get_bytes = 0u64;
     let total = paths.len();
@@ -1211,7 +1457,143 @@ fn coordinate_candidate(
         None,
         None,
     );
-    for (index, path) in paths.into_iter().enumerate() {
+    let mut work = std::collections::VecDeque::new();
+    let mut deferred = BTreeSet::new();
+    let mut processed = BTreeSet::new();
+    if let Some(current) = &hash_stream {
+        // Absence is authoritative now: PC-only paths need no Android hash.
+        work.extend(
+            paths
+                .iter()
+                .filter(|p| !current.namespace.contains_key(*p))
+                .cloned(),
+        );
+    } else {
+        work.extend(paths.iter().cloned());
+    }
+    let mut index = 0;
+    let mut last_chunk_paths = BTreeSet::new();
+    let mut requested_preempt = None;
+    loop {
+        if hash_stream.as_ref().is_some_and(|s| !s.ended) && requested_preempt.is_none() {
+            requested_preempt = audit_control(AuditWait::Tick).filter(|s| !s.is_empty());
+            if requested_preempt.is_some() {
+                crate::trace_event!(
+                    trace::Level::Info,
+                    trace::Component::Scanner,
+                    "STREAM_PREEMPT_REQUESTED",
+                    serde_json::json!({"phase":"transfer_boundary","frame_boundary":true})
+                );
+                work.clear();
+            }
+        }
+        if work.is_empty() {
+            // Finish all outstanding Blob frames before reading the next hash frame
+            // or emitting a control frame. No partial committed base is persisted.
+            drain_puts(io, store, state, state_path, &mut pending_puts, &mut report)?;
+            drain_gets(
+                io,
+                store,
+                state,
+                state_path,
+                &mut pending_gets,
+                &mut ack_batch,
+                &mut report,
+                started,
+            )?;
+            put_bytes = 0;
+            get_bytes = 0;
+            if let Some(current) = hash_stream.as_mut().filter(|s| !s.ended) {
+                if !last_chunk_paths.is_empty() {
+                    protocol::send_for(
+                        io,
+                        &share_id,
+                        Message::HashRelease {
+                            scan_id: current.scan_id.clone(),
+                            paths: std::mem::take(&mut last_chunk_paths),
+                        },
+                    )?;
+                }
+                if let Some(shares) = requested_preempt
+                    .take()
+                    .or_else(|| audit_control(AuditWait::Tick).filter(|s| !s.is_empty()))
+                {
+                    flush_ack_batch(io, &share_id, &mut ack_batch, &mut report.metrics)?;
+                    protocol::send_for(
+                        io,
+                        &share_id,
+                        Message::AuditPreempt {
+                            shares: shares.clone(),
+                        },
+                    )?;
+                    ensure!(
+                        matches!(protocol::receive_for(io, &share_id)?, Message::ScanDeferred),
+                        "expected stream deferred"
+                    );
+                    crate::trace_event!(
+                        trace::Level::Info,
+                        trace::Component::Scanner,
+                        "STREAM_PREEMPT_APPLIED",
+                        serde_json::json!({"phase":"transfer_boundary","frame_boundary":true})
+                    );
+                    return Ok(Report {
+                        pending_wakes: shares,
+                        round_deferred: true,
+                        ..report
+                    });
+                }
+                audit_control(AuditWait::Start);
+                let next = current
+                    .next_with_control(io, &share_id, &mut || audit_control(AuditWait::Tick));
+                audit_control(AuditWait::End);
+                let (chunk, metrics, pipeline) = match next {
+                    Ok(chunk) => chunk,
+                    Err(error) if error.is::<ScanDeferred>() => {
+                        return Ok(Report {
+                            round_deferred: true,
+                            ..report
+                        })
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(files) = chunk {
+                    report.metrics.manifest_bytes += serde_json::to_vec(&files)?.len() as u64;
+                    report.metrics.control_messages += 2;
+                    last_chunk_paths.extend(files.keys().cloned());
+                    work.extend(files.keys().cloned());
+                    android.extend(files.into_iter().filter(|(p, _)| !store.excluded(p)));
+                    continue;
+                }
+                peer_scan_metrics = metrics;
+                report.metrics.scan_stream = pipeline;
+                report.metrics.scan_stream.namespace_ms = namespace_ms.max(pipeline.namespace_ms);
+                report.metrics.hash_stream_ms =
+                    hash_started.map_or(0, |instant| instant.elapsed().as_millis());
+                report.metrics.transfers_completed_before_hash_end = report.transferred as u64;
+                // commit_scan has already installed the scan cache on the peer.
+                // Only now can the private incoming stages mutate the SAF tree.
+                install_remote_stages(
+                    io,
+                    store,
+                    state,
+                    &current.scan_id,
+                    &mut staged_puts,
+                    &mut report,
+                )?;
+                deferred_stage_bytes = 0;
+                work.extend(paths.iter().filter(|p| !processed.contains(*p)).cloned());
+                work.extend(std::mem::take(&mut deferred));
+                state
+                    .conflicts
+                    .retain(|p| pc.contains_key(p) || android.contains_key(p));
+                continue;
+            }
+            break;
+        }
+        let path = work.pop_front().unwrap();
+        if processed.insert(path.clone()) {
+            index += 1;
+        }
         if store.excluded(&path) {
             continue;
         }
@@ -1234,6 +1616,18 @@ fn coordinate_candidate(
             }
             _ => reconcile(state.files.get(&path).map(String::as_str), ph, ah),
         };
+        if hash_stream.as_ref().is_some_and(|s| !s.ended)
+            && (action == Action::Conflict
+                || (action == Action::ToAndroid
+                    && p.is_some_and(|e| {
+                        e.size > MAX_STAGED_BYTES
+                            || staged_puts.len() == MAX_IN_FLIGHT_FILES
+                            || deferred_stage_bytes.saturating_add(e.size) > MAX_STAGED_BYTES
+                    })))
+        {
+            deferred.insert(path);
+            continue;
+        }
         let prohibited = bootstrap.is_none()
             && match mode {
                 crate::config::SyncMode::Bidirectional => false,
@@ -1332,7 +1726,7 @@ fn coordinate_candidate(
                         "SNAPSHOT_FAILED",
                         "filesystem",
                         "snapshot_local_file",
-                        e,
+                        protocol::LocalOperation::attach(e, "snapshot", Some(&path)),
                     )
                 })?;
                 crate::trace_legacy_event!(
@@ -1346,6 +1740,55 @@ fn coordinate_candidate(
                 );
                 report.metrics.snapshot_ms += preparing.elapsed().as_millis();
                 report.metrics.socket_idle_ms += preparing.elapsed().as_millis();
+                if let Some(current) = hash_stream.as_ref().filter(|s| !s.ended) {
+                    let sequence = staged_puts.len() as u64;
+                    let sending = Instant::now();
+                    report
+                        .metrics
+                        .time_to_first_transfer_ms
+                        .get_or_insert_with(|| hash_started.unwrap().elapsed().as_millis());
+                    report
+                        .metrics
+                        .first_byte_ms
+                        .get_or_insert_with(|| started.elapsed().as_millis());
+                    remote_stage(
+                        io,
+                        &share_id,
+                        &current.scan_id,
+                        sequence,
+                        &path,
+                        ah,
+                        entry,
+                        &temp,
+                    )?;
+                    report.metrics.transfer_ms += sending.elapsed().as_millis();
+                    report.metrics.transfers_started_before_hash_end += 1;
+                    report.metrics.files_received_for_deferred_install += 1;
+                    report.metrics.bytes_transferred += entry.size;
+                    report.metrics.control_messages += 2;
+                    deferred_stage_bytes += entry.size;
+                    staged_puts.push(StagedPut {
+                        sequence,
+                        path: path.clone(),
+                        entry: entry.clone(),
+                    });
+                    report.metrics.peak_in_flight_files = report
+                        .metrics
+                        .peak_in_flight_files
+                        .max(staged_puts.len() as u64);
+                    report.metrics.peak_staged_bytes =
+                        report.metrics.peak_staged_bytes.max(deferred_stage_bytes);
+                    continue;
+                }
+                report
+                    .metrics
+                    .time_to_first_transfer_ms
+                    .get_or_insert_with(|| {
+                        hash_started.map_or_else(
+                            || started.elapsed().as_millis(),
+                            |instant| instant.elapsed().as_millis(),
+                        )
+                    });
                 if entry.size > MAX_STAGED_BYTES {
                     let started_transfer = Instant::now();
                     report
@@ -1370,6 +1813,7 @@ fn coordinate_candidate(
                         None,
                         None,
                     );
+                    let mut source = File::open(temp.path())?;
                     protocol::send_for(
                         io,
                         &share_id,
@@ -1393,7 +1837,7 @@ fn coordinate_candidate(
                         None,
                     );
                     let sending = Instant::now();
-                    protocol::copy_exact(&mut File::open(temp.path())?, io, entry.size)?;
+                    protocol::copy_exact(&mut source, io, entry.size)?;
                     crate::trace_legacy_event!(
                         "sync",
                         "blob_send_end",
@@ -1419,6 +1863,18 @@ fn coordinate_candidate(
                 }
             }
             Action::ToPc => {
+                report
+                    .metrics
+                    .time_to_first_transfer_ms
+                    .get_or_insert_with(|| {
+                        hash_started.map_or_else(
+                            || started.elapsed().as_millis(),
+                            |instant| instant.elapsed().as_millis(),
+                        )
+                    });
+                if hash_stream.as_ref().is_some_and(|s| !s.ended) {
+                    report.metrics.transfers_started_before_hash_end += 1;
+                }
                 let _transfer = trace::transfer_context(&share_id, &path).enter();
                 report
                     .metrics
@@ -1440,6 +1896,15 @@ fn coordinate_candidate(
                     )?;
                     get_bytes = 0;
                 }
+                report
+                    .metrics
+                    .time_to_first_transfer_ms
+                    .get_or_insert_with(|| {
+                        hash_started.map_or_else(
+                            || started.elapsed().as_millis(),
+                            |instant| instant.elapsed().as_millis(),
+                        )
+                    });
                 if entry.size > MAX_STAGED_BYTES {
                     let started_transfer = Instant::now();
                     let temp = remote_snapshot(
@@ -1449,6 +1914,7 @@ fn coordinate_candidate(
                         entry,
                         &mut report.metrics.first_byte_ms,
                         started,
+                        store.staging_directory().as_deref(),
                     )?;
                     let installing = Instant::now();
                     crate::trace_legacy_event!(
@@ -1460,7 +1926,9 @@ fn coordinate_candidate(
                         None,
                         None,
                     );
-                    store.install(&path, ph, entry, &temp)?;
+                    store
+                        .install_received(&path, ph, entry, temp)
+                        .map_err(|e| protocol::LocalOperation::attach(e, "install", Some(&path)))?;
                     crate::trace_legacy_event!(
                         "sync",
                         "install_end",
@@ -1515,11 +1983,22 @@ fn coordinate_candidate(
             Action::Conflict => {
                 report
                     .metrics
+                    .time_to_first_transfer_ms
+                    .get_or_insert_with(|| {
+                        hash_started.map_or_else(
+                            || started.elapsed().as_millis(),
+                            |instant| instant.elapsed().as_millis(),
+                        )
+                    });
+                report
+                    .metrics
                     .first_transfer_ms
                     .get_or_insert_with(|| started.elapsed().as_millis());
                 let pe = p.unwrap();
                 let ae = a.unwrap();
-                let pc_snapshot = store.snapshot(&path, pe)?;
+                let pc_snapshot = store
+                    .snapshot(&path, pe)
+                    .map_err(|e| protocol::LocalOperation::attach(e, "snapshot", Some(&path)))?;
                 let android_snapshot = remote_snapshot(
                     &share_id,
                     io,
@@ -1527,12 +2006,15 @@ fn coordinate_candidate(
                     ae,
                     &mut report.metrics.first_byte_ms,
                     started,
+                    store.staging_directory().as_deref(),
                 )?;
                 let conflict = conflict_path(&path, &ae.hash);
                 // Preserve Android on BOTH sides before changing its original path.
                 // Missing precondition prevents overwriting a manually edited conflict copy.
                 let installing = Instant::now();
-                store.install(&conflict, None, ae, &android_snapshot)?;
+                store
+                    .install(&conflict, None, ae, &android_snapshot)
+                    .map_err(|e| protocol::LocalOperation::attach(e, "install", Some(&conflict)))?;
                 report.metrics.install_ms += installing.elapsed().as_millis();
                 remote_install(&share_id, io, &conflict, None, ae, &android_snapshot)?;
                 remote_install(&share_id, io, &path, ah, pe, &pc_snapshot)?;
@@ -1569,6 +2051,16 @@ fn coordinate_candidate(
         None,
     );
     progress("", total, total);
+    if let Some(binding) = scan_binding {
+        store.validate_scan_snapshot()?;
+        ensure!(
+            store.scan_binding()? == binding,
+            "STALE_SOURCE: PC binding changed during stream"
+        );
+    }
+    if hash_stream.is_none() {
+        report.metrics.time_to_first_transfer_ms = report.metrics.first_transfer_ms;
+    }
     state.last_sync = Some(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -1580,6 +2072,10 @@ fn coordinate_candidate(
     }
     let candidate_path = state_path.with_extension("next");
     persist_state(&candidate_path, state, &mut report.metrics, None)?;
+    if hash_stream.is_some() {
+        report.metrics.full_scans += peer_scan_metrics.full_scans;
+        report.metrics.files_enumerated += peer_scan_metrics.files_enumerated;
+    }
     let store_metrics = store.metrics();
     report.metrics.files_hashed = store_metrics
         .files_hashed
@@ -1626,13 +2122,37 @@ pub fn respond(io: &mut (impl Read + Write + Send), store: &mut impl Store) -> R
     respond_share(io, store, None)
 }
 
+struct ResponderStream {
+    scan_id: String,
+    binding: String,
+    namespace: crate::model::Namespace,
+    cached: Option<crate::model::Manifest>,
+    sequence: u64,
+    seen: BTreeSet<String>,
+    hints: BTreeSet<String>,
+    hashing: bool,
+    before: crate::storage::StoreMetrics,
+}
+
 pub fn respond_share(
     io: &mut (impl Read + Write + Send),
     store: &mut impl Store,
     expected_share: Option<&str>,
 ) -> Result<Report> {
+    let mut stream: Option<ResponderStream> = None;
+    let mut stream_completed = false;
+    let mut completed_scan: Option<(String, String)> = None;
+    let mut incoming_stages = BTreeMap::<u64, ReceivedStage>::new();
+    let mut stage_sequence = 0;
+    let mut install_sequence = 0;
+    let mut incoming_bytes = 0u64;
     let mut share = expected_share.map(str::to_owned);
     let started = Instant::now();
+    let mut operation = "receive";
+    let mut relative_path: Option<String> = None;
+    let mut frame_boundary = true;
+    let mut stage_body_incomplete = false;
+    let mut error_kind = "protocol";
     crate::trace_legacy_event!(
         "sync",
         "share_sync_start",
@@ -1644,6 +2164,8 @@ pub fn respond_share(
     );
     let result = (|| -> Result<Report> {
         loop {
+            operation = "receive";
+            error_kind = "transport";
             let Message::Scoped { share_id, message } = protocol::receive(io)? else {
                 anyhow::bail!("missing Share context")
             };
@@ -1652,7 +2174,9 @@ pub fn respond_share(
             } else {
                 share = Some(share_id.clone());
             }
-            match *message {
+            operation = message.trace_type();
+            error_kind = "protocol";
+            match protocol::check_peer_error(*message)? {
                 Message::AckBatch { entries } => {
                     crate::trace_legacy_event!(
                         "sync",
@@ -1673,58 +2197,51 @@ pub fn respond_share(
                     }
                 }
                 Message::Scan => {
-                    let scanning = Instant::now();
-                    crate::trace_legacy_event!(
-                        "sync",
-                        "scan_start",
-                        Some(&share_id),
-                        None,
-                        None,
-                        None,
-                        None,
+                    ensure!(
+                        stream.is_none() && incoming_stages.is_empty(),
+                        "scan already active or stages pending"
                     );
+                    stream_completed = false;
+                    completed_scan = None;
+                    stage_sequence = 0;
+                    install_sequence = 0;
                     let before = store.metrics();
-                    let local_started = Instant::now();
-                    crate::trace_legacy_event!(
-                        "sync",
-                        "local_scan_start",
-                        Some(&share_id),
-                        None,
-                        None,
-                        None,
-                        None,
-                    );
-                    let files = match store.scan_with_control(io) {
-                        Ok(files) => files,
+                    let binding = store.scan_binding()?;
+                    let physical_namespace = match store.stream_namespace(io) {
+                        Ok(namespace) => namespace,
                         Err(error) if error.is::<ScanDeferred>() => {
                             store.discard_scan()?;
                             protocol::send_for(io, &share_id, Message::ScanDeferred)?;
                             return Ok(Report {
                                 round_deferred: true,
-                                ..Report::default()
+                                ..Default::default()
                             });
                         }
-                        Err(error) => {
-                            let _ = store.discard_scan();
-                            if !store.scan_is_staged() {
-                                store.set_base_token(None);
-                            }
-                            return Err(error);
+                        Err(error) => return Err(error),
+                    };
+                    let (namespace, files) = match physical_namespace {
+                        Some(namespace) => (namespace, None),
+                        None => {
+                            let files = match store.scan_with_control(io) {
+                                Ok(files) => files,
+                                Err(error) if error.is::<ScanDeferred>() => {
+                                    store.discard_scan()?;
+                                    protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                                    return Ok(Report {
+                                        round_deferred: true,
+                                        ..Default::default()
+                                    });
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            (crate::model::manifest_namespace(&files), Some(files))
                         }
                     };
-                    let gate = (|| -> Result<Message> {
-                        protocol::send_for(io, &share_id, Message::ScanReady)?;
-                        protocol::receive_for(io, &share_id)
-                    })();
-                    match gate {
-                        Ok(Message::ScanContinue) => {
-                            if let Err(error) = store.commit_scan() {
-                                let _ = store.discard_scan();
-                                store.set_base_token(None);
-                                return Err(error);
-                            }
-                        }
-                        Ok(Message::AuditPreempt { shares }) => {
+                    crate::model::validate_namespace(&namespace)?;
+                    protocol::send_for(io, &share_id, Message::ScanReady)?;
+                    match protocol::receive_for(io, &share_id)? {
+                        Message::ScanContinue => {}
+                        Message::AuditPreempt { shares } => {
                             for id in shares {
                                 crate::model::validate_hash(&id)?;
                             }
@@ -1732,86 +2249,349 @@ pub fn respond_share(
                             protocol::send_for(io, &share_id, Message::ScanDeferred)?;
                             return Ok(Report {
                                 round_deferred: true,
-                                ..Report::default()
+                                ..Default::default()
                             });
                         }
-                        Ok(_) => {
-                            store.discard_scan()?;
-                            anyhow::bail!("unexpected scan gate")
-                        }
-                        Err(error) => {
-                            let _ = store.discard_scan();
-                            return Err(error);
-                        }
+                        _ => anyhow::bail!("unexpected namespace gate"),
                     }
-                    // A completed full scan replaces the peer cache before Done;
-                    // a deferred scan leaves the committed token untouched.
-                    store.set_base_token(None);
-                    crate::trace_legacy_event!(
-                        "sync",
-                        "local_scan_end",
-                        Some(&share_id),
-                        None,
-                        None,
-                        Some(local_started),
-                        None,
-                    );
-                    crate::trace_legacy_event!(
-                        "sync",
-                        "scan_end",
-                        Some(&share_id),
-                        None,
-                        Some(files.len() as u64),
-                        Some(scanning),
-                        None,
-                    );
-                    let after = store.metrics();
-                    crate::trace_legacy_event!(
-                        "sync",
-                        "manifest_source",
-                        Some(&share_id),
-                        None,
-                        None,
-                        None,
-                        Some(if after.full_scans > before.full_scans {
-                            "physical_audit"
-                        } else {
-                            "full_manifest"
-                        }),
-                    );
-                    crate::trace_legacy_event!(
-                        "sync",
-                        "manifest_start",
-                        Some(&share_id),
-                        None,
-                        Some(files.len() as u64),
-                        None,
-                        None,
-                    );
-                    let manifest_started = Instant::now();
-                    protocol::send_manifest_with_metrics(
+                    let scan_id = crate::random_id()?;
+                    protocol::send_for(
                         io,
                         &share_id,
-                        &files,
-                        crate::storage::StoreMetrics {
-                            files_enumerated: after
-                                .files_enumerated
-                                .saturating_sub(before.files_enumerated),
-                            files_hashed: after.files_hashed.saturating_sub(before.files_hashed),
-                            bytes_hashed: after.bytes_hashed.saturating_sub(before.bytes_hashed),
-                            full_scans: after.full_scans.saturating_sub(before.full_scans),
-                            ..Default::default()
+                        Message::ScanStreamBegin {
+                            scan_id: scan_id.clone(),
+                            binding: binding.clone(),
                         },
                     )?;
-                    crate::trace_legacy_event!(
-                        "sync",
-                        "manifest_end",
-                        Some(&share_id),
-                        None,
-                        Some(files.len() as u64),
-                        Some(manifest_started),
-                        None,
+                    let mut sequence = 0;
+                    let mut chunk = crate::model::Namespace::new();
+                    for (path, entry) in &namespace {
+                        chunk.insert(path.clone(), entry.clone());
+                        if chunk.len() == protocol::SCAN_STREAM_CHUNK_FILES {
+                            protocol::send_for(
+                                io,
+                                &share_id,
+                                Message::NamespaceChunk {
+                                    scan_id: scan_id.clone(),
+                                    sequence,
+                                    entries: std::mem::take(&mut chunk),
+                                },
+                            )?;
+                            sequence += 1;
+                        }
+                    }
+                    if !chunk.is_empty() {
+                        protocol::send_for(
+                            io,
+                            &share_id,
+                            Message::NamespaceChunk {
+                                scan_id: scan_id.clone(),
+                                sequence,
+                                entries: chunk,
+                            },
+                        )?;
+                        sequence += 1;
+                    }
+                    protocol::send_for(
+                        io,
+                        &share_id,
+                        Message::NamespaceEnd {
+                            scan_id: scan_id.clone(),
+                            last_sequence: sequence,
+                            total_entries: namespace.len(),
+                            namespace_digest: protocol::namespace_digest(&namespace)?,
+                        },
+                    )?;
+                    stream = Some(ResponderStream {
+                        scan_id,
+                        binding,
+                        namespace,
+                        cached: files,
+                        sequence: 0,
+                        seen: Default::default(),
+                        hints: Default::default(),
+                        hashing: false,
+                        before,
+                    });
+                }
+                Message::HashStageHint { scan_id, paths } => {
+                    let current = stream.as_mut().context("stage hint without namespace")?;
+                    ensure!(
+                        !current.hashing
+                            && scan_id == current.scan_id
+                            && paths.len() <= protocol::SCAN_STREAM_CHUNK_FILES,
+                        "invalid stage hint"
                     );
+                    for path in paths {
+                        ensure!(
+                            current.namespace.get(&path).is_some_and(|e| !e.directory)
+                                && current.hints.insert(path),
+                            "invalid or duplicate stage hint path"
+                        );
+                    }
+                }
+                Message::HashRelease { scan_id, paths } => {
+                    let current = stream.as_ref().context("hash release without stream")?;
+                    ensure!(
+                        current.hashing
+                            && scan_id == current.scan_id
+                            && paths.len() <= protocol::SCAN_STREAM_CHUNK_FILES
+                            && paths.iter().all(|p| current.seen.contains(p)),
+                        "invalid hash release"
+                    );
+                    store.release_hash_staging(&paths)?;
+                }
+                Message::HashStreamBegin { scan_id, binding } => {
+                    let current = stream.as_mut().context("hash begin without namespace")?;
+                    ensure!(
+                        !current.hashing
+                            && scan_id == current.scan_id
+                            && binding == current.binding
+                            && store.scan_binding()? == binding,
+                        "stale hash begin"
+                    );
+                    store.start_hash_stream(&current.hints)?;
+                    current.hashing = true;
+                }
+                Message::StagePut {
+                    scan_id,
+                    sequence,
+                    path,
+                    entry,
+                    expected,
+                } => {
+                    // StagePut owns raw Blob bytes immediately after its header.
+                    // Any early semantic error closes this connection; never inject
+                    // a ShareError into an unread body.
+                    frame_boundary = false;
+                    stage_body_incomplete = true;
+                    let current = stream
+                        .as_ref()
+                        .context("staging without active hash stream")?;
+                    ensure!(
+                        current.hashing && scan_id == current.scan_id && sequence == stage_sequence,
+                        "misaligned staged transfer"
+                    );
+                    ensure!(
+                        store.scan_binding()? == current.binding,
+                        "STALE_TARGET: scan binding changed"
+                    );
+                    crate::model::validate_path(&path)?;
+                    crate::model::validate_hash(&entry.hash)?;
+                    if let Some(hash) = &expected {
+                        crate::model::validate_hash(hash)?;
+                    }
+                    ensure!(!store.excluded(&path), "ignored staged path");
+                    ensure!(
+                        incoming_stages.len() < MAX_IN_FLIGHT_FILES
+                            && entry.size <= MAX_STAGED_BYTES
+                            && incoming_bytes.saturating_add(entry.size) <= MAX_STAGED_BYTES,
+                        "deferred staging limit exceeded"
+                    );
+                    ensure!(
+                        !incoming_stages.values().any(|s| s.job.path == path),
+                        "duplicate staged path"
+                    );
+                    ensure!(
+                        if current.namespace.contains_key(&path) {
+                            expected.is_some() && current.seen.contains(&path)
+                        } else {
+                            expected.is_none()
+                        },
+                        "staged target has not been reconciled"
+                    );
+                    operation = "receive_staged_blob";
+                    relative_path = Some(path.clone());
+                    error_kind = "filesystem";
+                    let staged = receive_blob(io, &entry, store.staging_directory().as_deref())?;
+                    frame_boundary = true;
+                    stage_body_incomplete = false;
+                    ensure!(
+                        store.scan_binding()? == current.binding,
+                        "STALE_TARGET: scan binding changed during receipt"
+                    );
+                    incoming_bytes += entry.size;
+                    incoming_stages.insert(
+                        sequence,
+                        ReceivedStage {
+                            job: IncomingPut {
+                                path: path.clone(),
+                                entry,
+                                expected,
+                            },
+                            staged,
+                        },
+                    );
+                    stage_sequence += 1;
+                    crate::trace_event!(
+                        trace::Level::Debug,
+                        trace::Component::Transfer,
+                        "PC_TO_ANDROID_STAGED",
+                        serde_json::json!({"scan_id":scan_id,"sequence":sequence,"relative_path":path,"staged_bytes":incoming_bytes,"install_deferred":true})
+                    );
+                    protocol::send_for(
+                        io,
+                        &share_id,
+                        Message::StageReceived { scan_id, sequence },
+                    )?;
+                }
+                Message::InstallStaged { scan_id, sequence } => {
+                    ensure!(
+                        stream.is_none() && stream_completed && sequence == install_sequence,
+                        "staged installation before scan commit or out of order"
+                    );
+                    let (completed_id, binding) = completed_scan
+                        .as_ref()
+                        .context("missing completed scan identity")?;
+                    ensure!(
+                        scan_id == *completed_id && store.scan_binding()? == *binding,
+                        "STALE_TARGET: staged scan binding changed"
+                    );
+                    let staged = incoming_stages
+                        .remove(&sequence)
+                        .context("missing or duplicate staged installation")?;
+                    incoming_bytes -= staged.job.entry.size;
+                    operation = "install_staged";
+                    relative_path = Some(staged.job.path.clone());
+                    error_kind = "filesystem";
+                    store
+                        .install_received(
+                            &staged.job.path,
+                            staged.job.expected.as_deref(),
+                            &staged.job.entry,
+                            staged.staged,
+                        )
+                        .map_err(|e| {
+                            protocol::LocalOperation::attach(e, "install", Some(&staged.job.path))
+                        })?;
+                    install_sequence += 1;
+                    crate::trace_event!(
+                        trace::Level::Debug,
+                        trace::Component::Transfer,
+                        "PC_TO_ANDROID_STAGE_INSTALLED",
+                        serde_json::json!({"scan_id":scan_id,"sequence":sequence,"relative_path":staged.job.path})
+                    );
+                    protocol::send_for(io, &share_id, Message::Accept)?;
+                }
+                Message::HashNext { scan_id, sequence } => {
+                    let current = stream.as_mut().context("hash request without stream")?;
+                    ensure!(
+                        current.hashing
+                            && scan_id == current.scan_id
+                            && sequence == current.sequence,
+                        "misaligned hash request"
+                    );
+                    let chunk = if let Some(files) = &mut current.cached {
+                        let keys: Vec<_> = files
+                            .keys()
+                            .take(protocol::SCAN_STREAM_CHUNK_FILES)
+                            .cloned()
+                            .collect();
+                        if keys.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                keys.into_iter()
+                                    .map(|path| {
+                                        let entry = files.remove(&path).unwrap();
+                                        (path, entry)
+                                    })
+                                    .collect(),
+                            )
+                        }
+                    } else {
+                        match store.next_hash_chunk(io) {
+                            Ok(chunk) => chunk,
+                            Err(error) if error.is::<ScanDeferred>() => {
+                                store.discard_scan()?;
+                                protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                                return Ok(Report {
+                                    round_deferred: true,
+                                    ..Default::default()
+                                });
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    if let Some(files) = chunk {
+                        validate_manifest(&files)?;
+                        ensure!(
+                            !files.is_empty() && files.len() <= protocol::SCAN_STREAM_CHUNK_FILES,
+                            "invalid produced chunk"
+                        );
+                        for (path, entry) in &files {
+                            ensure!(
+                                current
+                                    .namespace
+                                    .get(path)
+                                    .is_some_and(|e| !e.directory && e.size == entry.size)
+                                    && current.seen.insert(path.clone()),
+                                "hash namespace mismatch"
+                            );
+                        }
+                        protocol::send_for(
+                            io,
+                            &share_id,
+                            Message::HashChunk {
+                                scan_id,
+                                sequence,
+                                files,
+                            },
+                        )?;
+                        current.sequence += 1;
+                    } else {
+                        ensure!(
+                            current.seen.len()
+                                == current.namespace.values().filter(|e| !e.directory).count()
+                                && store.scan_binding()? == current.binding,
+                            "incomplete or stale hash stream"
+                        );
+                        store.commit_scan()?;
+                        store.set_base_token(None);
+                        let after = store.metrics();
+                        let pipeline = store.scan_stream_metrics()?;
+                        completed_scan = Some((current.scan_id.clone(), current.binding.clone()));
+                        protocol::send_for(
+                            io,
+                            &share_id,
+                            Message::HashStreamEnd {
+                                scan_id,
+                                last_sequence: sequence,
+                                total_entries: current.seen.len(),
+                                metrics: crate::storage::StoreMetrics {
+                                    files_enumerated: after
+                                        .files_enumerated
+                                        .saturating_sub(current.before.files_enumerated),
+                                    files_hashed: after
+                                        .files_hashed
+                                        .saturating_sub(current.before.files_hashed),
+                                    bytes_hashed: after
+                                        .bytes_hashed
+                                        .saturating_sub(current.before.bytes_hashed),
+                                    full_scans: 1,
+                                    ..Default::default()
+                                },
+                                pipeline,
+                            },
+                        )?;
+                        stream = None;
+                        stream_completed = true;
+                    }
+                }
+                Message::AuditPreempt { shares } => {
+                    ensure!(
+                        stream.is_some() || stream_completed,
+                        "preempt outside stream"
+                    );
+                    for id in shares {
+                        crate::model::validate_hash(&id)?;
+                    }
+                    store.discard_scan()?;
+                    protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                    return Ok(Report {
+                        round_deferred: true,
+                        ..Default::default()
+                    });
                 }
                 Message::DeltaScan { base_token, paths } => {
                     let old = store.base_token();
@@ -1832,55 +2612,41 @@ pub fn respond_share(
                         && paths.len() <= 1024
                         && paths.iter().all(|p| crate::model::validate_path(p).is_ok())
                     {
-                        match store.delta_paths() {
-                            Ok(Some(dirty)) if dirty.len() <= 1024 => {
-                                let union: BTreeSet<_> = paths.union(&dirty).cloned().collect();
-                                if union.len() <= 1024 {
-                                    let scanned = store
-                                        .scan_paths(&union)
-                                        .ok()
-                                        .flatten()
-                                        .map(|files| (union, files));
-                                    if scanned.is_none() {
-                                        fallback_reason = Some("scan_paths_failed");
-                                    }
-                                    scanned
-                                } else {
-                                    fallback_reason = Some("too_many_dirty_paths");
-                                    None
-                                }
-                            }
-                            Ok(Some(_)) => {
-                                fallback_reason = Some("too_many_dirty_paths");
-                                None
-                            }
+                        match store.delta_scan_with_control(io, &paths) {
+                            Ok(Some(candidate)) => Some(candidate),
                             Ok(None) => {
                                 fallback_reason = Some("dirty_unavailable");
                                 None
                             }
-                            Err(error) => {
-                                crate::trace_event!(
-                                    trace::Level::Warn,
-                                    trace::Component::Scanner,
-                                    "DELTA_UNAVAILABLE",
-                                    serde_json::json!({"reason":"jni_or_store_error","fallback":"full_scan","error":trace::TraceError::new("filesystem","delta_paths",&error)})
-                                );
-                                crate::trace_legacy_event!(
-                                    "sync",
-                                    "delta_unavailable",
-                                    Some(&share_id),
-                                    None,
-                                    None,
-                                    None,
-                                    Some("jni_or_store_error"),
-                                );
-                                fallback_reason = Some("dirty_unavailable");
-                                None
+                            Err(error) if error.is::<ScanDeferred>() => {
+                                store.discard_scan()?;
+                                protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                                return Ok(Report {
+                                    round_deferred: true,
+                                    ..Default::default()
+                                });
                             }
+                            Err(error) => return Err(error),
                         }
                     } else {
                         None
                     };
+                    protocol::send_for(io, &share_id, Message::ScanReady)?;
+                    match protocol::receive_for(io, &share_id)? {
+                        Message::ScanContinue => {}
+                        Message::AuditPreempt { shares } => {
+                            for id in shares {
+                                crate::model::validate_hash(&id)?;
+                            }
+                            store.discard_scan()?;
+                            protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                            return Ok(Report {
+                                round_deferred: true,
+                                ..Default::default()
+                            });
+                        }
+                        _ => anyhow::bail!("unexpected delta scan gate"),
+                    }
                     if let Some((paths, files)) = candidate {
                         let after = store.metrics();
                         protocol::send_for(
@@ -1938,7 +2704,11 @@ pub fn respond_share(
                         None,
                         None,
                     );
+                    operation = "snapshot";
+                    relative_path = Some(path.clone());
+                    error_kind = "filesystem";
                     let temp = store.snapshot(&path, &entry)?;
+                    let mut source = File::open(temp.path())?;
                     crate::trace_legacy_event!(
                         "sync",
                         "snapshot_end",
@@ -1948,6 +2718,9 @@ pub fn respond_share(
                         Some(snapshot_started),
                         None,
                     );
+                    operation = "blob_send";
+                    error_kind = "transport";
+                    frame_boundary = false;
                     protocol::send_for(
                         io,
                         &share_id,
@@ -1965,7 +2738,8 @@ pub fn respond_share(
                         None,
                     );
                     let sending = Instant::now();
-                    protocol::copy_exact(&mut File::open(temp.path())?, io, entry.size)?;
+                    protocol::copy_exact(&mut source, io, entry.size)?;
+                    frame_boundary = true;
                     crate::trace_legacy_event!(
                         "sync",
                         "blob_send_end",
@@ -1981,6 +2755,11 @@ pub fn respond_share(
                     entry,
                     expected,
                 } => {
+                    ensure!(stream.is_none(), "SAF install forbidden during hash stream");
+                    operation = "receive_put_batch";
+                    relative_path = Some(path.clone());
+                    error_kind = "filesystem";
+                    frame_boundary = false;
                     let installed = receive_put_batch(
                         io,
                         store,
@@ -1991,6 +2770,7 @@ pub fn respond_share(
                             expected,
                         },
                     )?;
+                    frame_boundary = true;
                     for path in installed {
                         let _transfer = trace::transfer_context(&share_id, &path).enter();
                         protocol::send_for(io, &share_id, Message::Accept)?;
@@ -2010,7 +2790,12 @@ pub fn respond_share(
                     conflicts,
                     base_token,
                 } => {
+                    ensure!(
+                        stream.is_none() && incoming_stages.is_empty(),
+                        "Done before hash stream end or staged installs"
+                    );
                     crate::model::validate_hash(&base_token)?;
+                    store.discard_scan()?;
                     store.set_base_token(Some(base_token));
                     crate::trace_legacy_event!(
                         "sync",
@@ -2034,6 +2819,14 @@ pub fn respond_share(
             }
         }
     })();
+    let result = if stage_body_incomplete {
+        result.map_err(|e| e.context(protocol::IncompleteFrame))
+    } else {
+        result
+    };
+    if result.is_err() {
+        let _ = store.discard_scan();
+    }
     if let Err(ref e) = result {
         let context = if let Some(share) = share.as_deref() {
             trace::current_context().with("share_id", share)
@@ -2045,14 +2838,23 @@ pub fn respond_share(
             trace::Level::Error,
             trace::Component::Round,
             "SHARE_FAILED",
-            serde_json::json!({"reason":if e.to_string().starts_with("STALE_"){"stale"}else{"round_failed"},"error":trace::TraceError::new("transfer","respond_share",e)})
+            serde_json::json!({"reason":if e.to_string().starts_with("STALE_"){"stale"}else{"round_failed"},"operation":operation,"relative_path":relative_path,"kind":error_kind,"frame_boundary":frame_boundary,"error":trace::TraceError::new(error_kind,operation,e)})
         );
-        let _ = protocol::send(
-            io,
-            &Message::Error {
-                message: e.to_string(),
-            },
-        );
+        if frame_boundary {
+            protocol::send_share_error(
+                io,
+                e,
+                if cfg!(target_os = "android") {
+                    "android"
+                } else {
+                    "responder"
+                },
+                share.as_deref(),
+                operation,
+                relative_path.as_deref(),
+                error_kind,
+            );
+        }
     }
     result
 }
@@ -2441,8 +3243,12 @@ mod v2_tests {
             }
             let remap = (scenario == "remap").then_some(RemapPolicy::Compare);
             let report = local_round(&mut p, &mut a, &mut state, &path, remap);
-            let expected_audits = u64::from(matches!(scenario, "cache" | "ignore"));
-            assert_eq!(report.metrics.full_scans, expected_audits, "{scenario}");
+            // Full streaming always audits both structural namespaces; physical
+            // hash evidence still prevents rereading unchanged content.
+            assert_eq!(report.metrics.full_scans, 2, "{scenario}");
+            if matches!(scenario, "restart" | "token" | "peer_token" | "remap") {
+                assert_eq!(report.metrics.files_hashed, 0, "{scenario}");
+            }
         }
     }
     #[test]
@@ -2748,7 +3554,17 @@ mod v2_tests {
             let (mut x, mut y) = sockets();
             std::thread::scope(|scope| {
                 let responder = scope.spawn(|| respond(&mut y, &mut a));
-                assert!(coordinate(&mut x, &mut p, &mut state, &path).is_err());
+                let remote = coordinate(&mut x, &mut p, &mut state, &path).unwrap_err();
+                let detail = remote
+                    .downcast_ref::<protocol::ShareError>()
+                    .expect("cause must reach the PC, not EOF");
+                assert_eq!(detail.kind, "filesystem");
+                assert_eq!(
+                    detail.operation,
+                    if to_phone { "install" } else { "snapshot" }
+                );
+                assert_eq!(detail.relative_path.as_deref(), Some("b"));
+                assert!(!detail.stream_reusable);
                 assert!(responder.join().unwrap().is_err());
             });
             if to_phone {
@@ -3160,5 +3976,493 @@ mod v2_tests {
             crate::hash_reader(b"latest".as_slice()).unwrap().0
         );
         assert_eq!(p.scan().unwrap(), a.scan().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod scan_resilience_tests {
+    use super::*;
+    use crate::model::Manifest;
+    use std::{collections::VecDeque, io::Cursor};
+
+    enum Step {
+        Idle(u64),
+        Frame(Vec<u8>),
+    }
+    struct Peer<'a> {
+        clock: &'a std::sync::atomic::AtomicU64,
+        steps: VecDeque<Step>,
+        frame: Cursor<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+    impl Read for Peer<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.frame.position() < self.frame.get_ref().len() as u64 {
+                return self.frame.read(buf);
+            }
+            match self.steps.pop_front() {
+                Some(Step::Frame(bytes)) => {
+                    self.frame = Cursor::new(bytes);
+                    self.frame.read(buf)
+                }
+                step => {
+                    let seconds = match step {
+                        Some(Step::Idle(s)) => s,
+                        _ => 30,
+                    };
+                    self.clock
+                        .fetch_add(seconds, std::sync::atomic::Ordering::Relaxed);
+                    Err(std::io::ErrorKind::WouldBlock.into())
+                }
+            }
+        }
+    }
+    impl Write for Peer<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.sent.extend(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn frame(message: Message) -> Step {
+        let mut bytes = vec![];
+        protocol::send_for(&mut bytes, "share", message).unwrap();
+        Step::Frame(bytes)
+    }
+    fn peer(clock: &std::sync::atomic::AtomicU64, steps: Vec<Step>) -> Peer<'_> {
+        Peer {
+            clock,
+            steps: steps.into(),
+            frame: Cursor::new(vec![]),
+            sent: vec![],
+        }
+    }
+    #[test]
+    fn scan_over_ninety_seconds_then_manifest_and_second_round_stay_aligned() {
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let epoch = Instant::now();
+        let mut steps = vec![];
+        for _ in 0..12 {
+            steps.push(Step::Idle(30));
+            steps.push(frame(Message::ScanAlive));
+        }
+        steps.push(frame(Message::ScanReady));
+        steps.push(frame(Message::ManifestBegin { count: 0 }));
+        steps.push(frame(Message::ManifestEnd {
+            metrics: Default::default(),
+        }));
+        steps.push(frame(Message::Done {
+            transferred: 0,
+            conflicts: 0,
+            base_token: "a".repeat(64),
+        }));
+        steps.push(frame(Message::ScanAlive));
+        steps.push(frame(Message::ScanReady));
+        let mut io = peer(&clock, steps);
+        assert_eq!(
+            receive_scan_gate_with_clock(
+                &mut io,
+                "share",
+                &mut |_| None,
+                || epoch + Duration::from_secs(clock.load(std::sync::atomic::Ordering::Relaxed)),
+                Duration::from_secs(90)
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(clock.load(std::sync::atomic::Ordering::Relaxed), 360);
+        assert!(protocol::receive_manifest(&mut io, "share")
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            protocol::receive_for(&mut io, "share").unwrap(),
+            Message::Done { .. }
+        ));
+        assert_eq!(
+            receive_scan_gate_with_clock(
+                &mut io,
+                "share",
+                &mut |_| None,
+                || epoch + Duration::from_secs(clock.load(std::sync::atomic::Ordering::Relaxed)),
+                Duration::from_secs(90)
+            )
+            .unwrap(),
+            None
+        );
+        let mut sent = Cursor::new(io.sent);
+        for _ in 0..2 {
+            assert!(matches!(
+                protocol::receive_for(&mut sent, "share").unwrap(),
+                Message::ScanContinue
+            ));
+        }
+        assert_eq!(sent.position(), sent.get_ref().len() as u64);
+    }
+    #[test]
+    fn dead_peer_expires_after_inactivity_even_after_previous_liveness() {
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let epoch = Instant::now();
+        let mut io = peer(&clock, vec![Step::Idle(60), frame(Message::ScanAlive)]);
+        let error = receive_scan_gate_with_clock(
+            &mut io,
+            "share",
+            &mut |_| None,
+            || epoch + Duration::from_secs(clock.load(std::sync::atomic::Ordering::Relaxed)),
+            Duration::from_secs(90),
+        )
+        .unwrap_err();
+        assert_eq!(clock.load(std::sync::atomic::Ordering::Relaxed), 150);
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(protocol::transport_dead(&error));
+        assert!(error.to_string().contains("liveness timeout"));
+    }
+    #[test]
+    fn slow_delta_gate_keeps_response_and_next_gate_aligned() {
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let epoch = Instant::now();
+        let mut steps = vec![];
+        for _ in 0..12 {
+            steps.push(Step::Idle(30));
+            steps.push(frame(Message::ScanAlive));
+        }
+        steps.push(frame(Message::ScanReady));
+        steps.push(frame(Message::DeltaManifest {
+            paths: BTreeSet::from(["file".into()]),
+            files: Manifest::new(),
+            metrics: Default::default(),
+        }));
+        steps.push(frame(Message::ScanReady));
+        let mut io = peer(&clock, steps);
+        assert_eq!(
+            receive_scan_gate_with_clock(
+                &mut io,
+                "share",
+                &mut |_| None,
+                || epoch + Duration::from_secs(clock.load(std::sync::atomic::Ordering::Relaxed)),
+                Duration::from_secs(90)
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(clock.load(std::sync::atomic::Ordering::Relaxed), 360);
+        assert!(matches!(
+            protocol::receive_for(&mut io, "share").unwrap(),
+            Message::DeltaManifest { .. }
+        ));
+        assert_eq!(
+            receive_scan_gate(&mut io, "share", &mut |_| None).unwrap(),
+            None
+        );
+        let mut sent = Cursor::new(io.sent);
+        for _ in 0..2 {
+            assert!(matches!(
+                protocol::receive_for(&mut sent, "share").unwrap(),
+                Message::ScanContinue
+            ));
+        }
+        assert_eq!(sent.position(), sent.get_ref().len() as u64);
+    }
+    #[test]
+    fn delta_responder_gates_success_fallback_and_cancellation() {
+        struct DeltaStore {
+            inner: crate::storage::LocalStore,
+            mode: u8,
+            calls: usize,
+            discarded: bool,
+        }
+        impl Store for DeltaStore {
+            fn base_token(&self) -> Option<String> {
+                self.inner.base_token()
+            }
+            fn set_base_token(&mut self, token: Option<String>) {
+                self.inner.set_base_token(token)
+            }
+            fn delta_scan_with_control(
+                &mut self,
+                io: &mut (impl Read + Write),
+                paths: &BTreeSet<String>,
+            ) -> Result<Option<(BTreeSet<String>, Manifest)>> {
+                self.calls += 1;
+                protocol::send_for(io, "share", Message::ScanAlive)?;
+                match self.mode {
+                    1 => Ok(None),
+                    2 => Err(ScanDeferred.into()),
+                    _ => Ok(Some((paths.clone(), Manifest::new()))),
+                }
+            }
+            fn discard_scan(&mut self) -> Result<()> {
+                self.discarded = true;
+                Ok(())
+            }
+            fn scan(&mut self) -> Result<Manifest> {
+                self.inner.scan()
+            }
+            fn snapshot(&mut self, path: &str, entry: &Entry) -> Result<Snapshot> {
+                self.inner.snapshot(path, entry)
+            }
+            fn install(
+                &mut self,
+                path: &str,
+                expected: Option<&str>,
+                entry: &Entry,
+                staged: &Snapshot,
+            ) -> Result<()> {
+                self.inner.install(path, expected, entry, staged)
+            }
+        }
+        for mode in 0..4 {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = DeltaStore {
+                inner: crate::storage::LocalStore::open(directory.path()).unwrap(),
+                mode,
+                calls: 0,
+                discarded: false,
+            };
+            store.set_base_token(Some("a".repeat(64)));
+            let clock = std::sync::atomic::AtomicU64::new(0);
+            let mut steps = vec![frame(Message::DeltaScan {
+                base_token: "a".repeat(64),
+                paths: BTreeSet::from(["file".into()]),
+            })];
+            if mode != 2 {
+                steps.push(frame(if mode == 3 {
+                    Message::AuditPreempt {
+                        shares: vec!["b".repeat(64)],
+                    }
+                } else {
+                    Message::ScanContinue
+                }));
+            }
+            if mode < 2 {
+                steps.push(frame(Message::Done {
+                    transferred: 0,
+                    conflicts: 0,
+                    base_token: "a".repeat(64),
+                }));
+            }
+            let mut io = peer(&clock, steps);
+            let report = respond_share(&mut io, &mut store, Some("share")).unwrap();
+            assert_eq!(report.round_deferred, mode >= 2);
+            assert_eq!(store.calls, 1);
+            assert!(store.discarded);
+            let mut sent = Cursor::new(io.sent);
+            assert!(matches!(
+                protocol::receive_for(&mut sent, "share").unwrap(),
+                Message::ScanAlive
+            ));
+            if mode != 2 {
+                assert!(matches!(
+                    protocol::receive_for(&mut sent, "share").unwrap(),
+                    Message::ScanReady
+                ));
+            }
+            let response = protocol::receive_for(&mut sent, "share").unwrap();
+            assert!(match mode {
+                0 => matches!(response, Message::DeltaManifest { .. }),
+                1 => matches!(response, Message::NeedFullScan),
+                _ => matches!(response, Message::ScanDeferred),
+            });
+            assert_eq!(sent.position(), sent.get_ref().len() as u64);
+        }
+        #[cfg(unix)]
+        {
+            let pc = tempfile::tempdir().unwrap();
+            let phone = tempfile::tempdir().unwrap();
+            let mut local = crate::storage::LocalStore::open(pc.path()).unwrap();
+            local.allow_incremental_scan();
+            let mut remote = DeltaStore {
+                inner: crate::storage::LocalStore::open(phone.path()).unwrap(),
+                mode: 0,
+                calls: 0,
+                discarded: false,
+            };
+            let path = local.private().join("state.json");
+            let mut state = State::load(&path, "pair", "share").unwrap();
+            let (mut sender, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+            for socket in [&sender, &receiver] {
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+            }
+            // Establish a base, defer an incremental round, then reuse the same connection.
+            for round in 0..3 {
+                remote.mode = if round == 1 { 2 } else { 0 };
+                let prior = serde_json::to_value(&state).unwrap();
+                let prior_disk = std::fs::read(&path).ok();
+                std::thread::scope(|scope| {
+                    let worker =
+                        scope.spawn(|| respond_share(&mut receiver, &mut remote, Some("share")));
+                    let report = coordinate(&mut sender, &mut local, &mut state, &path).unwrap();
+                    assert_eq!(report.round_deferred, round == 1);
+                    assert_eq!(worker.join().unwrap().unwrap().round_deferred, round == 1);
+                });
+                if round == 1 {
+                    assert_eq!(serde_json::to_value(&state).unwrap(), prior);
+                    assert_eq!(std::fs::read(&path).ok(), prior_disk);
+                }
+            }
+            assert_eq!(remote.calls, 2);
+        }
+    }
+    #[test]
+    fn audit_preempt_drains_prior_liveness_and_defers_without_scan_continue() {
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let epoch = Instant::now();
+        let mut io = peer(
+            &clock,
+            vec![
+                Step::Idle(1),
+                frame(Message::ScanAlive),
+                frame(Message::ScanDeferred),
+            ],
+        );
+        let wanted = vec!["a".repeat(64)];
+        assert_eq!(
+            receive_scan_gate_with_clock(
+                &mut io,
+                "share",
+                &mut |_| Some(wanted.clone()),
+                || epoch + Duration::from_secs(clock.load(std::sync::atomic::Ordering::Relaxed)),
+                Duration::from_secs(90)
+            )
+            .unwrap(),
+            Some(wanted.clone())
+        );
+        let mut sent = Cursor::new(io.sent);
+        match protocol::receive_for(&mut sent, "share").unwrap() {
+            Message::AuditPreempt { shares } => assert_eq!(shares, wanted),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(sent.position(), sent.get_ref().len() as u64);
+    }
+    #[test]
+    fn responder_snapshot_failure_reaches_peer_with_cause_share_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"content").unwrap();
+        let mut store = crate::storage::LocalStore::open(dir.path()).unwrap();
+        let entry = store.scan().unwrap()["file"].clone();
+        std::fs::remove_file(dir.path().join("file")).unwrap();
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let mut io = peer(
+            &clock,
+            vec![frame(Message::Get {
+                path: "file".into(),
+                entry,
+            })],
+        );
+        let local = respond_share(&mut io, &mut store, Some("share")).unwrap_err();
+        let remote = protocol::receive(&mut Cursor::new(io.sent)).unwrap_err();
+        let error = remote.downcast_ref::<protocol::ShareError>().unwrap();
+        assert_eq!(error.operation, "snapshot");
+        assert_eq!(error.relative_path.as_deref(), Some("file"));
+        assert_eq!(error.share_id.as_deref(), Some("share"));
+        assert_eq!(error.kind, "filesystem");
+        assert!(error.message.contains(&local.to_string()));
+        assert!(!error.stream_reusable);
+    }
+    #[test]
+    fn peer_error_is_not_reflected_by_responder() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = crate::storage::LocalStore::open(directory.path()).unwrap();
+        let clock = std::sync::atomic::AtomicU64::new(0);
+        let mut io = peer(
+            &clock,
+            vec![frame(Message::Error {
+                message: "pc failed".into(),
+            })],
+        );
+        let error = respond_share(&mut io, &mut store, Some("share")).unwrap_err();
+        assert!(protocol::is_peer_error(&error));
+        assert!(io.sent.is_empty());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn liveness_rounds_reuse_connection_and_confirmed_files_survive_reconnect() {
+        use crate::storage::{LocalStore, Store};
+        struct AliveStore {
+            inner: LocalStore,
+            acknowledged: usize,
+            snapshots: usize,
+        }
+        impl Store for AliveStore {
+            fn scan(&mut self) -> Result<Manifest> {
+                self.inner.scan()
+            }
+            fn scan_with_control(&mut self, io: &mut (impl Read + Write)) -> Result<Manifest> {
+                for _ in 0..25 {
+                    protocol::send_for(io, "share", Message::ScanAlive)?;
+                }
+                self.scan()
+            }
+            fn snapshot(&mut self, path: &str, entry: &Entry) -> Result<Snapshot> {
+                self.snapshots += 1;
+                self.inner.snapshot(path, entry)
+            }
+            fn install(
+                &mut self,
+                path: &str,
+                expected: Option<&str>,
+                entry: &Entry,
+                staged: &Snapshot,
+            ) -> Result<()> {
+                self.inner.install(path, expected, entry, staged)
+            }
+            fn acknowledge(&mut self, path: &str, entry: &Entry) -> Result<()> {
+                self.inner.acknowledge(path, entry)?;
+                self.acknowledged += 1;
+                Ok(())
+            }
+        }
+        let pc = tempfile::tempdir().unwrap();
+        let android = tempfile::tempdir().unwrap();
+        for index in 0..9 {
+            std::fs::write(
+                android.path().join(format!("{index}.png")),
+                format!("content-{index}"),
+            )
+            .unwrap();
+        }
+        let mut local = LocalStore::open(pc.path()).unwrap();
+        let mut remote = AliveStore {
+            inner: LocalStore::open(android.path()).unwrap(),
+            acknowledged: 0,
+            snapshots: 0,
+        };
+        let state_path = local.private().join("state.json");
+        let mut state = State::load(&state_path, "pair", "share").unwrap();
+        let (mut sender, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        for round in 0..2 {
+            std::thread::scope(|scope| {
+                let worker =
+                    scope.spawn(|| respond_share(&mut receiver, &mut remote, Some("share")));
+                let report = coordinate(&mut sender, &mut local, &mut state, &state_path).unwrap();
+                assert_eq!(report.transferred, if round == 0 { 9 } else { 0 });
+                worker.join().unwrap().unwrap();
+            });
+        }
+        // Full reconciliation reaffirms equal files via ACK, without another Get/Blob.
+        assert_eq!(remote.acknowledged, 18);
+        assert_eq!(remote.snapshots, 9);
+        drop(sender);
+        drop(receiver);
+        state = State::load(&state_path, "pair", "share").unwrap();
+        let (mut sender, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| respond_share(&mut receiver, &mut remote, Some("share")));
+            assert_eq!(
+                coordinate(&mut sender, &mut local, &mut state, &state_path)
+                    .unwrap()
+                    .transferred,
+                0
+            );
+            worker.join().unwrap().unwrap();
+        });
+        assert_eq!(remote.acknowledged, 27);
+        assert_eq!(remote.snapshots, 9);
     }
 }

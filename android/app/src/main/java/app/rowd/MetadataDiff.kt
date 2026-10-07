@@ -1,5 +1,14 @@
 package app.rowd
 
+internal fun metadataRoots(prefixes: Set<String>): List<String> {
+    if ("" in prefixes) return listOf("")
+    val roots = linkedSetOf<String>()
+    for (prefix in prefixes.sortedBy { it.length }) {
+        if (prefix.indices.none { prefix[it] == '/' && prefix.substring(0, it) in roots }) roots.add(prefix)
+    }
+    return roots.toList()
+}
+
 /** Recursive discovery. File metadata can reuse a hash; it cannot prove a subtree unchanged. */
 internal class MetadataDiff(private val cached: Map<String, DocumentMetadata>, val startedAt: Long) {
     var directoriesVisited = 0

@@ -2,12 +2,17 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
 android {
     namespace = "app.rowd"
     compileSdk = 35
+    useLibrary("android.test.runner")
+    useLibrary("android.test.mock")
+    useLibrary("android.test.base")
+    testBuildType = "release"
     defaultConfig {
         applicationId = "app.rowd"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "0.8.2-alpha"
+        versionCode = 17
+        versionName = "0.8.4-alpha"
+        testInstrumentationRunner = "android.test.InstrumentationTestRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }

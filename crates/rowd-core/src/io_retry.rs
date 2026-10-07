@@ -8,6 +8,26 @@ pub fn interrupted<T>(operation: &str, syscall: impl FnMut() -> io::Result<T>) -
 /// Check control before the syscall and between EINTR retries, without replaying frames.
 pub fn interrupted_with_control<T>(
     operation: &str,
+    control: impl FnMut() -> io::Result<()>,
+    syscall: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    retry(operation, false, control, syscall)
+}
+
+/// Expected idle polling is not a failed syscall. Other errors and EINTR remain visible.
+pub fn poll<T>(operation: &str, syscall: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    poll_with_control(operation, || Ok(()), syscall)
+}
+pub fn poll_with_control<T>(
+    operation: &str,
+    control: impl FnMut() -> io::Result<()>,
+    syscall: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    retry(operation, true, control, syscall)
+}
+fn retry<T>(
+    operation: &str,
+    polling: bool,
     mut control: impl FnMut() -> io::Result<()>,
     mut syscall: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
@@ -24,7 +44,27 @@ pub fn interrupted_with_control<T>(
                     serde_json::json!({"operation":operation,"attempt":attempt})
                 );
             }
-            result => return result,
+            result => {
+                if let Err(error) = &result {
+                    if polling
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )
+                    {
+                        return result;
+                    }
+                    crate::trace_event!(
+                        crate::trace::Level::Debug,
+                        crate::trace::Component::Connection,
+                        "IO_SYSCALL_FAILED",
+                        serde_json::json!({"syscall":operation,"operation":operation,
+                            "error_kind":format!("{:?}", error.kind()),"errno":error.raw_os_error(),
+                            "message":error.to_string()})
+                    );
+                }
+                return result;
+            }
         }
     }
 }

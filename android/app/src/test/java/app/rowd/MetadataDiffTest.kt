@@ -4,6 +4,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class MetadataDiffTest {
+    @Test fun coalescedRootsKeepDisjointSubtreesAndRespectPathBoundaries() {
+        assertEquals(setOf("a", "a-b"), metadataRoots(setOf("a", "a/sub", "a-b", "a-b/sub")).toSet())
+        assertEquals(listOf(""), metadataRoots(setOf("", "a", "a/sub")))
+        assertTrue(metadataRoots(emptySet()).isEmpty())
+    }
+    @Test fun vanishedSubtreeReportsItsFilesWithoutDeletingAdjacentSubtree() {
+        val diff = MetadataDiff(mapOf("a/file" to metadata("a/file"), "a-b/file" to metadata("a-b/file")), 0)
+        diff.finish("a")
+        assertEquals(setOf("a/file"), diff.changed)
+    }
     private fun metadata(path: String, modified: Long = 100) = DocumentMetadata("uri:$path", modified, 5)
     @Test fun providerWideUnchangedTreeDoesNotHash() {
         val cached = mapOf("dir/a" to metadata("dir/a"), "dir/b" to metadata("dir/b"))

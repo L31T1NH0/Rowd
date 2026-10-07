@@ -1,6 +1,6 @@
 package app.rowd
 
-/** Fixed window from the first generic callback: continuous notifications never postpone work. */
+/** Fixed window from the first directory/generic callback: notifications never postpone work. */
 internal class ObserverBursts {
     companion object { const val WINDOW_MS = 100L }
     data class Burst(val provider: String, val startedAt: Long, var callbacks: Int = 0,

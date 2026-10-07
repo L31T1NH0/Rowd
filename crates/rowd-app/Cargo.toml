@@ -20,3 +20,6 @@ base64 = "0.22"
 fs2 = "0.4"
 if-addrs = "0.13"
 tempfile = "3"
+
+[dev-dependencies]
+rowd-core = { path = "../rowd-core", features = ["dev-tools"] }

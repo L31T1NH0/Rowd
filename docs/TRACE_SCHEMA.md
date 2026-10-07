@@ -89,9 +89,9 @@ file_id permanece hex(SHA256(share_id + NUL + relative_path)[0..8]), compatível
 
 Lifecycle: TRACE_START/STOP, TRACE_PRODUCER_STOP, PROCESS_START/STOP, DAEMON_START/READY/STOP, ANDROID_SERVICE_CREATE/START/STOP/DESTROY, WORKER_START/STOP/INTERRUPTED e SYNC_IDLE_ENTER/EXIT.
 
-Watcher: OBSERVER_REFRESH_START, OBSERVER_REGISTER_START/REGISTERED/REGISTER_FAILED, OBSERVER_UNREGISTERED, OBSERVER_CALLBACK, OBSERVER_CHANGE_CLASSIFIED, WAKE_REQUESTED (source, generation, detected_at_ms) e WATCHER_QUEUE_OVERFLOW. Falhas de registro preservam o fallback full_audit e suas causas.
+Watcher: OBSERVER_REFRESH_START, OBSERVER_REGISTER_START/REGISTERED/REGISTER_FAILED, OBSERVER_UNREGISTERED, OBSERVER_CALLBACK, OBSERVER_CHANGE_CLASSIFIED, WAKE_REQUESTED (source, generation, detected_at_ms) e WATCHER_QUEUE_OVERFLOW. No PC, WATCHER_EVENTS_RECEIVED, WATCHER_EVENTS_DROPPED_IRRELEVANT, WATCHER_EVENTS_QUEUED e WATCHER_QUEUE_OVERFLOW agregam contagens por intervalo de aproximadamente um segundo. Access sem Rescan e caminhos inteiramente internos (.rowd) são descartados antes do canal; alterações de .rowdignore continuam invalidando as regras. Overflow acumula as Shares afetadas e invalida seus caches com wake pelo debounce existente, sem acordar todas as Shares a cada perda. Falhas de registro preservam o fallback full_audit e suas causas.
 
-Scheduler: ROUND_CREATED/START/END (um terminal result=success/failed para cada início, incluindo retornos antecipados), SHARE_SYNC_START/END, SHARE_CONSIDERED/SELECTED/SKIPPED/FAILED e FILE_RECONCILE_DECISION. Decisões registram reason, foco, disponibilidade, política de direção e hashes/estado relevantes, sem modificar a ordem ou algoritmo existente.
+Scheduler: ROUND_CREATED/START/END (um terminal result=success/failed para cada início, incluindo retornos antecipados), SHARE_SYNC_START/END, SHARE_CONSIDERED/SELECTED/SKIPPED/FAILED e FILE_RECONCILE_DECISION. Decisões registram reason, foco, disponibilidade, política de direção e hashes/estado relevantes, A fila negociada representa as Shares ainda elegíveis: o coordenador escolhe a ordem e cada identidade só pode ser selecionada/pulada uma vez. Shares desabilitadas, indisponíveis, fora do foco negociado ou desconhecidas não entram nesse conjunto.
 
 Scanner/filesystem: FILE_FIRST_SEEN, FILE_ENUMERATED, FILE_HASH_START/END/REUSED, AUDIT_SCHEDULED/START/END, DEEP_AUDIT_START/END, DELTA_UNAVAILABLE, DELTA_SCAN_START/END, FULL_SCAN_FALLBACK, SNAPSHOT_START/END e INSTALL_START/END. Os eventos atuais de scan, manifest e cache continuam normalizados para maiúsculas.
 
@@ -297,3 +297,65 @@ hashes, não um ganho de poda hierárquica. `scripts/validate-android-idle.sh` c
 sendo o cenário reproduzível de 10 minutos em aparelho, com counters exatos e verificação
 de `empty_poll_count=0`. Providers SAF reais, suspend/resume e latência do Handler
 precisam de validação em aparelho. Este ambiente não disponibiliza aparelho/emulador.
+
+## Solicitação manual e cleanup SAF
+
+`.rowd/next-share.json` contém `{share_id, request_id}`; o formato legado (string)
+continua aceito. MANUAL_SHARE_REQUESTED registra a gravação pela UI;
+MANUAL_SHARE_ACCEPTED registra uma solicitação elegível no conjunto negociado;
+MANUAL_SHARE_COMPLETED remove a solicitação após a conclusão daquela Share.
+MANUAL_SHARE_RETRY mantém a solicitação após transporte temporário ou preempção;
+MANUAL_SHARE_REJECTED remove e reporta pedidos inválidos, indisponíveis ou falhas
+lógicas/protocolares. Se o binding Android desaparecer depois de Capabilities,
+o cliente envia Error antes de encerrar, para o PC distinguir a rejeição de EOF
+de transporte. A remoção compara o request_id sob o lock de configuração,
+preservando uma nova solicitação recebida durante a rodada.
+
+O poll SAF consome o resultado; finishScanJson aguarda o worker sem consumir esse
+resultado novamente e retorna a idle, inclusive depois de um poll concluído.
+Cleanup só descarta o scan depois de o worker terminar. selectShare rejeita um
+worker pendente. Não há scans concorrentes de Shares diferentes.
+
+IO_SYSCALL_FAILED registra syscall/operation, error_kind, errno e mensagem, com
+componente e contexto herdado (Share, rodada, conexão quando disponíveis).
+Callers de polling usam `io_retry::poll`/`poll_with_control`: WouldBlock/EAGAIN e
+TimedOut esperados retornam ao caller sem emitir um evento por ciclo. Callers de
+I/O normal continuam registrando essas falhas. Erros reais de polling continuam
+em IO_SYSCALL_FAILED; IO_INTERRUPTED_RETRY continua restrito a EINTR.
+
+No protocolo 13, ScanAlive era scoped pelo Share e só circulava entre Scan e ScanReady.
+PROTOCOL_SEND/PROTOCOL_RECEIVE registram esses frames; o intervalo Android é 5 s,
+e o deadline PC é 90 s sem liveness completo. ScanReady encerra esse fluxo antes
+de ScanContinue/manifest. Não há limite total de duração nessa espera.
+
+ShareError traz side, share_id, operation, relative_path, kind, message e
+stream_reusable. O trace do frame inclui share_error. SHARE_FAILED no responder
+inclui operation, relative_path, kind e frame_boundary, além da cadeia/errno.
+Um Blob incompleto impede inserir um frame de erro naquela direção; a falha
+local continua registrada antes do fechamento. Erros recebidos não são refletidos.
+
+## Full scan em fluxo (protocolo 14)
+
+NAMESPACE_BEGIN/CHUNK/END e HASH_STREAM_BEGIN/HASH_CHUNK/HASH_STREAM_END
+registram scan_id, sequência e contagem quando emitidos pelo protocolo.
+`protocol_event` distingue envio de recebimento. Binding aparece no begin;
+HashStreamEnd inclui as métricas finais do worker. ScanAlive também é permitido
+durante a espera por um HashNext, com o mesmo intervalo de cinco segundos.
+
+PIPELINE_BACKPRESSURE_START/END marcam espera por fila ou pool de sources.
+HASH_STAGED/HASH_REUSED identificam leitura com staging e reuse físico.
+PC_TO_ANDROID_STAGED é apenas receipt privado; PC_TO_ANDROID_STAGE_INSTALLED
+registra instalação posterior ao commit do scan, sem promover committed base.
+
+INTERNAL_WRITE_REGISTERED/MATCHED/MISMATCH acompanham o registro funcional
+consultado pelo watcher. STREAM_PREEMPT_REQUESTED/APPLIED incluem phase e
+frame_boundary quando emitidos pelo coordenador. SAF_SOURCE_LOOKUP_FALLBACK
+identifica providers que exigem a resolução conservadora de uma URI descoberta.
+
+ShareMetrics contém namespace_ms, time_to_first_hash_ms,
+time_to_first_transfer_ms, hashes_calculated/reused, bytes_hashed,
+files_staged_during_hash, duplicate_reads_avoided, queue_peak_chunks,
+queue_wait_ms, saf_source_lookup_fallback_count, hash_stream_ms e contadores
+transfers_started/completed_before_hash_end. first_transfer_ms mantém sua
+referência anterior ao início da rodada; time_to_first_transfer_ms usa o início
+do hash stream nos full scans. Sem transferência, os tempos opcionais são null.

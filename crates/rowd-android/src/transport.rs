@@ -66,6 +66,16 @@ impl std::fmt::Display for PendingWakes {
 }
 impl std::error::Error for PendingWakes {}
 
+pub fn requires_reconnect(error: &anyhow::Error, kind: FailureKind) -> bool {
+    kind.invalidates()
+        || error
+            .downcast_ref::<rowd_core::protocol::ShareError>()
+            .is_some_and(|e| !e.stream_reusable)
+        || error
+            .downcast_ref::<rowd_core::managed::RoundFailure>()
+            .is_some_and(|e| !e.stream_reusable)
+}
+
 pub fn classify(error: &anyhow::Error, generation_changed: bool, cancelled: bool) -> FailureKind {
     if generation_changed {
         return FailureKind::NetworkGenerationChanged;
@@ -84,6 +94,14 @@ pub fn classify(error: &anyhow::Error, generation_changed: bool, cancelled: bool
         ) {
             return FailureKind::TransportInvalid;
         }
+    }
+    if let Some(remote) = error.downcast_ref::<rowd_core::protocol::ShareError>() {
+        return match remote.kind.as_str() {
+            "filesystem" => FailureKind::FilesystemError,
+            "transport" => FailureKind::TransportInvalid,
+            "protocol" => FailureKind::ProtocolFatal,
+            _ => FailureKind::ShareOperationError,
+        };
     }
     // An unfinished frame/session cannot safely be replayed, even for a local error or cancel.
     let round = error.downcast_ref::<rowd_core::managed::RoundFailure>();
@@ -203,13 +221,13 @@ pub fn wait_for_wake(
     mut peek: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
 ) -> std::io::Result<WakeReadiness> {
     let mut byte = [0];
-    match rowd_core::io_retry::interrupted("poll_wake_tls_read", || read(&mut byte)) {
+    match rowd_core::io_retry::poll("poll_wake_tls_read", || read(&mut byte)) {
         Ok(0) => return Ok(WakeReadiness::Eof),
         Ok(_) => return Ok(WakeReadiness::Buffered(byte[0])),
         Err(e) if e.kind() == ErrorKind::WouldBlock => {}
         Err(e) => return Err(e),
     }
-    match rowd_core::io_retry::interrupted("poll_wake_peek", || peek(&mut byte)) {
+    match rowd_core::io_retry::poll("poll_wake_peek", || peek(&mut byte)) {
         Ok(0) => Ok(WakeReadiness::Eof),
         Ok(_) => Ok(WakeReadiness::SocketData),
         Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
@@ -334,5 +352,28 @@ mod scan_tests {
         );
         assert_eq!(classify(&cancelled, false, true), FailureKind::Cancelled);
         assert!(!classify(&cancelled, false, true).invalidates());
+    }
+}
+
+#[cfg(test)]
+mod remote_error_tests {
+    use super::*;
+    #[test]
+    fn remote_filesystem_cause_and_stream_reuse_are_independent() {
+        for reusable in [false, true] {
+            let error: anyhow::Error = rowd_core::protocol::ShareError {
+                side: "pc".into(),
+                share_id: Some("share".into()),
+                operation: "snapshot".into(),
+                relative_path: Some("file".into()),
+                kind: "filesystem".into(),
+                message: "permission denied".into(),
+                stream_reusable: reusable,
+            }
+            .into();
+            let kind = classify(&error, false, false);
+            assert_eq!(kind, FailureKind::FilesystemError);
+            assert_eq!(requires_reconnect(&error, kind), !reusable);
+        }
     }
 }

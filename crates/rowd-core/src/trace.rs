@@ -1348,6 +1348,57 @@ mod tests {
         .unwrap();
         assert_eq!(peeked, 1);
         {
+            let _io_context = current_context()
+                .with("share_id", "errno-share")
+                .with("round_id", "errno-round")
+                .with("connection_id", "errno-connection")
+                .enter();
+            for index in 0..10_000 {
+                let kind = if index % 2 == 0 {
+                    std::io::ErrorKind::WouldBlock
+                } else {
+                    std::io::ErrorKind::TimedOut
+                };
+                assert_eq!(
+                    crate::io_retry::poll::<usize>(
+                        "scan_peek_idle_regression",
+                        || Err(kind.into())
+                    )
+                    .unwrap_err()
+                    .kind(),
+                    kind
+                );
+            }
+            let mut attempts = 0;
+            let result = crate::io_retry::interrupted::<usize>("diagnostic_syscall", || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(11))
+            });
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(11));
+            assert_eq!(attempts, 1); // Diagnostics never retries EAGAIN.
+            let records: Vec<Value> = fs::read_to_string(latest.join("trace-0001.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(!records.iter().any(|r| r["event"] == "IO_SYSCALL_FAILED"
+                && r["fields"]["syscall"] == "scan_peek_idle_regression"));
+            let failure = records
+                .iter()
+                .rev()
+                .find(|record| {
+                    record["event"] == "IO_SYSCALL_FAILED"
+                        && record["fields"]["syscall"] == "diagnostic_syscall"
+                })
+                .unwrap();
+            assert_eq!(failure["component"], "Connection");
+            assert_eq!(failure["fields"]["errno"], 11);
+            assert!(failure["fields"]["error_kind"].is_string());
+            assert_eq!(failure["context"]["share_id"], "errno-share");
+            assert_eq!(failure["context"]["round_id"], "errno-round");
+            assert_eq!(failure["context"]["connection_id"], "errno-connection");
+        }
+        {
             let _share = current_context().with("share_id", "origin-test").enter();
             remote_installed("received.txt", "verified-hash");
             first_seen(
@@ -1419,7 +1470,7 @@ mod tests {
                 v["event"] == "ROUND_END" && v["context"]["connection_id"] == "lifecycle-connection"
             })
             .collect();
-        assert_eq!(starts.len(), 4);
+        assert_eq!(starts.len(), 5);
         assert_eq!(starts.len(), ends.len());
         for start in starts {
             assert_eq!(
@@ -1433,7 +1484,7 @@ mod tests {
             ends.iter()
                 .filter(|end| end["fields"]["result"] == "failed")
                 .count(),
-            2
+            3
         );
         // Read-only descriptor makes writes fail without depending on disk capacity.
         session().lock().unwrap().as_mut().unwrap().writer =
