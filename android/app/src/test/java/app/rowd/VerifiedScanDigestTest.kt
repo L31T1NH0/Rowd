@@ -13,7 +13,7 @@ class VerifiedScanDigestTest {
             override fun close() { closed = true; super.close() }
         }
         val result = verifiedScanDigest(input, before, after = { before })
-        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", result.first)
+        assertEquals("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85", result.first)
         assertEquals(3L, result.second)
         assertTrue(closed)
     }

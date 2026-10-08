@@ -4,6 +4,25 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WakeStateTest {
+    @Test fun startupRequestsAllSharesEvenAfterPreviousServiceConsumedItsWakes() {
+        val state = WakeState()
+        state.wake(null, WakeSource.MANUAL, 1)
+        state.wake("camera", WakeSource.LOCAL_OBSERVER, 2)
+        state.complete(state.dirtyShares.toMap(), setOf("camera"))
+        state.dirty = false
+        val completedAllGeneration = state.dirtyAllGeneration
+
+        state.wake(null, WakeSource.STARTUP, 3)
+
+        assertTrue(state.dirty)
+        assertTrue(state.dirtyShares.isEmpty())
+        // An all-Share request must bypass the one-Share periodic audit.
+        assertTrue(state.dirtyAllGeneration > completedAllGeneration)
+        assertEquals(state.dirtyAllGeneration, state.generationFor("camera"))
+        assertEquals(state.dirtyAllGeneration, state.generationFor("documents"))
+        assertEquals(WakeSource.STARTUP, state.sources["*"])
+    }
+
     @Test fun otherShareAndReconnectDoNotInvalidateActiveShare() {
         val state = WakeState()
         state.wake("A", WakeSource.LOCAL_OBSERVER, 1)

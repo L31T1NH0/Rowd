@@ -73,6 +73,43 @@ fn retry<T>(
 mod tests {
     use super::*;
     #[test]
+    fn idle_poll_is_quiet_but_real_failures_remain_visible() {
+        let _session = crate::trace::TEST_SESSION_LOCK.lock().unwrap();
+        let round_id = crate::trace::new_id("idle-poll-test");
+        let _context = crate::trace::TraceContext::default()
+            .with("round_id", round_id.clone())
+            .enter();
+        let directory = tempfile::tempdir().unwrap();
+        crate::trace::start(directory.path(), "pc", None).unwrap();
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            assert_eq!(
+                poll::<()>("accept", || Err(kind.into()))
+                    .unwrap_err()
+                    .kind(),
+                kind
+            );
+        }
+        assert_eq!(
+            poll::<()>("accept", || Err(io::ErrorKind::ConnectionReset.into()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        crate::trace::stop("test_complete").unwrap();
+        let trace = std::fs::read_to_string(directory.path().join("Latest-trace/trace-0001.jsonl"))
+            .unwrap();
+        let failures: Vec<serde_json::Value> = trace
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| {
+                event["event"] == "IO_SYSCALL_FAILED" && event["context"]["round_id"] == round_id
+            })
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["fields"]["error_kind"], "ConnectionReset");
+    }
+
+    #[test]
     fn interrupted_peek_and_wait_retry_without_invalidating() {
         for operation in [
             "scan_peek",

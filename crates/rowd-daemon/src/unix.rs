@@ -578,7 +578,7 @@ pub fn run(home: &Path) -> Result<()> {
             );
             snapshot_at = Instant::now();
         }
-        match rowd_core::io_retry::interrupted("accept", || listener.accept()) {
+        match rowd_core::io_retry::poll("accept", || listener.accept()) {
             Ok((stream, _)) => {
                 let state = state.clone();
                 handlers.retain(|handle: &std::thread::JoinHandle<()>| !handle.is_finished());
@@ -597,7 +597,7 @@ pub fn run(home: &Path) -> Result<()> {
                 }));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50))
+                std::thread::sleep(Duration::from_millis(250))
             }
             Err(error) => {
                 state.logs.emit(format!("{} IPC error: {error}", now()));

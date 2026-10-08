@@ -23,6 +23,10 @@ class DiagnosticReceiver : BroadcastReceiver() {
                     if (intent.getStringExtra("command") == "idle-begin") "IDLE_VALIDATION_BEGIN" else "IDLE_VALIDATION_END", null,
                     component = PerformanceTrace.Component.Service, detail = JSONObject(NativeBridge.traceRuntimeState()), sourceFile = "DiagnosticReceiver.kt", sourceLine = 22)
                 "sync-start" -> if (!SyncService.busy.get()) context.startForegroundService(Intent(context, SyncService::class.java))
+                "sync-stop" -> context.startService(Intent(context, SyncService::class.java).setAction(SyncService.STOP))
+                "process-kill" -> android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                }, 1_000L)
                 "sync-now" -> {
                     val shares = JSONArray(FolderAccess(context).knownShares())
                     for (index in 0 until shares.length())
@@ -44,6 +48,8 @@ class DiagnosticReceiver : BroadcastReceiver() {
             }
             Log.i("RowdDiagnostic", "command=${intent.getStringExtra("command")} result=ok")
         } catch (error: Exception) {
+            resultCode = 1
+            resultData = error.message
             Log.e("RowdDiagnostic", "command failed", error)
         }
     }

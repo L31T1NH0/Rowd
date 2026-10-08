@@ -1,3 +1,4 @@
+mod digest;
 mod idle;
 mod transport;
 use anyhow::{ensure, Context, Result};
@@ -760,6 +761,18 @@ impl Store for AndroidStore<'_, '_, '_> {
     fn discard_scan(&mut self) -> Result<()> {
         self.call("discardScanJson", &[])?;
         Ok(())
+    }
+    fn legacy_hash_with_control(
+        &mut self,
+        io: &mut (impl Read + Write),
+        path: &str,
+        entry: &Entry,
+    ) -> Result<String> {
+        self.call(
+            "startLegacyHashJson",
+            &[path, &entry.hash, &entry.size.to_string()],
+        )?;
+        self.poll_stream(io, "pollScanJson")
     }
     fn snapshot(&mut self, path: &str, entry: &Entry) -> Result<VerifiedStaged> {
         check_cancelled()?;

@@ -6,7 +6,11 @@ import java.security.MessageDigest
 
 /** Control is optional: snapshot/recovery callers retain their own cancellation semantics. */
 internal fun scanDigest(input: InputStream, copy: OutputStream? = null,
-    checkControl: () -> Unit = {}): Pair<String, Long> {
+    legacy: Boolean = false, checkControl: () -> Unit = {}): Pair<String, Long> {
+    if (!legacy) return input.use { stream ->
+        val result = ContentDigest.hashStream(stream, copy, checkControl).split(':')
+        result[0] to result[1].toLong()
+    }
     val md = MessageDigest.getInstance("SHA-256")
     var size = 0L
     val buffer = ByteArray(64 * 1024)

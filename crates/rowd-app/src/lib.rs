@@ -1188,9 +1188,7 @@ fn recovery(home: &Path) -> Result<Vec<RecoveryItem>> {
 fn recovery_from_config(cfg: &DeviceConfig) -> Result<Vec<RecoveryItem>> {
     let mut items = Vec::new();
     for share in &cfg.shares {
-        let store = LocalStore::open_recovery(&share.root)?;
-        for entry in store.recovery_entries()? {
-            let backup = store.private().join("recovery").join(&entry.id);
+        for entry in LocalStore::read_recovery_entries(&share.root)? {
             items.push(RecoveryItem {
                 share_id: share.share_id.clone(),
                 share_name: share.name.clone(),
@@ -1198,10 +1196,7 @@ fn recovery_from_config(cfg: &DeviceConfig) -> Result<Vec<RecoveryItem>> {
                 path: entry.path,
                 finished: entry.finished,
                 backup_available: entry.backup_available,
-                bytes: backup
-                    .metadata()
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
+                bytes: entry.bytes,
             });
         }
     }
@@ -1732,14 +1727,27 @@ fn scan_share(
     Ok(())
 }
 
-fn invalidate_share_cache_serialized(
+fn try_invalidate_share_cache_serialized(
     home: &Path,
     share: &ShareConfig,
     full: bool,
     dirty: Option<&BTreeSet<String>>,
-) -> Result<()> {
-    let _session = session_guard(home)?;
-    LocalStore::queue_cache_invalidation(&share.root, full, dirty)
+) -> Result<bool> {
+    let directory = home.join(".rowd-locks");
+    fs::create_dir_all(&directory)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("session.lock"))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    LocalStore::queue_cache_invalidation(&share.root, full, dirty)?;
+    Ok(true)
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Status {
@@ -1960,7 +1968,7 @@ fn session(
     );
     event("Android conectado".into());
     signal(AppSignal::new("connected", None));
-    io.sock.set_read_timeout(Some(Duration::from_millis(50)))?;
+    io.sock.set_read_timeout(Some(Duration::from_millis(250)))?;
     let mut audit_preempted = false;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -2030,7 +2038,7 @@ fn session(
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            io.sock.set_read_timeout(Some(Duration::from_millis(50)))?;
+            io.sock.set_read_timeout(Some(Duration::from_millis(250)))?;
         }
         let mut pending = BTreeSet::new();
         while let Ok(id) = wakes.try_recv() {
@@ -2915,8 +2923,9 @@ fn serve(
     let (tx, rx) = mpsc::sync_channel(1024);
     let watcher_ingress = Arc::new(watcher::Ingress::default());
     let callback_ingress = watcher_ingress.clone();
+    let callback_tx = tx.clone();
     let mut watcher: Option<RecommendedWatcher> = match notify::recommended_watcher(move |event| {
-        callback_ingress.send(&tx, event);
+        callback_ingress.send(&callback_tx, event);
     }) {
         Ok(watcher) => Some(watcher),
         Err(e) => {
@@ -2926,7 +2935,9 @@ fn serve(
     };
     let mut watcher_untrusted = watcher.is_none();
     let mut watched: BTreeMap<String, ShareConfig> = BTreeMap::new();
+    let mut pending_watch_registration = BTreeSet::new();
     let mut dirty: BTreeMap<String, (Instant, BTreeSet<String>)> = BTreeMap::new();
+    let mut watcher_changes = BTreeSet::new();
     let mut full = false;
     let mut last_watcher_metrics = Instant::now();
     let mut last_fallback = Instant::now();
@@ -2939,6 +2950,7 @@ fn serve(
     let result = std::thread::scope(|scope| -> Result<()> {
         let mut candidates: Vec<std::thread::ScopedJoinHandle<'_, Result<()>>> = Vec::new();
         let mut candidate_id = 0u64;
+        let mut pending_event = None;
         while !stop.load(Ordering::Relaxed) {
             for message in responder_error_rx.try_iter() {
                 event(message);
@@ -2984,9 +2996,7 @@ fn serve(
                                 ));
                             }
                         }
-                        if let Err(e) = invalidate_share_cache_serialized(home, share, true, None) {
-                            event(format!("{}: {e:#}", share.name));
-                        }
+                        pending_watch_registration.insert(share.share_id.clone());
                     }
                 }
                 watched = cfg
@@ -3000,6 +3010,25 @@ fn serve(
                     .map(|(id, share)| (id.clone(), share.root.clone()))
                     .collect();
                 last_config = Instant::now();
+            }
+            // Registration invalidates trust but is not a user edit or a wake.
+            pending_watch_registration.retain(|id| watched.contains_key(id));
+            for id in pending_watch_registration.clone() {
+                let share = &watched[&id];
+                match try_invalidate_share_cache_serialized(home, share, true, None) {
+                    Ok(false) => {} // Retry without blocking event consumption.
+                    Ok(true) => {
+                        pending_watch_registration.remove(&id);
+                        #[cfg(target_os = "linux")]
+                        if let Some(watcher) = &mut watcher {
+                            watcher::exclude_private(watcher, &share.root);
+                        }
+                    }
+                    Err(error) => {
+                        pending_watch_registration.remove(&id);
+                        event(format!("{}: {error:#}", share.name));
+                    }
+                }
             }
             if last_watcher_metrics.elapsed() >= Duration::from_secs(1) {
                 let counts = watcher_ingress.drain_metrics();
@@ -3029,6 +3058,7 @@ fn serve(
                 // Coalesce lost relevant events once per interval. Persist a full
                 // invalidation for affected roots; the usual debounce sends one wake.
                 for id in watcher_ingress.take_recovery() {
+                    watcher_changes.insert(id.clone());
                     let entry = dirty
                         .entry(id)
                         .or_insert_with(|| (Instant::now(), BTreeSet::new()));
@@ -3037,7 +3067,7 @@ fn serve(
                 }
                 last_watcher_metrics = Instant::now();
             }
-            for result in rx.try_iter() {
+            for result in pending_event.take().into_iter().chain(rx.try_iter()) {
                 match result {
                     Ok(Event {
                         kind, paths, attrs, ..
@@ -3115,6 +3145,7 @@ fn serve(
                                             let generation = events.0;
                                             events.1.insert(share.share_id.clone(), generation);
                                         }
+                                        watcher_changes.insert(share.share_id.clone());
                                         if !dirty.contains_key(&share.share_id) {
                                             signal(AppSignal::new(
                                                 "change",
@@ -3156,15 +3187,22 @@ fn serve(
             if last_full.elapsed() >= Duration::from_secs(15 * 60) {
                 full = true;
             }
+            if full {
+                for share in watched.values() {
+                    dirty.insert(
+                        share.share_id.clone(),
+                        (Instant::now(), BTreeSet::from([String::new()])),
+                    );
+                }
+                last_full = Instant::now();
+                full = false;
+            }
             for share in watched.values() {
-                if full
-                    || fallback
-                    || dirty
-                        .get(&share.share_id)
-                        .is_some_and(|(t, _)| t.elapsed() >= Duration::from_millis(150))
+                if dirty
+                    .get(&share.share_id)
+                    .is_some_and(|(t, _)| t.elapsed() >= Duration::from_millis(150))
                 {
-                    let changed = dirty.contains_key(&share.share_id);
-                    let wake = full || changed;
+                    let changed = watcher_changes.contains(&share.share_id);
                     if !share.root.is_dir() {
                         let (_, paths) = dirty
                             .entry(share.share_id.clone())
@@ -3174,22 +3212,30 @@ fn serve(
                         continue;
                     }
                     if changed && active.lock().unwrap().is_some() {
-                        urgent.lock().unwrap().insert(share.share_id.clone(), false);
+                        urgent
+                            .lock()
+                            .unwrap()
+                            .entry(share.share_id.clone())
+                            .or_insert(false);
                     }
-                    invalidate_share_cache_serialized(
+                    if !try_invalidate_share_cache_serialized(
                         home,
                         share,
-                        full,
+                        false,
                         dirty.get(&share.share_id).map(|(_, paths)| paths),
                     )
-                    .with_context(|| format!("watcher hint for {}", share.name))?;
+                    .with_context(|| format!("watcher hint for {}", share.name))?
+                    {
+                        continue; // Keep the hint and keep draining the watcher while sync owns the session.
+                    }
                     dirty.remove(&share.share_id);
+                    watcher_changes.remove(&share.share_id);
                     let delivered = urgent
                         .lock()
                         .unwrap()
                         .remove(&share.share_id)
                         .unwrap_or(false);
-                    if wake && !delivered {
+                    if !delivered {
                         if let Some((_, _, tx)) = &*active.lock().unwrap() {
                             let _ = tx.send(share.share_id.clone());
                             event(format!("{}: wake enviado", share.name));
@@ -3197,14 +3243,10 @@ fn serve(
                     }
                 }
             }
-            if full || fallback {
+            if fallback {
                 last_fallback = Instant::now();
-                if full {
-                    last_full = Instant::now();
-                }
-                full = false;
             }
-            match rowd_core::io_retry::interrupted("accept", || listener.accept()) {
+            match rowd_core::io_retry::poll("accept", || listener.accept()) {
                 Ok((socket, _)) => {
                     // Bound unauthenticated candidates; each has a five-second deadline.
                     if candidates.len() >= 5 {
@@ -3257,7 +3299,14 @@ fn serve(
                     candidates.push(handle);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50))
+                    // Real file events wake immediately; connection/control checks stay bounded.
+                    pending_event = match rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(event) => Some(event),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(anyhow::anyhow!("watcher channel disconnected"));
+                        }
+                    };
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -3304,6 +3353,97 @@ fn pairing_payload(cfg: &DeviceConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_server_delivers_file_wakes_and_stops_promptly() {
+        let (_directory, app, root) = configured_app();
+        let id = app
+            .add_share("photos".into(), root.clone(), SyncMode::Bidirectional)
+            .unwrap();
+        let cfg = app.config().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let home = app.home().to_path_buf();
+        let (tx, notices) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            serve(
+                &home,
+                Some("127.0.0.1:0"),
+                false,
+                worker_stop,
+                |message| {
+                    let _ = tx.send(message);
+                },
+                &|_| {},
+            )
+        });
+        let result = (|| -> Result<()> {
+            let listening = notices.recv_timeout(Duration::from_secs(3))?;
+            let endpoint = listening
+                .strip_prefix("Rowd ouvindo em ")
+                .context("missing listener endpoint")?;
+            let mut io = tls::connect_pinned(&cfg.cert, endpoint, Duration::from_secs(3))?;
+            protocol::client_auth(&mut io, &cfg.pair_id, &cfg.secret, &"ab".repeat(32))?;
+            io.sock.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while notices.recv_timeout(deadline.saturating_duration_since(Instant::now()))?
+                != "Android conectado"
+            {}
+            std::thread::sleep(Duration::from_millis(350));
+            let changed = Instant::now();
+            fs::write(root.join("new.jpg"), "photo")?;
+            ensure!(
+                matches!(protocol::receive(&mut io)?, Message::WakeShare { share_id } if share_id == id),
+                "file edit did not wake the idle peer"
+            );
+            ensure!(
+                changed.elapsed() < Duration::from_secs(2),
+                "file wake was delayed"
+            );
+            Ok(())
+        })();
+        let stopping = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap().unwrap();
+        assert!(stopping.elapsed() < Duration::from_secs(2));
+        result.unwrap();
+    }
+
+    #[test]
+    fn watcher_hint_does_not_block_behind_active_session_or_lose_pending_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalStore::open(root.path()).unwrap();
+        let share = ShareConfig {
+            share_id: "share".into(),
+            name: "print".into(),
+            root: root.path().into(),
+            binding_revision: 0,
+            mode: SyncMode::Bidirectional,
+            enabled: true,
+            legacy_ignore: String::new(),
+            request_id: None,
+            remap_policy: None,
+        };
+        let dirty = BTreeSet::from(["image.png".into()]);
+        let session = session_guard(home.path()).unwrap();
+        let start = Instant::now();
+        assert!(
+            !try_invalidate_share_cache_serialized(home.path(), &share, false, Some(&dirty))
+                .unwrap()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!store.private().join("cache-dirty.json").exists());
+        drop(session);
+        assert!(
+            try_invalidate_share_cache_serialized(home.path(), &share, false, Some(&dirty))
+                .unwrap()
+        );
+        let hint: serde_json::Value =
+            serde_json::from_reader(File::open(store.private().join("cache-dirty.json")).unwrap())
+                .unwrap();
+        assert_eq!(hint["paths"], serde_json::json!(["image.png"]));
+    }
 
     fn run_manual_round(home: &Path, android: &Path, failure: &str) -> Result<()> {
         use rowd_core::managed::{client_round_on, LocalDevice};

@@ -2,6 +2,20 @@ package app.rowd
 
 internal enum class WakeSource { LOCAL_OBSERVER, REMOTE_WAKE, PERIODIC_AUDIT, MANUAL, NETWORK_RECONNECT, STARTUP }
 
+internal class AuditRotation {
+    private var cursor = 0L
+
+    fun select(available: Set<String>, enabled: Set<String>): String? {
+        val eligible = available.intersect(enabled).sorted()
+        return if (eligible.isEmpty()) null else eligible[(cursor % eligible.size).toInt()]
+    }
+
+    fun complete(share: String?, deferred: Boolean) {
+        // A Share disabled or unbound during the round must not pin the rotation.
+        if (share != null && !deferred) cursor++
+    }
+}
+
 /** Guarded by SyncService.changes. Transport state never mutates filesystem generations. */
 internal class WakeState {
     var dirty = false

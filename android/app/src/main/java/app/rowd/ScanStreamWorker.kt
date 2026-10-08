@@ -39,7 +39,8 @@ internal class ScanStreamWorker(private val backpressure: (Boolean) -> Unit = {}
         queue.poll()?.let { return it }
         if (!current.isDone) return ""
         current.get() // Propagate a worker failure, never publish partial hashes.
-        return "end"
+        // The producer may publish between the first poll and isDone.
+        return queue.poll() ?: "end"
     }
     fun cancel() { cancelled.set(true) }
     fun finish() {

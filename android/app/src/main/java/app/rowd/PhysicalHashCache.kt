@@ -31,7 +31,7 @@ internal class PhysicalHashCache(private val directory: File) {
             val payload = bytes.copyOfRange(0, bytes.size - 32)
             check(MessageDigest.isEqual(MessageDigest.getInstance("SHA-256").digest(payload), bytes.copyOfRange(bytes.size - 32, bytes.size)))
             DataInputStream(ByteArrayInputStream(payload)).use { input ->
-                check(input.readInt() == 1 && input.readUTF() == share && input.readUTF() == identity)
+                check(input.readInt() == 2 && input.readUTF() == share && input.readUTF() == identity)
                 val count = input.readInt(); check(count in 0..100_000)
                 repeat(count) {
                     val path = input.readUTF()
@@ -75,7 +75,7 @@ internal class PhysicalHashCache(private val directory: File) {
             FileOutputStream(temp).use { raw ->
                 val digest = MessageDigest.getInstance("SHA-256")
                 val output = DataOutputStream(BufferedOutputStream(DigestOutputStream(raw, digest)))
-                output.writeInt(1); output.writeUTF(share); output.writeUTF(identity)
+                output.writeInt(2); output.writeUTF(share); output.writeUTF(identity)
                 output.writeInt(entries.size)
                 entries.toSortedMap().forEach { (path, entry) ->
                     output.writeUTF(path); output.writeUTF(entry.uri); output.writeLong(entry.modified)

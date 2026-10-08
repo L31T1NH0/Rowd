@@ -1,9 +1,9 @@
 # <img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="40"> Rowd
 
 > [!WARNING]
-> **Unstable alpha (0.8.4).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+> **Unstable alpha (0.8.7).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
 
-Source builds are **0.8.4-alpha**, using sync protocol **V15**. Build the PC binary and Android APK from the same checkout. The downloads below refer to the previous 0.8.2 release.
+Source builds are **0.8.7-alpha**, using sync protocol **V16**. Build the PC binary and Android APK from the same checkout. The downloads below refer to the previous 0.8.2 release.
 
 Rowd syncs folders between one Linux PC and one Android phone on the same local network. You choose which folders connect and whether files travel both ways, to Android, or to the PC. The devices transfer files over TLS without a cloud account or relay.
 
@@ -62,7 +62,7 @@ For synchronization diagnostics, run `rowd run --trace` on the PC. In the termin
 
 | Change | Behavior |
 | --- | --- |
-| New or modified file | A trusted watcher event can limit the next round to that path. Rowd verifies content with SHA-256 before transfer and installation. |
+| New or modified file | A trusted watcher event can limit the next round to that path. Rowd verifies content with BLAKE3 before transfer and installation. |
 | Concurrent edits | Rowd preserves both versions and records a conflict. |
 | Delete or rename | Rowd scans the Share to resolve the change. It does not propagate deletions; a removed file can return from the other device. |
 | Missed event or lost scan trust | Rowd falls back to an audit. Android can reuse cached hashes during a namespace audit and rehashes files when a deep audit is required. |

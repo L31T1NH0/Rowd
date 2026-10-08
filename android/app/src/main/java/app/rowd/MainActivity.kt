@@ -326,7 +326,10 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
     private fun startSync() = safely {
-        if (SyncService.busy.get()) { SyncService.wake(); return@safely }
+        if (SyncService.busy.get()) {
+            startService(Intent(this, SyncService::class.java))
+            return@safely
+        }
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         startForegroundService(Intent(this, SyncService::class.java))
     }
@@ -491,7 +494,12 @@ class MainActivity : AppCompatActivity() {
     }
     private fun message(title: String, text: String) { MaterialAlertDialogBuilder(this).setTitle(title).setMessage(text).setPositiveButton("Entendi", null).show() }
     private fun safely(action: () -> Unit) { try { action() } catch (e: Exception) { message("Não foi possível continuar", e.message ?: "Tente novamente.") } }
-    override fun onResume() { super.onResume(); SyncService.observe(statusChanged); refresh() }
+    override fun onResume() {
+        super.onResume()
+        SyncService.observe(statusChanged)
+        if (!SyncService.busy.get() && prefs.contains("invitation") && prefs.getBoolean("syncEnabled", false)) startSync()
+        refresh()
+    }
     override fun onPause() {
         pairingDiscovery?.set(false)
         pairingDialog?.dismiss()

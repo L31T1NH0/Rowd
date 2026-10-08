@@ -24,6 +24,18 @@ internal class ScanPathLookup(root: String, private val read: (String, String) -
     }
     fun find(path: String): SafMetadata? = children(path.substringBeforeLast('/', ""))[path]
 
+    /** Cached listings resolve names; fresh exact queries still validate snapshot ancestors. */
+    fun validateAncestors(path: String, read: (String, String) -> SafMetadata) {
+        val names = path.split('/')
+        for (index in names.indices) {
+            val prefix = names.take(index).joinToString("/")
+            val uri = directory(prefix) ?: error("STALE_SOURCE: $path")
+            val current = read(uri, prefix)
+            check(current.uri == uri && current.directory && !current.virtual &&
+                (prefix.isEmpty() || current.path == prefix)) { "STALE_SOURCE: $path" }
+        }
+    }
+
     /** Recheck selected names and every traversed ancestor, including previously absent names. */
     fun validate(paths: Set<String>) {
         val relevant = (paths + directories.keys).groupBy { it.substringBeforeLast('/', "") }

@@ -62,4 +62,39 @@ class ScanPathLookupTest {
         try { lookup.validate(setOf("a")); fail() }
         catch (error: IllegalStateException) { assertEquals("cancelled", error.message) }
     }
+    @Test fun repeatedSnapshotResolutionListsSiblingsOnceButRechecksAncestors() {
+        val files = (0 until 2000).map { file("dir/$it.jpg") }
+        var listings = 0
+        var exactReads = 0
+        val lookup = ScanPathLookup("uri:root") { _, prefix ->
+            listings++
+            if (prefix.isEmpty()) listOf(directory("dir")) else files
+        }
+        files.take(6).forEach { entry ->
+            assertEquals(entry, lookup.find(entry.path))
+            lookup.validateAncestors(entry.path) { uri, prefix ->
+                exactReads++
+                directory(prefix).copy(uri = uri)
+            }
+        }
+        assertEquals(2, listings) // Root and dir, regardless of the number of snapshots.
+        assertEquals(12, exactReads)
+        for (changed in listOf(directory("renamed"), directory("dir").copy(uri = "replacement"),
+            directory("dir").copy(directory = false), directory("dir").copy(virtual = true))) {
+            stale { lookup.validateAncestors("dir/0.jpg") { uri, prefix ->
+                if (prefix.isEmpty()) directory(prefix).copy(uri = uri) else changed
+            } }
+        }
+    }
+    @Test fun batchedCacheValidationRejectsChangedFileMetadata() {
+        val original = file("a")
+        for (changed in listOf(original.copy(modified = 101), original.copy(length = 3),
+            original.copy(directory = true), original.copy(virtual = true))) {
+            var files = listOf(original)
+            val lookup = ScanPathLookup("root") { _, _ -> files }
+            assertEquals(original, lookup.find("a"))
+            files = listOf(changed)
+            stale { lookup.validate(setOf("a")) }
+        }
+    }
 }

@@ -415,6 +415,7 @@ enum Modal {
 
 enum UiEvent {
     Notice(String),
+    StateChanged,
     JobDone(String),
     PairPeers(Vec<pairing::Peer>),
 }
@@ -460,7 +461,7 @@ impl Ui {
     }
 
     fn refresh(&mut self, app: &App) {
-        if !self.dirty && self.last_refresh.elapsed() < Duration::from_secs(1) {
+        if !self.dirty && self.last_refresh.elapsed() < Duration::from_secs(5) {
             return;
         }
         if let Ok(snapshot) = app.snapshot() {
@@ -1593,11 +1594,15 @@ pub fn run(home: &Path) -> Result<()> {
             let worker_stop = stop.clone();
             let worker_tx = tx.clone();
             worker = Some(std::thread::spawn(move || {
-                if let Err(error) =
-                    App::new(&worker_home).serve(None, false, worker_stop, |message| {
+                if let Err(error) = App::new(&worker_home).serve_observed(
+                    worker_stop,
+                    |message| {
                         let _ = worker_tx.send(UiEvent::Notice(message));
-                    })
-                {
+                    },
+                    |_| {
+                        let _ = worker_tx.send(UiEvent::StateChanged);
+                    },
+                ) {
                     let _ = worker_tx.send(UiEvent::Notice(format!("Servidor: {error:#}")));
                 }
             }));
@@ -1605,6 +1610,7 @@ pub fn run(home: &Path) -> Result<()> {
         for message in rx.try_iter() {
             match message {
                 UiEvent::Notice(message) => ui.notice = message,
+                UiEvent::StateChanged => ui.dirty = true,
                 UiEvent::PairPeers(peers) => {
                     if let Some(Modal::PairDiscovery(found, index)) = &mut ui.modal {
                         *found = peers;
@@ -2156,6 +2162,32 @@ mod tests {
         assert_eq!(wide[0].y, wide[1].y);
         assert_eq!(medium[0].y, medium[1].y);
         assert!(narrow[1].y > narrow[0].y);
+    }
+
+    #[test]
+    fn idle_snapshot_is_cached_but_changes_and_fallback_refresh_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::new(&directory.path().join("config"));
+        app.pair("127.0.0.1:43821").unwrap();
+        let mut ui = Ui::new(&app);
+        for name in ["A", "B"] {
+            let root = directory.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            app.add_share(name.into(), root, SyncMode::Bidirectional)
+                .unwrap();
+            if name == "A" {
+                ui.last_refresh = Instant::now() - Duration::from_secs(2);
+                ui.refresh(&app);
+                assert!(ui.snapshot.shares.is_empty());
+                ui.dirty = true; // Native state-change notifications refresh immediately.
+                ui.refresh(&app);
+                assert_eq!(ui.snapshot.shares.len(), 1);
+            } else {
+                ui.last_refresh = Instant::now() - Duration::from_secs(6);
+                ui.refresh(&app);
+                assert_eq!(ui.snapshot.shares.len(), 2);
+            }
+        }
     }
 
     #[test]

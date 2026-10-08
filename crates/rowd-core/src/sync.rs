@@ -103,6 +103,11 @@ pub struct State {
     pub share_id: String,
     pub peer_root: Option<String>,
     pub files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub blake3: bool,
+    /// Old committed bases remain authoritative until their path is reconciled successfully.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub legacy_files: BTreeMap<String, String>,
     #[serde(default, skip_serializing)]
     pub base_token: Option<String>,
 }
@@ -121,6 +126,8 @@ impl State {
                 share_id: share_id.into(),
                 peer_root: None,
                 files: BTreeMap::new(),
+                blake3: true,
+                legacy_files: BTreeMap::new(),
                 base_token: None,
             }
         };
@@ -133,9 +140,17 @@ impl State {
         {
             // Older versions wrote the candidate directly into state.json.
             state.files.clear();
+            state.legacy_files.clear();
             state.last_sync = None;
             session_tokens().lock().unwrap().remove(path);
             retry_paths().lock().unwrap().remove(path);
+        }
+        if !state.blake3 {
+            ensure!(state.legacy_files.is_empty(), "ambiguous legacy base");
+            state.legacy_files = std::mem::take(&mut state.files);
+            state.blake3 = true;
+            state.base_token = None;
+            session_tokens().lock().unwrap().remove(path);
         }
         Ok(state)
     }
@@ -1255,6 +1270,7 @@ fn coordinate_candidate(
             .filter(|(_, e)| !e.directory)
             .map(|(p, _)| p.clone())
             .chain(state.files.keys().cloned())
+            .chain(state.legacy_files.keys().cloned())
             .collect();
         let mut folded = BTreeSet::new();
         for path in &paths {
@@ -1601,8 +1617,69 @@ fn coordinate_candidate(
         let a = android.get(&path);
         let ph = p.map(|e| e.hash.as_str());
         let ah = a.map(|e| e.hash.as_str());
+        let legacy_base = state
+            .legacy_files
+            .get(&path)
+            .filter(|_| !state.files.contains_key(&path))
+            .cloned();
+        // Migration checks are control requests; finish streaming and drain FIFO replies first.
+        if legacy_base.is_some() && p.is_some() && a.is_some() && ph != ah {
+            if hash_stream.as_ref().is_some_and(|s| !s.ended) {
+                deferred.insert(path);
+                continue;
+            }
+            drain_puts(io, store, state, state_path, &mut pending_puts, &mut report)?;
+            put_bytes = 0;
+            drain_gets(
+                io,
+                store,
+                state,
+                state_path,
+                &mut pending_gets,
+                &mut ack_batch,
+                &mut report,
+                started,
+            )?;
+            get_bytes = 0;
+            flush_ack_batch(io, &share_id, &mut ack_batch, &mut report.metrics)?;
+            protocol::send_for(io, &share_id, Message::ScanAlive)?;
+            let mut alive = Instant::now();
+            let local = store.snapshot(&path, p.unwrap())?;
+            let old_hash =
+                crate::legacy_hash_reader_with_control(File::open(local.path())?, || {
+                    if alive.elapsed() >= Duration::from_secs(5) {
+                        protocol::send_for(io, &share_id, Message::ScanAlive)?;
+                        alive = Instant::now();
+                    }
+                    Ok(())
+                })?
+                .0;
+            if Some(&old_hash) == legacy_base.as_ref() {
+                state.files.insert(path.clone(), p.unwrap().hash.clone());
+            } else {
+                protocol::send_for(
+                    io,
+                    &share_id,
+                    Message::LegacyHash {
+                        path: path.clone(),
+                        entry: a.unwrap().clone(),
+                    },
+                )?;
+                let hash = loop {
+                    match protocol::receive_for(io, &share_id)? {
+                        Message::ScanAlive => continue,
+                        Message::LegacyHashResult { hash } => break hash,
+                        _ => anyhow::bail!("expected legacy base verification"),
+                    }
+                };
+                crate::model::validate_hash(&hash)?;
+                if Some(&hash) == legacy_base.as_ref() {
+                    state.files.insert(path.clone(), a.unwrap().hash.clone());
+                }
+            }
+        }
         let previous_base = state.files.get(&path).cloned();
-        let bootstrap = remap.filter(|_| previous_base.is_none());
+        let bootstrap = remap.filter(|_| previous_base.is_none() && legacy_base.is_none());
         let reconciling = Instant::now();
         let action = match (bootstrap, p, a) {
             (Some(crate::config::RemapPolicy::Pc), Some(_), Some(_)) if ph != ah => {
@@ -1695,6 +1772,7 @@ fn coordinate_candidate(
                     state.files.insert(path.clone(), hash.into());
                 } else {
                     state.files.remove(&path);
+                    state.legacy_files.remove(&path);
                 }
             }
             Action::ToAndroid => {
@@ -2061,6 +2139,9 @@ fn coordinate_candidate(
     if hash_stream.is_none() {
         report.metrics.time_to_first_transfer_ms = report.metrics.first_transfer_ms;
     }
+    state
+        .legacy_files
+        .retain(|path, _| !state.files.contains_key(path));
     state.last_sync = Some(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -2682,6 +2763,27 @@ pub fn respond_share(
                         );
                     }
                 }
+                Message::ScanAlive => {
+                    // The coordinator can verify a legacy local base between stream completion and transfer.
+                    ensure!(
+                        stream.is_none(),
+                        "unexpected coordinator liveness during stream"
+                    );
+                }
+                Message::LegacyHash { path, entry } => {
+                    ensure!(stream.is_none(), "legacy verification during hash stream");
+                    crate::model::validate_path(&path)?;
+                    crate::model::validate_hash(&entry.hash)?;
+                    ensure!(
+                        entry.size <= crate::model::MAX_FILE,
+                        "legacy source too large"
+                    );
+                    operation = "legacy_base_verification";
+                    relative_path = Some(path.clone());
+                    error_kind = "filesystem";
+                    let hash = store.legacy_hash_with_control(io, &path, &entry)?;
+                    protocol::send_for(io, &share_id, Message::LegacyHashResult { hash })?;
+                }
                 Message::Get { path, entry } => {
                     let _transfer = trace::transfer_context(&share_id, &path).enter();
                     crate::model::validate_path(&path)?;
@@ -3190,6 +3292,90 @@ mod v2_tests {
         })
     }
     #[test]
+    fn sha256_base_migrates_without_false_conflicts_or_wrong_direction() {
+        for (pc_bytes, phone_bytes, conflicts, transfers) in [
+            (b"base".as_slice(), b"base".as_slice(), 0, 0),
+            (b"pc edit".as_slice(), b"base".as_slice(), 0, 1),
+            (b"base".as_slice(), b"phone edit".as_slice(), 0, 1),
+            (b"pc edit".as_slice(), b"phone edit".as_slice(), 1, 3),
+        ] {
+            let pc = tempfile::tempdir().unwrap();
+            let phone = tempfile::tempdir().unwrap();
+            std::fs::write(pc.path().join("file"), pc_bytes).unwrap();
+            std::fs::write(phone.path().join("file"), phone_bytes).unwrap();
+            let mut p = LocalStore::open(pc.path()).unwrap();
+            let mut a = LocalStore::open(phone.path()).unwrap();
+            let path = pc.path().join(".rowd/state.json");
+            let old = crate::legacy_hash_reader(b"base".as_slice()).unwrap().0;
+            atomic_json(
+                &path,
+                &serde_json::json!({"version":1,"pair_id":"pair","share_id":"share",
+                "peer_root":null,"files":{"file":old}}),
+            )
+            .unwrap();
+            let mut state = State::load(&path, "pair", "share").unwrap();
+            assert!(state.files.is_empty());
+            assert_eq!(state.legacy_files["file"], old);
+            let report = local_round(&mut p, &mut a, &mut state, &path, None);
+            assert_eq!(report.conflicts, conflicts);
+            assert_eq!(report.transferred, transfers);
+            assert_eq!(p.scan().unwrap(), a.scan().unwrap());
+            let expected = if pc_bytes == b"base" {
+                phone_bytes
+            } else {
+                pc_bytes
+            };
+            assert_eq!(std::fs::read(pc.path().join("file")).unwrap(), expected);
+            let mut reloaded = State::load(&path, "pair", "share").unwrap();
+            assert!(reloaded.blake3 && reloaded.legacy_files.is_empty());
+            assert_eq!(
+                reloaded.files["file"],
+                crate::hash_reader(expected).unwrap().0
+            );
+            let report = local_round(&mut p, &mut a, &mut reloaded, &path, None);
+            assert_eq!(report.transferred, 0);
+        }
+    }
+
+    #[test]
+    fn ignored_legacy_base_survives_until_the_path_can_be_reconciled() {
+        let pc = tempfile::tempdir().unwrap();
+        let phone = tempfile::tempdir().unwrap();
+        std::fs::write(pc.path().join("file.tmp"), b"pc edit").unwrap();
+        std::fs::write(phone.path().join("file.tmp"), b"base").unwrap();
+        let mut p = LocalStore::open_with_policy(pc.path(), "*.tmp").unwrap();
+        let mut a = LocalStore::open_with_policy(phone.path(), "*.tmp").unwrap();
+        let path = pc.path().join(".rowd/state.json");
+        let old = crate::legacy_hash_reader(b"base".as_slice()).unwrap().0;
+        atomic_json(
+            &path,
+            &serde_json::json!({"version":1,"pair_id":"pair","share_id":"share",
+            "peer_root":null,"files":{"file.tmp":old}}),
+        )
+        .unwrap();
+        let mut state = State::load(&path, "pair", "share").unwrap();
+        assert_eq!(
+            local_round(&mut p, &mut a, &mut state, &path, None).transferred,
+            0
+        );
+        assert_eq!(
+            State::load(&path, "pair", "share").unwrap().legacy_files["file.tmp"],
+            old
+        );
+        drop(p);
+        drop(a);
+        let mut p = LocalStore::open_with_policy(pc.path(), "").unwrap();
+        let mut a = LocalStore::open_with_policy(phone.path(), "").unwrap();
+        let report = local_round(&mut p, &mut a, &mut state, &path, None);
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(report.transferred, 1);
+        assert_eq!(
+            std::fs::read(phone.path().join("file.tmp")).unwrap(),
+            b"pc edit"
+        );
+    }
+
+    #[test]
     fn delta_falls_back_when_trust_is_lost() {
         for scenario in [
             "restart",
@@ -3599,7 +3785,8 @@ mod v2_tests {
         let report = local_round(&mut p, &mut a, &mut state, &path, None);
         assert_eq!(report.conflicts, 1);
         assert_eq!(report.transferred, 5);
-        assert_eq!(report.metrics.peak_in_flight_files, 1);
+        // Streaming may stage the two independent files before the deferred conflict.
+        assert!(report.metrics.peak_in_flight_files <= MAX_IN_FLIGHT_FILES as u64);
         assert_eq!(p.scan().unwrap(), a.scan().unwrap());
     }
     #[test]
@@ -3651,6 +3838,8 @@ mod v2_tests {
         phone_store.allow_incremental_scan();
         let state_path = pc_store.private().join("state.json");
         let mut state = State {
+            blake3: true,
+            legacy_files: BTreeMap::new(),
             conflicts: BTreeSet::new(),
             last_sync: None,
             version: VERSION,

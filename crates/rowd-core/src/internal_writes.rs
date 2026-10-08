@@ -33,7 +33,7 @@ pub fn register(path: &Path, root: &Path, entry: &Entry) -> InternalWrite {
     }
     let (lock, _) = registry();
     let mut state = lock.lock().unwrap();
-    state.retain(|_, e| e.expires > Instant::now());
+    state.retain(|_, e| !e.finished || e.expires > Instant::now());
     state.insert(
         path.to_owned(),
         Expected {
@@ -59,6 +59,7 @@ impl InternalWrite {
         let (lock, wake) = registry();
         if let Some(expected) = lock.lock().unwrap().get_mut(&self.path) {
             expected.finished = true;
+            expected.expires = Instant::now() + Duration::from_secs(30);
         }
         self.complete = true;
         wake.notify_all();
@@ -77,7 +78,7 @@ impl Drop for InternalWrite {
 pub fn matches(path: &Path, directory_created: bool) -> bool {
     let (lock, wake) = registry();
     let mut state = lock.lock().unwrap();
-    state.retain(|_, e| e.expires > Instant::now());
+    state.retain(|_, e| !e.finished || e.expires > Instant::now());
     let Some(target) = state
         .iter()
         .find(|(p, e)| {
@@ -116,4 +117,34 @@ pub fn matches(path: &Path, directory_created: bool) -> bool {
         lock.lock().unwrap().remove(&target);
     }
     matched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn slow_install_is_retained_and_expiry_starts_at_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("file");
+        let entry = Entry {
+            hash: hash_reader(b"file".as_slice()).unwrap().0,
+            size: 4,
+        };
+        let write = register(&target, root.path(), &entry);
+        registry()
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(&target)
+            .unwrap()
+            .expires = Instant::now() - Duration::from_secs(1);
+        let other = register(&root.path().join("other"), root.path(), &entry);
+        assert!(registry().0.lock().unwrap().contains_key(&target));
+        std::fs::write(&target, b"file").unwrap();
+        write.complete();
+        assert!(matches(&target, false));
+        drop(other);
+        std::fs::write(&target, b"user edit").unwrap();
+        assert!(!matches(&target, false));
+    }
 }

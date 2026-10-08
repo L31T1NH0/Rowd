@@ -50,8 +50,41 @@ class ScanResilienceTest {
     @Test fun digestWithoutControlPreservesSnapshotCopyAndHash() {
         val output = java.io.ByteArrayOutputStream()
         val (hash, size) = scanDigest(ByteArrayInputStream("abc".toByteArray()), output)
-        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", hash)
+        assertEquals("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85", hash)
         assertEquals(3L, size); assertEquals("abc", output.toString())
+    }
+    @Test fun nativeDigestHandlesShortReadsAcrossBlocksWithoutHashingBufferPadding() {
+        val bytes = ByteArray(131073) { (it % 251).toByte() }
+        val expected = scanDigest(ByteArrayInputStream(bytes))
+        val input = object : ByteArrayInputStream(bytes) {
+            override fun read(buffer: ByteArray, offset: Int, length: Int) = super.read(buffer, offset, minOf(length, 8191))
+        }
+        val output = java.io.ByteArrayOutputStream()
+        assertEquals(expected, scanDigest(input, output))
+        assertEquals(bytes.size.toLong(), expected.second)
+        assertArrayEquals(bytes, output.toByteArray())
+    }
+    @Test fun legacyJournalsCanStillUseSha256() {
+        val result = scanDigest(ByteArrayInputStream("abc".toByteArray()), legacy = true)
+        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", result.first)
+        assertEquals(3L, result.second)
+    }
+    @Test fun nativeDigestPreservesReadAndWriteExceptionsAndClosesInput() {
+        for (writing in listOf(false, true)) {
+            var closed = false
+            val original = java.io.IOException("I/O failure")
+            val input = object : ByteArrayInputStream("abc".toByteArray()) {
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    if (!writing) throw original
+                    return super.read(buffer, offset, length)
+                }
+                override fun close() { closed = true }
+            }
+            val output = object : java.io.OutputStream() { override fun write(value: Int) { throw original } }
+            try { scanDigest(input, output); fail("Accepted failed I/O") }
+            catch (error: java.io.IOException) { assertSame(original, error) }
+            assertTrue(closed)
+        }
     }
     private val entry = PhysicalHashCache.Entry("uri", 123, 3, "a".repeat(64), 3)
     @Test fun checkpointsAreThrottledAndUnchangedCacheIsNotRewritten() {
@@ -151,7 +184,7 @@ class ScanResilienceTest {
     @Test fun corruptTruncatedAndUnknownSchemaCacheFallBackToHashing() {
         val directory = Files.createTempDirectory("rowd-hashes").toFile()
         try {
-            for (mode in 0..2) {
+            for (mode in 0..3) {
                 val cache = PhysicalHashCache(directory); cache.select("share", "tree")
                 cache.remember("a", entry); cache.save()
                 val file = directory.listFiles()!!.single()
@@ -160,7 +193,7 @@ class ScanResilienceTest {
                     0 -> { bytes[bytes.size - 33] = (bytes[bytes.size - 33].toInt() xor 1).toByte(); file.writeBytes(bytes) }
                     1 -> file.writeBytes(bytes.copyOf(12))
                     else -> {
-                        bytes[3] = 2
+                        bytes[3] = 1
                         val payload = bytes.copyOfRange(0, bytes.size - 32)
                         file.writeBytes(payload + java.security.MessageDigest.getInstance("SHA-256").digest(payload))
                     }

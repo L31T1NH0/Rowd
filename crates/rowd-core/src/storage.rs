@@ -192,6 +192,15 @@ pub trait Store {
     }
     fn scan(&mut self) -> Result<Manifest>;
     fn snapshot(&mut self, path: &str, expected: &Entry) -> Result<Snapshot>;
+    fn legacy_hash_with_control(
+        &mut self,
+        _io: &mut (impl Read + Write),
+        path: &str,
+        entry: &Entry,
+    ) -> Result<String> {
+        let snapshot = self.snapshot(path, entry)?;
+        Ok(crate::legacy_hash_reader(File::open(snapshot.path())?)?.0)
+    }
     fn install(
         &mut self,
         path: &str,
@@ -238,6 +247,8 @@ fn sync_dir(path: &Path) -> Result<()> {
 
 #[derive(Serialize, Deserialize)]
 struct Journal {
+    #[serde(default)]
+    blake3: bool,
     path: String,
     backup: String,
     finished: bool,
@@ -253,6 +264,7 @@ pub struct RecoveryEntry {
     pub path: String,
     pub backup_available: bool,
     pub finished: bool,
+    pub bytes: u64,
 }
 
 pub struct LocalStore {
@@ -294,12 +306,15 @@ struct CachedEntry {
 
 #[derive(Deserialize)]
 struct CacheDisk {
+    #[serde(default)]
+    blake3: bool,
     policy: String,
     files: std::collections::BTreeMap<String, CachedEntry>,
 }
 
 #[derive(Serialize)]
 struct CacheDiskWrite<'a> {
+    blake3: bool,
     policy: &'a str,
     files: &'a std::collections::BTreeMap<String, CachedEntry>,
 }
@@ -341,8 +356,11 @@ fn enumerate_namespace(
             let rel = path
                 .strip_prefix(base)?
                 .to_str()
-                .context("non UTF-8 filename")?
-                .replace('\\', "/");
+                .context("non UTF-8 filename")?;
+            #[cfg(windows)]
+            let rel = rel.replace('\\', "/");
+            #[cfg(not(windows))]
+            let rel = rel.to_owned();
             let kind = item.file_type()?;
             if ignore.matches(&rel, kind.is_dir()) {
                 continue;
@@ -359,7 +377,8 @@ fn enumerate_namespace(
                     size: metadata.len(),
                     modified: metadata
                         .modified()?
-                        .duration_since(std::time::UNIX_EPOCH)?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
                         .as_millis() as u64,
                     directory: kind.is_dir(),
                 },
@@ -445,16 +464,12 @@ impl LocalStore {
         let cache_bytes = fs::read(private.join("cache.json")).ok();
         let parsed_cache = cache_bytes
             .as_deref()
-            .and_then(|bytes| serde_json::from_slice::<CacheDisk>(bytes).ok());
+            .and_then(|bytes| serde_json::from_slice::<CacheDisk>(bytes).ok())
+            .filter(|cache| cache.blake3);
         let cache_trusted = parsed_cache
             .as_ref()
             .is_some_and(|cache| cache.policy == source);
-        let cache = parsed_cache.map(|cache| cache.files).unwrap_or_else(|| {
-            cache_bytes
-                .as_deref()
-                .and_then(|bytes| serde_json::from_slice(bytes).ok())
-                .unwrap_or_default()
-        });
+        let cache = parsed_cache.map(|cache| cache.files).unwrap_or_default();
         let ignore = crate::ignore::Ignore::parse(&source);
         let mut store = Self {
             ignore,
@@ -546,6 +561,7 @@ impl LocalStore {
         atomic_json(
             &self.private.join("cache.json"),
             &CacheDiskWrite {
+                blake3: true,
                 policy: &self.policy_text,
                 files: &self.cache,
             },
@@ -614,20 +630,52 @@ impl LocalStore {
     }
 
     pub fn recovery_entries(&self) -> Result<Vec<RecoveryEntry>> {
+        Self::read_recovery_entries(&self.root)
+    }
+
+    /// UI snapshots only read atomic journals; they must never claim the writer lock.
+    pub fn read_recovery_entries(root: &Path) -> Result<Vec<RecoveryEntry>> {
+        ensure!(
+            root.is_dir() && root.canonicalize()? == root,
+            "Share root is unavailable or changed"
+        );
+        let private = root.join(".rowd");
+        let directory = private.join("recovery");
+        for path in [&private, &directory] {
+            match fs::symlink_metadata(path) {
+                Ok(meta) => ensure!(
+                    meta.is_dir() && !meta.file_type().is_symlink(),
+                    "unsafe recovery directory"
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+                Err(e) => return Err(e.into()),
+            }
+        }
         let mut entries = vec![];
-        for file in fs::read_dir(self.private.join("recovery"))? {
+        for file in fs::read_dir(&directory)? {
             let path = file?.path();
             if path.extension().and_then(|p| p.to_str()) != Some("json") {
                 continue;
             }
-            let j: Journal = serde_json::from_reader(File::open(&path)?)?;
+            let file = match File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // Concurrent cleanup.
+                Err(e) => return Err(e.into()),
+            };
+            let j: Journal = serde_json::from_reader(file)?;
             crate::model::validate_hash(&j.backup)?;
-            if self.private.join("recovery").join(&j.backup).exists() || !j.finished {
+            let backup = directory.join(&j.backup);
+            let metadata = backup.symlink_metadata().ok();
+            let available = metadata
+                .as_ref()
+                .is_some_and(|m| m.is_file() && !m.file_type().is_symlink());
+            if available || !j.finished {
                 entries.push(RecoveryEntry {
-                    id: j.backup.clone(),
+                    id: j.backup,
                     path: j.path,
-                    backup_available: self.private.join("recovery").join(j.backup).exists(),
+                    backup_available: available,
                     finished: j.finished,
+                    bytes: metadata.filter(|_| available).map_or(0, |m| m.len()),
                 });
             }
         }
@@ -760,8 +808,15 @@ impl LocalStore {
                 sync_dir(target.parent().unwrap())?;
             }
             if target.is_file() {
-                let (current, _) = hash_reader(File::open(&target)?)?;
-                let restored = backup.is_file() && hash_reader(File::open(&backup)?)?.0 == current;
+                let digest = |path: &Path| {
+                    if journal.blake3 {
+                        hash_reader(File::open(path)?)
+                    } else {
+                        crate::legacy_hash_reader(File::open(path)?)
+                    }
+                };
+                let (current, _) = digest(&target)?;
+                let restored = backup.is_file() && digest(&backup)?.0 == current;
                 let before_displacement =
                     !backup.exists() && journal.old_hash.as_deref() == Some(&current);
                 ensure!(restored || before_displacement || journal.new_hash.as_deref() == Some(&current),
@@ -831,6 +886,7 @@ impl LocalStore {
         let journal_path = self.private.join("recovery").join(format!("{id}.json"));
         let backup = self.private.join("recovery").join(&id);
         let mut journal = Journal {
+            blake3: true,
             path: path.into(),
             backup: id,
             finished: false,
@@ -1193,8 +1249,11 @@ impl Store for LocalStore {
                 let rel = path
                     .strip_prefix(base)?
                     .to_str()
-                    .context("non UTF-8 filename")?
-                    .replace('\\', "/");
+                    .context("non UTF-8 filename")?;
+                #[cfg(windows)]
+                let rel = rel.replace('\\', "/");
+                #[cfg(not(windows))]
+                let rel = rel.to_owned();
                 let kind = item.file_type()?;
                 if ignore.matches(&rel, kind.is_dir()) {
                     continue;
@@ -1454,6 +1513,83 @@ impl Store for LocalStore {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(unix)]
+    fn scanners_reject_literal_backslashes_without_aliasing_nested_paths() {
+        for invalid in [r"foo\bar.txt", r"foo\bar/file.txt"] {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(root.path().join("foo/bar")).unwrap();
+            fs::write(root.path().join("foo/bar.txt"), b"same").unwrap();
+            fs::write(root.path().join("foo/bar/file.txt"), b"same").unwrap();
+            let mut store = LocalStore::open(root.path()).unwrap();
+            assert_eq!(store.scan().unwrap().len(), 2);
+            let namespace = enumerate_namespace(root.path(), &store.ignore).unwrap();
+            assert!(namespace.contains_key("foo/bar.txt"));
+            assert!(namespace.contains_key("foo/bar/file.txt"));
+
+            let invalid = root.path().join(invalid);
+            fs::create_dir_all(invalid.parent().unwrap()).unwrap();
+            fs::write(invalid, b"same").unwrap();
+            assert!(store
+                .scan()
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe filename"));
+            assert!(enumerate_namespace(root.path(), &store.ignore)
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe filename"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn old_timestamps_are_zero_on_wire_and_preserved_for_snapshot_validation() {
+        use std::time::{Duration, UNIX_EPOCH};
+        for modified in [UNIX_EPOCH, UNIX_EPOCH - Duration::from_secs(1)] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("old");
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("file");
+            fs::write(&path, b"old").unwrap();
+            let file = File::open(&path).unwrap();
+            file.set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            File::open(&directory)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            let original = fingerprint(&file.metadata().unwrap());
+            let mut store = LocalStore::open(root.path()).unwrap();
+            let namespace = store
+                .stream_namespace(&mut std::io::Cursor::new(Vec::new()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(namespace["old"].modified, 0);
+            assert_eq!(namespace["old/file"].modified, 0);
+            assert_eq!(
+                store.scan().unwrap()["old/file"].hash,
+                hash_reader(b"old".as_slice()).unwrap().0
+            );
+            store.validate_scan_snapshot().unwrap();
+            assert_eq!(file.metadata().unwrap().modified().unwrap(), modified);
+            assert_eq!(directory.metadata().unwrap().modified().unwrap(), modified);
+            assert_eq!(fingerprint(&file.metadata().unwrap()), original);
+
+            file.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH - Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                enumerate_namespace(root.path(), &store.ignore).unwrap()["old/file"].modified,
+                0
+            );
+            assert!(store
+                .validate_scan_snapshot()
+                .unwrap_err()
+                .to_string()
+                .contains("STALE_SOURCE"));
+        }
+    }
+
     fn received(directory: &Path, bytes: &[u8]) -> VerifiedStaged {
         let mut file = NamedTempFile::new_in(directory).unwrap();
         let (hash, size) = copy_and_hash(bytes, &mut file).unwrap();
@@ -1649,6 +1785,72 @@ mod tests {
     }
 
     #[test]
+    fn recovery_snapshot_does_not_lock_or_create_a_store() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(LocalStore::read_recovery_entries(root.path())
+            .unwrap()
+            .is_empty());
+        assert!(!root.path().join(".rowd").exists());
+        let mut store = LocalStore::open(root.path()).unwrap();
+        let id = "a".repeat(64);
+        fs::write(store.private.join("recovery").join(&id), b"backup").unwrap();
+        atomic_json(
+            &store.private.join("recovery").join(format!("{id}.json")),
+            &Journal {
+                blake3: true,
+                path: "file".into(),
+                backup: id,
+                finished: false,
+                new_hash: None,
+                old_hash: None,
+            },
+        )
+        .unwrap();
+        let entries = LocalStore::read_recovery_entries(root.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].bytes, 6);
+        assert!(
+            LocalStore::open_recovery(root.path()).is_err(),
+            "writer lock must remain held"
+        );
+        store.recover().unwrap();
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"backup");
+    }
+
+    #[test]
+    fn sha256_cache_is_rehashed_and_pending_journals_still_recover() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        fs::write(root.path().join("file"), b"old").unwrap();
+        let old = crate::legacy_hash_reader(b"old".as_slice()).unwrap().0;
+        let id = "f".repeat(64);
+        atomic_json(
+            &store.private.join("recovery").join(format!("{id}.json")),
+            &serde_json::json!({
+                "path":"file", "backup":id, "finished":false, "old_hash":old, "new_hash":null,
+            }),
+        )
+        .unwrap();
+        store.recover().unwrap();
+        store.scan().unwrap();
+        store.persist_cache().unwrap();
+        let cache_path = store.private.join("cache.json");
+        let mut cache: serde_json::Value =
+            serde_json::from_reader(File::open(&cache_path).unwrap()).unwrap();
+        cache.as_object_mut().unwrap().remove("blake3");
+        cache["files"]["file"]["entry"]["hash"] = old.into();
+        atomic_json(&cache_path, &cache).unwrap();
+        drop(store);
+        let mut store = LocalStore::open(root.path()).unwrap();
+        assert!(!store.cache_trusted);
+        assert_eq!(
+            store.scan().unwrap()["file"].hash,
+            hash_reader(b"old".as_slice()).unwrap().0
+        );
+        assert!(store.metrics().files_hashed > 0);
+    }
+
+    #[test]
     fn conditional_write_hash_validation_and_retained_backup() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = LocalStore::open(dir.path()).unwrap();
@@ -1681,6 +1883,7 @@ mod tests {
         let id = "b".repeat(64);
         fs::write(store.private.join("recovery").join(&id), b"recover me").unwrap();
         let journal = Journal {
+            blake3: true,
             path: "a".into(),
             backup: id.clone(),
             finished: false,
@@ -1710,6 +1913,7 @@ mod tests {
             atomic_json(
                 &record,
                 &Journal {
+                    blake3: true,
                     path: "a".into(),
                     backup: id,
                     finished: false,
@@ -1766,6 +1970,7 @@ mod v2_tests {
         atomic_json(
             &recovery.join(format!("{id}.json")),
             &Journal {
+                blake3: true,
                 path: "a".into(),
                 backup: id.clone(),
                 finished: false,

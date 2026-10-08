@@ -117,7 +117,7 @@ pub fn validate_hash(hash: &str) -> Result<()> {
             && hash
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
-        "invalid SHA-256"
+        "invalid 256-bit hash"
     );
     Ok(())
 }

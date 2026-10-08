@@ -12,7 +12,7 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MANIFEST_CHUNK_FILES: usize = 1024;
 /// Small batches bound latency to first transfer independently of ACK batching.
 pub const SCAN_STREAM_CHUNK_FILES: usize = 32;
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -177,6 +177,14 @@ pub enum Message {
         path: String,
         entry: Entry,
     },
+    /// Verify an old committed base against a snapshot validated with BLAKE3.
+    LegacyHash {
+        path: String,
+        entry: Entry,
+    },
+    LegacyHashResult {
+        hash: String,
+    },
     Blob {
         entry: Entry,
     },
@@ -249,6 +257,8 @@ impl Message {
             Self::ManifestChunk { .. } => "ManifestChunk",
             Self::ManifestEnd { .. } => "ManifestEnd",
             Self::Get { .. } => "Get",
+            Self::LegacyHash { .. } => "LegacyHash",
+            Self::LegacyHashResult { .. } => "LegacyHashResult",
             Self::Blob { .. } => "Blob",
             Self::Put { .. } => "Put",
             Self::PutBatchEnd => "PutBatchEnd",

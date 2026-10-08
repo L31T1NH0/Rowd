@@ -4,40 +4,55 @@ import android.content.ContentResolver
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
+import org.json.JSONObject
 
 private val metadataColumns = arrayOf(Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME,
     Document.COLUMN_MIME_TYPE, Document.COLUMN_LAST_MODIFIED, Document.COLUMN_SIZE, Document.COLUMN_FLAGS)
 
 private fun readSafMetadata(resolver: ContentResolver, tree: Uri, query: Uri, prefix: String,
     checkControl: () -> Unit, validateName: Boolean = true): List<SafMetadata> {
-    checkControl()
+    val started = PerformanceTrace.now()
+    var queryUs = 0L
+    var succeeded = false
     val entries = mutableListOf<SafMetadata>()
     val names = mutableSetOf<String>()
     val ids = mutableSetOf<String>()
-    (resolver.query(query, metadataColumns, null, null, null) ?: error("Provider não retornou metadados.")).use { cursor ->
+    try {
         checkControl()
-        check(!cursor.extras.getBoolean(DocumentsContract.EXTRA_LOADING, false)) { "Listagem SAF incompleta." }
-        while (cursor.moveToNext()) {
+        val queryStarted = PerformanceTrace.now()
+        val result = try { resolver.query(query, metadataColumns, null, null, null) }
+            finally { queryUs = (PerformanceTrace.now() - queryStarted) / 1000 }
+        (result ?: error("Provider não retornou metadados.")).use { cursor ->
             checkControl()
-            check(entries.size < 200_000) { "Limite de listagem SAF excedido." }
-            val id = cursor.getString(0) ?: error("Documento sem ID.")
-            val name = cursor.getString(1) ?: error("Documento sem nome.")
-            val mime = cursor.getString(2) ?: error("Documento sem tipo.")
-            check(mime.isNotEmpty()) { "Documento sem tipo." }
-            check(ids.add(id) && names.add(name)) { "Identidade ou nome duplicado no provedor." }
-            if (validateName) check(name.isNotEmpty() && name != "." && name != ".." &&
-                name.none { it == '/' || it == '\\' || it == '\u0000' }) { "Nome de documento inválido." }
-            val directory = mime == Document.MIME_TYPE_DIR
-            val length = if (directory) 0L else cursor.getLong(4)
-            check(length >= 0) { "Tamanho de documento inválido." }
-            entries.add(SafMetadata(if (prefix.isEmpty()) name else "$prefix/$name",
-                DocumentsContract.buildDocumentUriUsingTree(tree, id).toString(), directory,
-                cursor.getInt(5) and Document.FLAG_VIRTUAL_DOCUMENT != 0, cursor.getLong(3), length))
+            check(!cursor.extras.getBoolean(DocumentsContract.EXTRA_LOADING, false)) { "Listagem SAF incompleta." }
+            while (cursor.moveToNext()) {
+                checkControl()
+                check(entries.size < 200_000) { "Limite de listagem SAF excedido." }
+                val id = cursor.getString(0) ?: error("Documento sem ID.")
+                val name = cursor.getString(1) ?: error("Documento sem nome.")
+                val mime = cursor.getString(2) ?: error("Documento sem tipo.")
+                check(mime.isNotEmpty()) { "Documento sem tipo." }
+                check(ids.add(id) && names.add(name)) { "Identidade ou nome duplicado no provedor." }
+                if (validateName) check(name.isNotEmpty() && name != "." && name != ".." &&
+                    name.none { it == '/' || it == '\\' || it == '\u0000' }) { "Nome de documento inválido." }
+                val directory = mime == Document.MIME_TYPE_DIR
+                val length = if (directory) 0L else cursor.getLong(4)
+                check(length >= 0) { "Tamanho de documento inválido." }
+                entries.add(SafMetadata(if (prefix.isEmpty()) name else "$prefix/$name",
+                    DocumentsContract.buildDocumentUriUsingTree(tree, id).toString(), directory,
+                    cursor.getInt(5) and Document.FLAG_VIRTUAL_DOCUMENT != 0, cursor.getLong(3), length))
+            }
+            check(!cursor.extras.getBoolean(DocumentsContract.EXTRA_LOADING, false)) { "Listagem SAF incompleta." }
         }
-        check(!cursor.extras.getBoolean(DocumentsContract.EXTRA_LOADING, false)) { "Listagem SAF incompleta." }
+        checkControl()
+        succeeded = true
+        return entries
+    } finally {
+        if (PerformanceTrace.enabled()) PerformanceTrace.event("SAF_METADATA_QUERY_END", null, prefix, start = started,
+            detail = JSONObject().put("query_kind", if (query.pathSegments.lastOrNull() == "children") "children" else "document")
+                .put("entries", entries.size).put("query_us", queryUs).put("success", succeeded),
+            sourceFile = "SafMetadata.kt", sourceLine = 51)
     }
-    checkControl()
-    return entries
 }
 
 internal fun safDocumentMetadata(resolver: ContentResolver, tree: Uri, document: Uri, path: String,

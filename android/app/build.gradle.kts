@@ -10,8 +10,8 @@ android {
         applicationId = "app.rowd"
         minSdk = 26
         targetSdk = 35
-        versionCode = 17
-        versionName = "0.8.4-alpha"
+        versionCode = 20
+        versionName = "0.8.7-alpha"
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
         ndk { abiFilters += "arm64-v8a" }
     }
@@ -23,7 +23,7 @@ android {
         create("diagnostic") {
             initWith(getByName("release"))
             matchingFallbacks += listOf("release")
-            isDebuggable = false
+            isDebuggable = true
             proguardFiles("trace-proguard-rules.pro")
         }
     }
@@ -37,4 +37,14 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
+}
+
+// Digest tests exercise the exact JNI implementation shipped in the APK.
+val buildHostDigest by tasks.registering(Exec::class) {
+    workingDir(rootProject.projectDir.parentFile)
+    commandLine("cargo", "build", "-p", "rowd-android", "--locked", "--offline")
+}
+tasks.withType<Test>().configureEach {
+    dependsOn(buildHostDigest)
+    systemProperty("java.library.path", rootProject.projectDir.resolve("../target/debug").absolutePath)
 }

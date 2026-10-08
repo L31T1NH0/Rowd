@@ -20,6 +20,8 @@ use std::{
 pub const CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static SESSION: OnceLock<Mutex<Option<Session>>> = OnceLock::new();
+#[cfg(test)]
+pub(crate) static TEST_SESSION_LOCK: Mutex<()> = Mutex::new(());
 static LAST_STATUS: OnceLock<Mutex<Value>> = OnceLock::new();
 static FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SECRETS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -1191,6 +1193,7 @@ mod tests {
     use super::*;
     #[test]
     fn persistence_schema_chunking_recovery_and_redaction() {
+        let _session = TEST_SESSION_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         register_secret("PRIVATE_TEST_KEY");
         start_with_limit(dir.path(), "pc", None, 32 * 1024).unwrap();
