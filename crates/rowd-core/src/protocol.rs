@@ -12,7 +12,7 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MANIFEST_CHUNK_FILES: usize = 1024;
 /// Small batches bound latency to first transfer independently of ACK batching.
 pub const SCAN_STREAM_CHUNK_FILES: usize = 32;
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

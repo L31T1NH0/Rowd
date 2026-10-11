@@ -225,7 +225,7 @@ fn remote_snapshot(
     first_byte_ms: &mut Option<u128>,
     round_started: Instant,
     directory: Option<&Path>,
-) -> Result<Snapshot> {
+) -> Result<Option<Snapshot>> {
     let _transfer = trace::transfer_context(share_id, path).enter();
     crate::trace_legacy_event!(
         "sync",
@@ -244,8 +244,13 @@ fn remote_snapshot(
             entry: entry.clone(),
         },
     )?;
-    let Message::Blob { entry: actual } = protocol::receive_for(io, share_id)? else {
-        anyhow::bail!("expected blob")
+    let actual = match protocol::receive_for(io, share_id)? {
+        Message::Blob { entry } => entry,
+        Message::ScanDeferred => {
+            finish_deferred_gets(io, share_id)?;
+            return Ok(None);
+        }
+        _ => anyhow::bail!("expected blob"),
     };
     if actual != *entry {
         return Err(anyhow::anyhow!("STALE_SOURCE").context(protocol::IncompleteFrame));
@@ -279,7 +284,18 @@ fn remote_snapshot(
         Some(started),
         None,
     );
-    Ok(blob)
+    Ok(Some(blob))
+}
+
+fn finish_deferred_gets(io: &mut (impl Read + Write), share_id: &str) -> Result<()> {
+    // Close the drained Get window before either peer returns to the session dispatcher.
+    protocol::send_for(io, share_id, Message::AuditPreempt { shares: Vec::new() })?;
+    match protocol::receive_for(io, share_id)? {
+        Message::ScanDeferred => Ok(()),
+        Message::Blob { .. } => Err(anyhow::anyhow!("unexpected Blob at Get deferral barrier")
+            .context(protocol::IncompleteFrame)),
+        _ => anyhow::bail!("expected Get deferral barrier"),
+    }
 }
 fn remote_install(
     share_id: &str,
@@ -663,8 +679,9 @@ fn drain_gets(
     ack_batch: &mut crate::model::Manifest,
     report: &mut Report,
     round_started: Instant,
-) -> Result<()> {
+) -> Result<bool> {
     let mut staged = Vec::with_capacity(pending.len());
+    let mut deferred = false;
     for job in pending.drain(..) {
         let _transfer = trace::transfer_context(&state.share_id, &job.path).enter();
         let waiting = Instant::now();
@@ -677,8 +694,17 @@ fn drain_gets(
             None,
             None,
         );
-        let Message::Blob { entry: actual } = protocol::receive_for(io, &state.share_id)? else {
-            anyhow::bail!("expected blob")
+        let actual = match protocol::receive_for(io, &state.share_id)? {
+            Message::Blob { entry } if !deferred => entry,
+            Message::Blob { .. } => {
+                return Err(anyhow::anyhow!("unexpected Blob after Get deferral")
+                    .context(protocol::IncompleteFrame));
+            }
+            Message::ScanDeferred => {
+                deferred = true;
+                continue;
+            }
+            _ => anyhow::bail!("expected blob or Get deferral"),
         };
         crate::trace_legacy_event!(
             "sync",
@@ -729,6 +755,10 @@ fn drain_gets(
         report.metrics.transfer_ms += transferring.elapsed().as_millis();
         staged.push((job, snapshot));
     }
+    if deferred {
+        finish_deferred_gets(io, &state.share_id)?;
+        return Ok(true);
+    }
     for (job, snapshot) in staged {
         let _transfer = trace::transfer_context(&state.share_id, &job.path).enter();
         let installing = Instant::now();
@@ -771,7 +801,7 @@ fn drain_gets(
         report.metrics.control_messages += 2;
         report.transferred += 1;
     }
-    Ok(())
+    Ok(false)
 }
 
 fn flush_ack_batch(
@@ -1507,7 +1537,7 @@ fn coordinate_candidate(
             // Finish all outstanding Blob frames before reading the next hash frame
             // or emitting a control frame. No partial committed base is persisted.
             drain_puts(io, store, state, state_path, &mut pending_puts, &mut report)?;
-            drain_gets(
+            if drain_gets(
                 io,
                 store,
                 state,
@@ -1516,7 +1546,13 @@ fn coordinate_candidate(
                 &mut ack_batch,
                 &mut report,
                 started,
-            )?;
+            )? {
+                return Ok(Report {
+                    pending_wakes: requested_preempt.take().unwrap_or_default(),
+                    round_deferred: true,
+                    ..report
+                });
+            }
             put_bytes = 0;
             get_bytes = 0;
             if let Some(current) = hash_stream.as_mut().filter(|s| !s.ended) {
@@ -1630,7 +1666,7 @@ fn coordinate_candidate(
             }
             drain_puts(io, store, state, state_path, &mut pending_puts, &mut report)?;
             put_bytes = 0;
-            drain_gets(
+            if drain_gets(
                 io,
                 store,
                 state,
@@ -1639,7 +1675,13 @@ fn coordinate_candidate(
                 &mut ack_batch,
                 &mut report,
                 started,
-            )?;
+            )? {
+                return Ok(Report {
+                    pending_wakes: requested_preempt.take().unwrap_or_default(),
+                    round_deferred: true,
+                    ..report
+                });
+            }
             get_bytes = 0;
             flush_ack_batch(io, &share_id, &mut ack_batch, &mut report.metrics)?;
             protocol::send_for(io, &share_id, Message::ScanAlive)?;
@@ -1736,7 +1778,7 @@ fn coordinate_candidate(
             put_bytes = 0;
         }
         if !pending_gets.is_empty() && (action != Action::ToPc || prohibited) {
-            drain_gets(
+            if drain_gets(
                 io,
                 store,
                 state,
@@ -1745,7 +1787,13 @@ fn coordinate_candidate(
                 &mut ack_batch,
                 &mut report,
                 started,
-            )?;
+            )? {
+                return Ok(Report {
+                    pending_wakes: requested_preempt.take().unwrap_or_default(),
+                    round_deferred: true,
+                    ..report
+                });
+            }
             get_bytes = 0;
         }
         if action != Action::None {
@@ -1962,7 +2010,7 @@ fn coordinate_candidate(
                 if pending_gets.len() == MAX_IN_FLIGHT_FILES
                     || get_bytes.saturating_add(entry.size) > MAX_STAGED_BYTES
                 {
-                    drain_gets(
+                    if drain_gets(
                         io,
                         store,
                         state,
@@ -1971,7 +2019,13 @@ fn coordinate_candidate(
                         &mut ack_batch,
                         &mut report,
                         started,
-                    )?;
+                    )? {
+                        return Ok(Report {
+                            pending_wakes: requested_preempt.take().unwrap_or_default(),
+                            round_deferred: true,
+                            ..report
+                        });
+                    }
                     get_bytes = 0;
                 }
                 report
@@ -1985,7 +2039,7 @@ fn coordinate_candidate(
                     });
                 if entry.size > MAX_STAGED_BYTES {
                     let started_transfer = Instant::now();
-                    let temp = remote_snapshot(
+                    let Some(temp) = remote_snapshot(
                         &share_id,
                         io,
                         &path,
@@ -1993,7 +2047,14 @@ fn coordinate_candidate(
                         &mut report.metrics.first_byte_ms,
                         started,
                         store.staging_directory().as_deref(),
-                    )?;
+                    )?
+                    else {
+                        return Ok(Report {
+                            pending_wakes: requested_preempt.take().unwrap_or_default(),
+                            round_deferred: true,
+                            ..report
+                        });
+                    };
                     let installing = Instant::now();
                     crate::trace_legacy_event!(
                         "sync",
@@ -2077,7 +2138,7 @@ fn coordinate_candidate(
                 let pc_snapshot = store
                     .snapshot(&path, pe)
                     .map_err(|e| protocol::LocalOperation::attach(e, "snapshot", Some(&path)))?;
-                let android_snapshot = remote_snapshot(
+                let Some(android_snapshot) = remote_snapshot(
                     &share_id,
                     io,
                     &path,
@@ -2085,7 +2146,14 @@ fn coordinate_candidate(
                     &mut report.metrics.first_byte_ms,
                     started,
                     store.staging_directory().as_deref(),
-                )?;
+                )?
+                else {
+                    return Ok(Report {
+                        pending_wakes: requested_preempt.take().unwrap_or_default(),
+                        round_deferred: true,
+                        ..report
+                    });
+                };
                 let conflict = conflict_path(&path, &ae.hash);
                 // Preserve Android on BOTH sides before changing its original path.
                 // Missing precondition prevents overwriting a manually edited conflict copy.
@@ -2108,7 +2176,7 @@ fn coordinate_candidate(
         }
     }
     drain_puts(io, store, state, state_path, &mut pending_puts, &mut report)?;
-    drain_gets(
+    if drain_gets(
         io,
         store,
         state,
@@ -2117,7 +2185,13 @@ fn coordinate_candidate(
         &mut ack_batch,
         &mut report,
         started,
-    )?;
+    )? {
+        return Ok(Report {
+            pending_wakes: requested_preempt.take().unwrap_or_default(),
+            round_deferred: true,
+            ..report
+        });
+    }
     flush_ack_batch(io, &share_id, &mut ack_batch, &mut report.metrics)?;
     crate::trace_legacy_event!(
         "sync",
@@ -2212,6 +2286,7 @@ struct ResponderStream {
     seen: BTreeSet<String>,
     hints: BTreeSet<String>,
     hashing: bool,
+    hash_deferred: bool,
     before: crate::storage::StoreMetrics,
 }
 
@@ -2222,6 +2297,7 @@ pub fn respond_share(
 ) -> Result<Report> {
     let mut stream: Option<ResponderStream> = None;
     let mut stream_completed = false;
+    let mut deferred_gets = 0;
     let mut completed_scan: Option<(String, String)> = None;
     let mut incoming_stages = BTreeMap::<u64, ReceivedStage>::new();
     let mut stage_sequence = 0;
@@ -2257,7 +2333,22 @@ pub fn respond_share(
             }
             operation = message.trace_type();
             error_kind = "protocol";
-            match protocol::check_peer_error(*message)? {
+            let message = protocol::check_peer_error(*message)?;
+            if deferred_gets > 0
+                && matches!(
+                    &message,
+                    Message::Put { .. } | Message::StagePut { .. } | Message::Blob { .. }
+                )
+            {
+                frame_boundary = false;
+                stage_body_incomplete = true;
+            }
+            ensure!(
+                deferred_gets == 0
+                    || matches!(&message, Message::Get { .. } | Message::AuditPreempt { .. }),
+                "expected Get deferral barrier"
+            );
+            match message {
                 Message::AckBatch { entries } => {
                     crate::trace_legacy_event!(
                         "sync",
@@ -2392,6 +2483,7 @@ pub fn respond_share(
                         seen: Default::default(),
                         hints: Default::default(),
                         hashing: false,
+                        hash_deferred: false,
                         before,
                     });
                 }
@@ -2431,7 +2523,14 @@ pub fn respond_share(
                             && store.scan_binding()? == binding,
                         "stale hash begin"
                     );
-                    store.start_hash_stream(&current.hints)?;
+                    match store.start_hash_stream(&current.hints) {
+                        Ok(()) => {}
+                        Err(error) if error.is::<ScanDeferred>() => {
+                            // HashStreamBegin has no reply; acknowledge deferral on HashNext.
+                            current.hash_deferred = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
                     current.hashing = true;
                 }
                 Message::StagePut {
@@ -2562,6 +2661,14 @@ pub fn respond_share(
                             && sequence == current.sequence,
                         "misaligned hash request"
                     );
+                    if current.hash_deferred {
+                        store.discard_scan()?;
+                        protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                        return Ok(Report {
+                            round_deferred: true,
+                            ..Default::default()
+                        });
+                    }
                     let chunk = if let Some(files) = &mut current.cached {
                         let keys: Vec<_> = files
                             .keys()
@@ -2661,7 +2768,7 @@ pub fn respond_share(
                 }
                 Message::AuditPreempt { shares } => {
                     ensure!(
-                        stream.is_some() || stream_completed,
+                        stream.is_some() || stream_completed || deferred_gets > 0,
                         "preempt outside stream"
                     );
                     for id in shares {
@@ -2787,6 +2894,17 @@ pub fn respond_share(
                 Message::Get { path, entry } => {
                     let _transfer = trace::transfer_context(&share_id, &path).enter();
                     crate::model::validate_path(&path)?;
+                    crate::model::validate_hash(&entry.hash)?;
+                    ensure!(entry.size <= crate::model::MAX_FILE, "source too large");
+                    if deferred_gets > 0 {
+                        ensure!(
+                            deferred_gets < MAX_IN_FLIGHT_FILES,
+                            "Get deferral window exceeded"
+                        );
+                        deferred_gets += 1;
+                        protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                        continue;
+                    }
                     crate::trace_legacy_event!(
                         "sync",
                         "get_received",
@@ -2809,7 +2927,16 @@ pub fn respond_share(
                     operation = "snapshot";
                     relative_path = Some(path.clone());
                     error_kind = "filesystem";
-                    let temp = store.snapshot(&path, &entry)?;
+                    let temp = match store.snapshot(&path, &entry) {
+                        Ok(temp) => temp,
+                        Err(error) if error.is::<ScanDeferred>() => {
+                            store.discard_scan()?;
+                            deferred_gets = 1;
+                            protocol::send_for(io, &share_id, Message::ScanDeferred)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let mut source = File::open(temp.path())?;
                     crate::trace_legacy_event!(
                         "sync",
@@ -4226,6 +4353,61 @@ mod scan_resilience_tests {
             steps: steps.into(),
             frame: Cursor::new(vec![]),
             sent: vec![],
+        }
+    }
+    #[test]
+    fn get_deferral_rejects_blob_with_unread_payload_as_incomplete_frame() {
+        let payload = b"payload";
+        let (hash, size) = crate::hash_reader(payload.as_slice()).unwrap();
+        let entry = Entry { hash, size };
+        for at_barrier in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut store = crate::storage::LocalStore::open(root.path()).unwrap();
+            let state_path = store.private().join("state.json");
+            let mut state = State::load(&state_path, "pair", "share").unwrap();
+            let mut pending = (0..if at_barrier { 1 } else { 2 })
+                .map(|i| PendingGet {
+                    path: format!("file-{i}"),
+                    entry: entry.clone(),
+                    expected: None,
+                })
+                .collect();
+            let Step::Frame(mut blob) = frame(Message::Blob {
+                entry: entry.clone(),
+            }) else {
+                unreachable!()
+            };
+            blob.extend(payload);
+            let clock = std::sync::atomic::AtomicU64::new(0);
+            let mut io = peer(
+                &clock,
+                vec![frame(Message::ScanDeferred), Step::Frame(blob)],
+            );
+            let mut ack = Default::default();
+            let mut report = Report::default();
+            let error = drain_gets(
+                &mut io,
+                &mut store,
+                &mut state,
+                &state_path,
+                &mut pending,
+                &mut ack,
+                &mut report,
+                Instant::now(),
+            )
+            .unwrap_err();
+            assert!(error.is::<protocol::IncompleteFrame>(), "{error:#}");
+            assert_eq!(io.frame.get_ref().len() as u64 - io.frame.position(), size);
+            assert!(state.files.is_empty() && ack.is_empty());
+            assert!(!root.path().join("file-0").exists());
+            if at_barrier {
+                assert!(
+                    matches!(protocol::receive_for(&mut Cursor::new(io.sent), "share").unwrap(),
+                    Message::AuditPreempt { shares } if shares.is_empty())
+                );
+            } else {
+                assert!(io.sent.is_empty());
+            }
         }
     }
     #[test]
