@@ -96,3 +96,5 @@ mod digest_tests {
         }
     }
 }
+
+pub mod resources;

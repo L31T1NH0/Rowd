@@ -11,3 +11,8 @@
 .DS_Store
 analysis/rowd-linux-release.asm
 analysis/rowd-linux-release-symbols.txt
+
+# Generated pipeline benchmark data and Python bytecode
+/docs/pipeline-*/
+/docs/PIPELINE_CONCURRENCY_DESIGN_*.md
+/scripts/__pycache__/

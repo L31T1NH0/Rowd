@@ -42,6 +42,9 @@ pub trait ManagedClient: Store {
     }
 }
 impl<S: Store> Store for &mut S {
+    fn supports_get_overlap(&self) -> bool {
+        (**self).supports_get_overlap()
+    }
     fn staging_directory(&self) -> Option<std::path::PathBuf> {
         (**self).staging_directory()
     }
@@ -132,6 +135,21 @@ impl<S: Store> Store for &mut S {
     }
     fn snapshot(&mut self, p: &str, e: &crate::model::Entry) -> Result<crate::storage::Snapshot> {
         (**self).snapshot(p, e)
+    }
+    fn prepare_snapshot_work(
+        &mut self,
+        p: &str,
+        e: &crate::model::Entry,
+    ) -> Result<Option<crate::storage::SnapshotWork>> {
+        (**self).prepare_snapshot_work(p, e)
+    }
+    fn finish_snapshot_work(
+        &mut self,
+        p: &str,
+        e: &crate::model::Entry,
+        prepared: crate::storage::SnapshotResult,
+    ) -> Result<crate::storage::Snapshot> {
+        (**self).finish_snapshot_work(p, e, prepared)
     }
     fn install(
         &mut self,
@@ -771,6 +789,37 @@ impl Store for LocalDevice {
 mod tests {
     use super::*;
     use crate::config::SyncMode;
+
+    #[test]
+    fn mutable_store_wrapper_preserves_snapshot_recipe_and_owned_install_capability() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"data").unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        let entry = store.scan().unwrap()["file"].clone();
+        let before = store.metrics();
+        let mut wrapped = &mut store;
+        assert!(wrapped.supports_get_overlap());
+        assert!(<&mut LocalStore as Store>::supports_get_overlap(&wrapped));
+        let recipe =
+            <&mut LocalStore as Store>::prepare_snapshot_work(&mut wrapped, "file", &entry)
+                .unwrap()
+                .unwrap();
+        let result = recipe.run(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        assert_eq!(wrapped.metrics().staging_copies, before.staging_copies);
+        let snapshot =
+            <&mut LocalStore as Store>::finish_snapshot_work(&mut wrapped, "file", &entry, result)
+                .unwrap();
+        <&mut LocalStore as Store>::install_received(&mut wrapped, "copy", None, &entry, snapshot)
+            .unwrap();
+        assert_eq!(fs::read(root.path().join("copy")).unwrap(), b"data");
+        assert_eq!(wrapped.metrics().staging_copies, before.staging_copies + 1);
+        assert_eq!(
+            wrapped.metrics().bytes_hashed,
+            before.bytes_hashed + entry.size
+        );
+    }
 
     pub(super) fn share(path: &str) -> ShareDefinition {
         ShareDefinition {

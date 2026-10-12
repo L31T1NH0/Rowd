@@ -2063,7 +2063,7 @@ fn session(
 
 fn session_round(
     home: &Path,
-    mut io: &mut (impl std::io::Read + std::io::Write),
+    mut io: &mut (impl std::io::Read + std::io::Write + Send),
     scan_socket: &TcpStream,
     device: &str,
     pair_id: &str,
@@ -2356,7 +2356,7 @@ fn session_round(
                 );
             }
         }
-        let ready = cfg
+        let mut ready = cfg
             .shares
             .iter()
             .filter(|share| {
@@ -2369,6 +2369,23 @@ fn session_round(
             })
             .cloned()
             .collect::<Vec<_>>();
+        // Fair round-robin only for background rounds; manual priority is unchanged.
+        if requested_share.is_none()
+            && ready.len() > 1
+            && rowd_core::resources::workers("ROWD_SHARE_WORKERS", 2) > 1
+        {
+            static NEXT_SHARE: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let offset =
+                NEXT_SHARE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % ready.len();
+            ready.rotate_left(offset);
+        }
+        let mut preparations = rowd_core::storage::ScanPreparations::new(
+            ready
+                .iter()
+                .filter(|_| !incremental_allowed)
+                .map(|share| (share.share_id.clone(), share.root.clone())),
+        );
         let waiting = cfg
             .shares
             .iter()
@@ -2453,6 +2470,11 @@ fn session_round(
                 } else {
                     store.invalidate();
                 }
+                if let Some(prepared) = preparations.take(&share.share_id, &share.root) {
+                    // A stale private result simply falls back to the normal fresh scan.
+                    let _ = store.consume_prepared_scan(prepared);
+                }
+                preparations.advance();
                 let path = state_path(home, share);
                 let mut state = State::load(&path, &cfg.pair_id, &share.share_id)?;
                 protocol::send(

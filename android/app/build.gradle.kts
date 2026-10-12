@@ -10,8 +10,8 @@ android {
         applicationId = "app.rowd"
         minSdk = 26
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.8.7-alpha"
+        versionCode = 22
+        versionName = "0.8.9-alpha"
         testInstrumentationRunner = "android.test.InstrumentationTestRunner"
         ndk { abiFilters += "arm64-v8a" }
     }

@@ -63,6 +63,68 @@ impl VerifiedStaged {
 
 pub type Snapshot = VerifiedStaged;
 
+pub struct SnapshotWork {
+    source: File,
+    temp: NamedTempFile,
+    expected: Entry,
+    evidence: Vec<u64>,
+}
+
+pub struct SnapshotResult {
+    snapshot: Result<Snapshot>,
+    evidence: Vec<u64>,
+    copied: Option<u64>,
+    pub(crate) elapsed_ms: u128,
+}
+
+impl SnapshotWork {
+    pub fn run(self, cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>) -> SnapshotResult {
+        let started = std::time::Instant::now();
+        struct Source {
+            file: File,
+            cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Read for Source {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(std::io::Error::other("snapshot preparation cancelled"));
+                }
+                self.file.read(buf)
+            }
+        }
+        let Self {
+            source,
+            mut temp,
+            expected,
+            evidence,
+        } = self;
+        let mut copied = None;
+        let snapshot = (|| {
+            let _cpu = crate::resources::acquire_hash();
+            let _permit = crate::resources::acquire(temp.path())?;
+            let mut source = Source {
+                file: source,
+                cancelled,
+            };
+            let (hash, size) = copy_and_hash(&mut source, &mut temp)?;
+            copied = Some(size);
+            ensure!(
+                hash == expected.hash
+                    && size == expected.size
+                    && fingerprint(&source.file.metadata()?) == evidence,
+                "STALE_SOURCE"
+            );
+            VerifiedStaged::from_digest(temp, &expected, &hash, size)
+        })();
+        SnapshotResult {
+            snapshot,
+            evidence,
+            copied,
+            elapsed_ms: started.elapsed().as_millis(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct StoreMetrics {
     pub files_enumerated: u64,
@@ -88,6 +150,10 @@ pub struct ScanStreamMetrics {
     pub saf_source_lookup_fallback_count: u64,
 }
 pub trait Store {
+    /// Only stores that promote an owned local staging file without another copy.
+    fn supports_get_overlap(&self) -> bool {
+        false
+    }
     /// Receive on the destination filesystem when the store can publish a local file.
     fn staging_directory(&self) -> Option<PathBuf> {
         None
@@ -192,6 +258,22 @@ pub trait Store {
     }
     fn scan(&mut self) -> Result<Manifest>;
     fn snapshot(&mut self, path: &str, expected: &Entry) -> Result<Snapshot>;
+    /// Private preparation only; stores with mutable/provider state retain the synchronous path.
+    fn prepare_snapshot_work(
+        &mut self,
+        _path: &str,
+        _expected: &Entry,
+    ) -> Result<Option<SnapshotWork>> {
+        Ok(None)
+    }
+    fn finish_snapshot_work(
+        &mut self,
+        _path: &str,
+        _expected: &Entry,
+        prepared: SnapshotResult,
+    ) -> Result<Snapshot> {
+        prepared.snapshot
+    }
     fn legacy_hash_with_control(
         &mut self,
         _io: &mut (impl Read + Write),
@@ -341,20 +423,29 @@ fn enumerate_namespace(
     root: &Path,
     ignore: &crate::ignore::Ignore,
 ) -> Result<crate::model::Namespace> {
-    fn walk(
-        base: &Path,
+    enumerate_namespace_limited(root, ignore, crate::model::MAX_FILES * 2)
+}
+fn enumerate_namespace_limited(
+    root: &Path,
+    ignore: &crate::ignore::Ignore,
+    limit: usize,
+) -> Result<crate::model::Namespace> {
+    fn directory(
+        root: &Path,
         dir: &Path,
         ignore: &crate::ignore::Ignore,
-        result: &mut crate::model::Namespace,
-    ) -> Result<()> {
+        limit: usize,
+    ) -> Result<Vec<(String, crate::model::NamespaceEntry, PathBuf)>> {
+        let _permit = crate::resources::acquire(dir)?;
+        let mut entries = Vec::new();
         for item in fs::read_dir(dir)? {
             let item = item?;
-            if dir == base && item.file_name() == ".rowd" {
+            if dir == root && item.file_name() == ".rowd" {
                 continue;
             }
             let path = item.path();
             let rel = path
-                .strip_prefix(base)?
+                .strip_prefix(root)?
                 .to_str()
                 .context("non UTF-8 filename")?;
             #[cfg(windows)]
@@ -370,8 +461,12 @@ fn enumerate_namespace(
                 !kind.is_symlink() && (kind.is_dir() || kind.is_file()),
                 "unsupported file: {rel}"
             );
-            let metadata = fs::metadata(&path)?;
-            result.insert(
+            let metadata = fs::symlink_metadata(&path)?;
+            ensure!(
+                !metadata.file_type().is_symlink() && metadata.is_dir() == kind.is_dir(),
+                "STALE_SOURCE: {rel}"
+            );
+            entries.push((
                 rel,
                 crate::model::NamespaceEntry {
                     size: metadata.len(),
@@ -382,24 +477,389 @@ fn enumerate_namespace(
                         .as_millis() as u64,
                     directory: kind.is_dir(),
                 },
-            );
-            ensure!(
-                result.len() <= crate::model::MAX_FILES * 2,
-                "too many namespace entries"
-            );
-            if kind.is_dir() {
-                walk(base, &path, ignore, result)?;
-            }
+                path,
+            ));
+            ensure!(entries.len() <= limit, "too many namespace entries");
         }
-        Ok(())
+        Ok(entries)
     }
     let mut result = crate::model::Namespace::new();
-    walk(root, root, ignore, &mut result)?;
+    let mut dirs = std::collections::VecDeque::from([root.to_path_buf()]);
+    let workers = crate::resources::workers("ROWD_METADATA_WORKERS", 2);
+    while !dirs.is_empty() {
+        let batch: Vec<_> = (0..workers).filter_map(|_| dirs.pop_front()).collect();
+        let results = if workers == 1 {
+            vec![directory(root, &batch[0], ignore, limit)?]
+        } else {
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = batch
+                    .iter()
+                    .map(|dir| scope.spawn(move || directory(root, dir, ignore, limit)))
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| {
+                        job.join()
+                            .map_err(|_| anyhow::anyhow!("metadata worker panicked"))?
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?
+        };
+        for entries in results {
+            for (path, entry, dir) in entries {
+                let is_dir = entry.directory;
+                ensure!(
+                    result.insert(path, entry).is_none(),
+                    "duplicate namespace path"
+                );
+                ensure!(result.len() <= limit, "too many namespace entries");
+                if is_dir {
+                    dirs.push_back(dir);
+                }
+            }
+        }
+    }
     crate::model::validate_namespace(&result)?;
     Ok(result)
 }
 
+pub struct PreparedScan {
+    root: PathBuf,
+    binding: String,
+    namespace: crate::model::Namespace,
+    files: Vec<(String, CachedEntry, bool)>,
+    share: String,
+    generation: u64,
+}
+
+/// Private cross-share preparation: no cache, journal or confirmed state writes.
+pub fn prepare_scan(
+    root: &Path,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedScan> {
+    ensure!(
+        !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+        "scan preparation cancelled"
+    );
+    let root = root.canonicalize()?;
+    let policy = read_root_policy(&root)?;
+    crate::ignore::Ignore::validate(&policy)?;
+    let binding = format!(
+        "{}|{:?}|{}",
+        root.display(),
+        fingerprint(&fs::symlink_metadata(&root)?)
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>(),
+        policy
+    );
+    let namespace =
+        enumerate_namespace_limited(&root, &crate::ignore::Ignore::parse(&policy), 4096)?;
+    ensure!(
+        namespace.len() <= 4096,
+        "share too large for ahead preparation"
+    );
+    ensure!(
+        namespace
+            .values()
+            .all(|entry| entry.directory || entry.size <= 8 * 1024 * 1024),
+        "large files use the normal scan"
+    );
+    ensure!(
+        namespace
+            .keys()
+            .map(|p| p.len().saturating_mul(3).saturating_add(512))
+            .sum::<usize>()
+            <= 8 * 1024 * 1024,
+        "share metadata exceeds preparation budget"
+    );
+    let cache_path = root.join(".rowd/cache.json");
+    let cache = fs::symlink_metadata(root.join(".rowd"))
+        .ok()
+        .filter(|m| m.is_dir() && !m.file_type().is_symlink())
+        .and_then(|_| {
+            fs::metadata(&cache_path)
+                .ok()
+                .filter(|m| m.len() <= 8 * 1024 * 1024)
+        })
+        .and_then(|_| fs::read(&cache_path).ok())
+        .and_then(|bytes| serde_json::from_slice::<CacheDisk>(&bytes).ok())
+        .filter(|disk| disk.blake3 && disk.policy == policy)
+        .map(|disk| disk.files)
+        .unwrap_or_default();
+    let paths: Vec<_> = namespace
+        .iter()
+        .filter(|(_, e)| !e.directory)
+        .map(|(p, _)| p.clone())
+        .collect();
+    let mut files = Vec::new();
+    for batch in paths.chunks(crate::resources::workers("ROWD_HASH_WORKERS", 4)) {
+        ensure!(
+            !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+            "scan preparation cancelled"
+        );
+        let results = std::thread::scope(|scope| {
+            let jobs: Vec<_> = batch
+                .iter()
+                .map(|path| {
+                    let root = &root;
+                    let cache = &cache;
+                    scope.spawn(move || {
+                        let target = root.join(path);
+                        let _cpu = crate::resources::acquire_hash();
+                        let _permit = crate::resources::acquire(&target)?;
+                        let metadata = fs::symlink_metadata(&target)?;
+                        ensure!(
+                            metadata.is_file() && !metadata.file_type().is_symlink(),
+                            "STALE_SOURCE: {path}"
+                        );
+                        let before = fingerprint(&metadata);
+                        if let Some(cached) = cache
+                            .get(path)
+                            .filter(|c| !before.is_empty() && c.metadata == before)
+                        {
+                            return Ok((path.clone(), cached.clone(), false));
+                        }
+                        struct CancelRead<'a>(File, &'a std::sync::atomic::AtomicBool);
+                        impl Read for CancelRead<'_> {
+                            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                                if self.1.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return Err(std::io::Error::other(
+                                        "scan preparation cancelled",
+                                    ));
+                                }
+                                self.0.read(buf)
+                            }
+                        }
+                        let file = File::open(&target)?;
+                        ensure!(
+                            fingerprint(&file.metadata()?) == before,
+                            "STALE_SOURCE: {path}"
+                        );
+                        let (hash, size) = hash_reader(CancelRead(file, cancelled))?;
+                        ensure!(
+                            fingerprint(&fs::symlink_metadata(&target)?) == before,
+                            "STALE_SOURCE: {path}"
+                        );
+                        Ok((
+                            path.clone(),
+                            CachedEntry {
+                                metadata: before,
+                                entry: Entry { hash, size },
+                            },
+                            true,
+                        ))
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| {
+                    job.join()
+                        .map_err(|_| anyhow::anyhow!("scan worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        files.extend(results);
+    }
+    Ok(PreparedScan {
+        root,
+        binding,
+        namespace,
+        files,
+        share: String::new(),
+        generation: 0,
+    })
+}
+
+pub struct ScanPreparations {
+    remaining: std::collections::VecDeque<(String, PathBuf)>,
+    generation: u64,
+    pending: std::collections::VecDeque<(
+        String,
+        PathBuf,
+        std::thread::JoinHandle<Result<PreparedScan>>,
+    )>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    limit: usize,
+}
+impl ScanPreparations {
+    pub fn new(roots: impl IntoIterator<Item = (String, PathBuf)>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let limit = crate::resources::workers("ROWD_SHARE_WORKERS", 2);
+        let mut queue = Self {
+            generation,
+            remaining: if limit > 1 {
+                roots.into_iter().collect()
+            } else {
+                Default::default()
+            },
+            pending: Default::default(),
+            cancelled: Default::default(),
+            limit,
+        };
+        queue.fill();
+        queue
+    }
+    fn fill(&mut self) {
+        while self.pending.len() < self.limit {
+            let Some((share, root)) = self.remaining.pop_front() else {
+                break;
+            };
+            let work_root = root.clone();
+            let cancelled = self.cancelled.clone();
+            let expected_share = share.clone();
+            let generation = self.generation;
+            self.pending.push_back((
+                share,
+                root,
+                std::thread::spawn(move || {
+                    let mut result = prepare_scan(&work_root, &cancelled)?;
+                    result.share = expected_share;
+                    result.generation = generation;
+                    Ok(result)
+                }),
+            ));
+        }
+    }
+    pub fn take(&mut self, share: &str, root: &Path) -> Option<PreparedScan> {
+        if self
+            .pending
+            .front()
+            .is_none_or(|(id, next, _)| id != share || next != root)
+        {
+            return None;
+        }
+        let (_, _, job) = self.pending.pop_front()?;
+        let result = job.join().ok().and_then(Result::ok)?;
+        (result.share == share && result.generation == self.generation).then_some(result)
+    }
+    pub fn advance(&mut self) {
+        self.fill();
+    }
+}
+impl Drop for ScanPreparations {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for (_, _, job) in self.pending.drain(..) {
+            let _ = job.join();
+        }
+    }
+}
+
 impl LocalStore {
+    pub fn consume_prepared_scan(&mut self, prepared: PreparedScan) -> Result<()> {
+        ensure!(
+            prepared.root == self.root && self.scan_binding()? == prepared.binding,
+            "STALE_SOURCE: prepared share binding"
+        );
+        ensure!(
+            enumerate_namespace(&self.root, &self.ignore)? == prepared.namespace,
+            "STALE_SOURCE: prepared namespace"
+        );
+        for (path, cached, _) in &prepared.files {
+            ensure!(
+                fingerprint(&fs::metadata(self.checked_path(path, false)?)?) == cached.metadata,
+                "STALE_SOURCE: {path}"
+            );
+        }
+        let mut metrics = self.metrics.get();
+        for (path, cached, hashed) in prepared.files {
+            if hashed {
+                metrics.files_hashed += 1;
+                metrics.bytes_hashed += cached.entry.size;
+            }
+            self.cache.insert(path, cached);
+        }
+        self.metrics.set(metrics);
+        self.cache_modified = true;
+        Ok(())
+    }
+
+    fn hash_paths(&mut self, paths: &[(String, Vec<u64>)]) -> Result<Manifest> {
+        let mut result = Manifest::new();
+        let workers = crate::resources::workers("ROWD_HASH_WORKERS", 4);
+        for batch in paths.chunks(workers) {
+            let mut jobs = Vec::new();
+            for (path, original) in batch {
+                let source = self.checked_path(path, false)?;
+                let metadata = fs::metadata(&source)?;
+                let before = fingerprint(&metadata);
+                ensure!(before == *original, "STALE_SOURCE: {path}");
+                if let Some(cached) = self
+                    .cache
+                    .get(path)
+                    .filter(|c| !before.is_empty() && c.metadata == before)
+                {
+                    crate::trace::observed_file(path, "audit_scan", &metadata, &cached.entry.hash);
+                    result.insert(path.clone(), cached.entry.clone());
+                } else {
+                    jobs.push((path.clone(), source, metadata, before));
+                }
+            }
+            let hash_job = |(path, source, metadata, before): (
+                String,
+                PathBuf,
+                fs::Metadata,
+                Vec<u64>,
+            )|
+             -> Result<_> {
+                let _cpu = crate::resources::acquire_hash();
+                let _permit = crate::resources::acquire(&source)?;
+                let file = File::open(&source)?;
+                ensure!(
+                    fingerprint(&file.metadata()?) == before,
+                    "STALE_SOURCE: {path}"
+                );
+                let (hash, size) = hash_reader(file)?;
+                ensure!(
+                    fingerprint(&fs::metadata(&source)?) == before,
+                    "STALE_SOURCE: {path}"
+                );
+                Ok((
+                    path,
+                    metadata,
+                    CachedEntry {
+                        metadata: before,
+                        entry: Entry { hash, size },
+                    },
+                ))
+            };
+            let hashed = if workers == 1 {
+                jobs.into_iter().map(hash_job).collect::<Result<Vec<_>>>()?
+            } else {
+                std::thread::scope(|scope| {
+                    let jobs: Vec<_> = jobs
+                        .into_iter()
+                        .map(|job| scope.spawn(move || hash_job(job)))
+                        .collect();
+                    jobs.into_iter()
+                        .map(|j| {
+                            j.join()
+                                .map_err(|_| anyhow::anyhow!("hash worker panicked"))?
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?
+            };
+            for (path, metadata, cached) in hashed {
+                ensure!(
+                    fingerprint(&fs::metadata(self.checked_path(&path, false)?)?)
+                        == cached.metadata,
+                    "STALE_SOURCE: {path}"
+                );
+                crate::trace::observed_file(&path, "audit_scan", &metadata, &cached.entry.hash);
+                let mut counts = self.metrics.get();
+                counts.files_hashed += 1;
+                counts.bytes_hashed += cached.entry.size;
+                self.metrics.set(counts);
+                result.insert(path.clone(), cached.entry.clone());
+                self.cache.insert(path, cached);
+                self.cache_modified = true;
+            }
+        }
+        Ok(result)
+    }
+
     pub fn open(root: &Path) -> Result<Self> {
         Self::open_impl(root, true, None, true)
     }
@@ -860,6 +1320,7 @@ impl LocalStore {
         temp: NamedTempFile,
         verified_metadata: Vec<u64>,
     ) -> Result<()> {
+        let _permit = crate::resources::acquire(&self.root)?;
         ensure!(!self.excluded(path), "ignored path: {path}");
         validate_path(path)?;
         let internal = crate::internal_writes::register(&self.root.join(path), &self.root, entry);
@@ -1001,6 +1462,8 @@ impl Store for LocalStore {
                 }
                 _ => return Ok(None),
             };
+            let _cpu = crate::resources::acquire_hash();
+            let _permit = crate::resources::acquire(&target)?;
             let (hash, size) = hash_reader(File::open(&target)?)?;
             let metadata = fs::metadata(&target)?;
             let after = fingerprint(&metadata);
@@ -1165,49 +1628,11 @@ impl Store for LocalStore {
         Ok(())
     }
     fn next_hash_chunk(&mut self, _io: &mut (impl Read + Write)) -> Result<Option<Manifest>> {
-        let mut files = Manifest::new();
-        while files.len() < crate::protocol::SCAN_STREAM_CHUNK_FILES {
-            let Some((path, original)) = self
-                .stream_queue
-                .as_mut()
-                .context("no namespace scan")?
-                .pop_front()
-            else {
-                break;
-            };
-            let source = self.checked_path(&path, false)?;
-            let before = fingerprint(
-                &fs::metadata(&source).with_context(|| format!("STALE_SOURCE: {path}"))?,
-            );
-            ensure!(before == original, "STALE_SOURCE: {path}");
-            let entry = if let Some(cached) = self
-                .cache
-                .get(&path)
-                .filter(|c| !before.is_empty() && c.metadata == before)
-            {
-                cached.entry.clone()
-            } else {
-                let (hash, size) = hash_reader(File::open(&source)?)?;
-                ensure!(
-                    fingerprint(&fs::metadata(&source)?) == before,
-                    "STALE_SOURCE: {path}"
-                );
-                let entry = Entry { hash, size };
-                self.cache.insert(
-                    path.clone(),
-                    CachedEntry {
-                        metadata: before,
-                        entry: entry.clone(),
-                    },
-                );
-                let mut metrics = self.metrics.get();
-                metrics.files_hashed += 1;
-                metrics.bytes_hashed += size;
-                self.metrics.set(metrics);
-                entry
-            };
-            files.insert(path, entry);
-        }
+        let queue = self.stream_queue.as_mut().context("no namespace scan")?;
+        let paths: Vec<_> = (0..crate::protocol::SCAN_STREAM_CHUNK_FILES)
+            .filter_map(|_| queue.pop_front())
+            .collect();
+        let files = self.hash_paths(&paths)?;
         Ok((!files.is_empty()).then_some(files))
     }
     fn discard_scan(&mut self) -> Result<()> {
@@ -1303,6 +1728,8 @@ impl Store for LocalStore {
                         "FILE_HASH_START",
                         serde_json::json!({"relative_path":rel,"reason":"cache_missing_or_metadata_changed"})
                     );
+                    let _cpu = crate::resources::acquire_hash();
+                    let _permit = crate::resources::acquire(&path)?;
                     let hashing = std::time::Instant::now();
                     let (hash, size) = hash_reader(File::open(&path)?)?;
                     crate::trace_event!(
@@ -1381,6 +1808,8 @@ impl Store for LocalStore {
                     Ok(file) => {
                         let metadata = fs::metadata(&target)?;
                         let before = fingerprint(&metadata);
+                        let _cpu = crate::resources::acquire_hash();
+                        let _permit = crate::resources::acquire(&target)?;
                         let (hash, size) = hash_reader(file)?;
                         let after = fingerprint(&fs::metadata(&target)?);
                         ensure!(before == after, "STALE_SOURCE: {path}");
@@ -1409,15 +1838,36 @@ impl Store for LocalStore {
             let mut counts = self.metrics.get();
             counts.full_scans += 1;
             self.metrics.set(counts);
-            walk(
-                &self.root,
-                &self.root,
-                &mut result,
-                &ignore,
-                &mut self.cache,
-                &self.metrics,
-                &mut cache_changed,
-            )?;
+            if crate::resources::workers("ROWD_HASH_WORKERS", 4) > 1
+                || crate::resources::workers("ROWD_METADATA_WORKERS", 2) > 1
+            {
+                let namespace = enumerate_namespace(&self.root, &ignore)?;
+                let paths = namespace
+                    .iter()
+                    .filter(|(_, e)| !e.directory)
+                    .map(|(path, _)| {
+                        Ok((
+                            path.clone(),
+                            fingerprint(&fs::metadata(self.checked_path(path, false)?)?),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut counts = self.metrics.get();
+                counts.files_enumerated += paths.len() as u64;
+                self.metrics.set(counts);
+                result = self.hash_paths(&paths)?;
+                cache_changed = true;
+            } else {
+                walk(
+                    &self.root,
+                    &self.root,
+                    &mut result,
+                    &ignore,
+                    &mut self.cache,
+                    &self.metrics,
+                    &mut cache_changed,
+                )?;
+            }
         }
         validate_manifest(&result)?;
         let cache_len = self.cache.len();
@@ -1447,6 +1897,8 @@ impl Store for LocalStore {
     fn snapshot(&mut self, path: &str, expected: &Entry) -> Result<Snapshot> {
         ensure!(!self.excluded(path), "ignored path: {path}");
         let source = self.checked_path(path, false)?;
+        let _cpu = crate::resources::acquire_hash();
+        let _permit = crate::resources::acquire(&source)?;
         let mut temp = NamedTempFile::new_in(&self.private)?;
         let (hash, size) = copy_and_hash(File::open(source)?, &mut temp)?;
         let mut metrics = self.metrics.get();
@@ -1462,8 +1914,62 @@ impl Store for LocalStore {
         VerifiedStaged::from_digest(temp, expected, &hash, size)
     }
 
+    fn prepare_snapshot_work(
+        &mut self,
+        path: &str,
+        expected: &Entry,
+    ) -> Result<Option<SnapshotWork>> {
+        ensure!(!self.excluded(path), "ignored path: {path}");
+        let source = File::open(self.checked_path(path, false)?)?;
+        let evidence = fingerprint(&source.metadata()?);
+        Ok(Some(SnapshotWork {
+            source,
+            temp: NamedTempFile::new_in(&self.private)?,
+            expected: expected.clone(),
+            evidence,
+        }))
+    }
+
+    fn finish_snapshot_work(
+        &mut self,
+        path: &str,
+        expected: &Entry,
+        prepared: SnapshotResult,
+    ) -> Result<Snapshot> {
+        if let Some(size) = prepared.copied {
+            let mut metrics = self.metrics.get();
+            metrics.staging_copies += 1;
+            metrics.files_hashed += 1;
+            metrics.bytes_hashed += size;
+            self.metrics.set(metrics);
+        }
+        let source_unchanged = self
+            .checked_path(path, false)
+            .and_then(|source| Ok(fingerprint(&fs::metadata(source)?) == prepared.evidence))
+            .unwrap_or(false);
+        if !source_unchanged
+            || prepared
+                .snapshot
+                .as_ref()
+                .is_err_and(|e| e.to_string() == "STALE_SOURCE")
+        {
+            self.invalidate_path(path);
+            self.persist_cache()?;
+            bail!("STALE_SOURCE: {path}; cache invalidated");
+        }
+        let snapshot = prepared.snapshot?;
+        ensure!(
+            snapshot.entry() == expected,
+            "prepared snapshot entry mismatch"
+        );
+        Ok(snapshot)
+    }
+
     fn staging_directory(&self) -> Option<PathBuf> {
         Some(self.private.clone())
+    }
+    fn supports_get_overlap(&self) -> bool {
+        true
     }
 
     fn install_received(
@@ -1511,6 +2017,153 @@ impl Store for LocalStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_hash_stream_matches_each_file() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..4 {
+            fs::write(
+                root.path().join(format!("file-{index}")),
+                format!("contents-{index}"),
+            )
+            .unwrap();
+        }
+        let mut store = LocalStore::open(root.path()).unwrap();
+        let mut wire = std::io::Cursor::new(Vec::new());
+        store.stream_namespace(&mut wire).unwrap();
+        store.start_hash_stream(&Default::default()).unwrap();
+        let files = store.next_hash_chunk(&mut wire).unwrap().unwrap();
+        assert_eq!(files.len(), 4);
+        for index in 0..4 {
+            assert_eq!(
+                files[&format!("file-{index}")].hash,
+                hash_reader(format!("contents-{index}").as_bytes())
+                    .unwrap()
+                    .0
+            );
+        }
+        assert_eq!(store.metrics().files_hashed, 4);
+        assert!(store.next_hash_chunk(&mut wire).unwrap().is_none());
+        store.validate_scan_snapshot().unwrap();
+    }
+
+    #[test]
+    fn concurrent_scan_preparation_is_private_and_rejects_stale_results() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a"), b"first").unwrap();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        fs::write(root.path().join("nested/b"), b"second").unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let prepared = prepare_scan(root.path(), &cancelled).unwrap();
+        assert!(!root.path().join(".rowd").exists());
+        let mut store = LocalStore::open(root.path()).unwrap();
+        store.consume_prepared_scan(prepared).unwrap();
+        let manifest = store.scan().unwrap();
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest["a"].hash, hash_reader(&b"first"[..]).unwrap().0);
+        let stale = prepare_scan(root.path(), &cancelled).unwrap();
+        fs::write(root.path().join("a"), b"changed length").unwrap();
+        assert!(store.consume_prepared_scan(stale).is_err());
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(prepare_scan(root.path(), &cancelled).is_err());
+    }
+    #[test]
+    fn concurrent_share_preparation_preserves_share_identity() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a"), b"a").unwrap();
+        let mut queue = ScanPreparations::new([(String::from("one"), root.path().to_path_buf())]);
+        assert!(queue.take("different", root.path()).is_none());
+        if crate::resources::workers("ROWD_SHARE_WORKERS", 2) > 1 {
+            let prepared = queue.take("one", root.path()).unwrap();
+            assert_eq!(prepared.share, "one");
+            assert!(prepared.generation > 0);
+        }
+    }
+
+    #[test]
+    fn prepared_snapshot_is_private_and_rejects_source_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"original").unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        let entry = store.scan().unwrap()["file"].clone();
+        let before = store.metrics();
+        let work = store
+            .prepare_snapshot_work("file", &entry)
+            .unwrap()
+            .unwrap();
+        let temp_path = work.temp.path().to_owned();
+        let prepared = work.run(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        assert_eq!(store.metrics().bytes_hashed, before.bytes_hashed);
+        fs::write(root.path().join("file"), b"mutated!").unwrap();
+        let error = store
+            .finish_snapshot_work("file", &entry, prepared)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("STALE_SOURCE"));
+        assert!(!temp_path.exists());
+        let cache: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.private.join("cache.json")).unwrap()).unwrap();
+        assert!(cache["files"].get("file").is_none());
+        assert_eq!(store.metrics().staging_copies, before.staging_copies + 1);
+        assert_ne!(store.scan().unwrap()["file"], entry);
+    }
+
+    #[test]
+    fn prepared_snapshot_rejects_mutation_before_worker_reads() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"original").unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        let entry = store.scan().unwrap()["file"].clone();
+        let work = store
+            .prepare_snapshot_work("file", &entry)
+            .unwrap()
+            .unwrap();
+        let temp_path = work.temp.path().to_owned();
+        fs::write(root.path().join("file"), b"changed before read").unwrap();
+        let prepared = work.run(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let error = store
+            .finish_snapshot_work("file", &entry, prepared)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("STALE_SOURCE"));
+        assert!(!temp_path.exists());
+        assert_ne!(store.scan().unwrap()["file"], entry);
+    }
+
+    #[test]
+    fn prepared_snapshot_keeps_fused_copy_hash_and_cancellation_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"original").unwrap();
+        let mut store = LocalStore::open(root.path()).unwrap();
+        let entry = store.scan().unwrap()["file"].clone();
+        let work = store
+            .prepare_snapshot_work("file", &entry)
+            .unwrap()
+            .unwrap();
+        let prepared = work.run(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let snapshot = store
+            .finish_snapshot_work("file", &entry, prepared)
+            .unwrap();
+        assert_eq!(fs::read(snapshot.path()).unwrap(), b"original");
+        let work = store
+            .prepare_snapshot_work("file", &entry)
+            .unwrap()
+            .unwrap();
+        let temp_path = work.temp.path().to_owned();
+        let prepared = work.run(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )));
+        assert!(store
+            .finish_snapshot_work("file", &entry, prepared)
+            .is_err());
+        assert!(!temp_path.exists());
+    }
+
     use super::*;
 
     #[test]

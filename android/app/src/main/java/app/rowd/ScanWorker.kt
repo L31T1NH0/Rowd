@@ -3,24 +3,24 @@ package app.rowd
 import java.util.concurrent.FutureTask
 
 /** Result consumption and worker termination are separate operations. */
-internal class ScanWorker {
+internal class ScanWorker<T>(private val discard: (T) -> Unit = {}) {
     enum class State { IDLE, RUNNING, COMPLETED, CONSUMED, CANCEL_REQUESTED }
-    @Volatile private var task: FutureTask<String>? = null
-    var state = State.IDLE
+    @Volatile private var task: FutureTask<T>? = null
+    @Volatile var state = State.IDLE
         private set
     fun hasTask() = task != null
 
-    @Synchronized fun start(scan: () -> String) {
+    @Synchronized fun start(scan: () -> T) {
         check(task == null) { "Scan SAF já em andamento." }
-        val next = FutureTask<String> { scan() }
+        val next = FutureTask<T> { scan() }
         task = next
         state = State.RUNNING
         Thread(next, "Rowd SAF scan").start()
     }
 
-    @Synchronized fun poll(): String {
+    @Synchronized fun poll(): T? {
         val current = task ?: error("Nenhum scan SAF em andamento.")
-        if (!current.isDone) return ""
+        if (!current.isDone) return null
         state = State.COMPLETED
         return try { current.get() } finally {
             task = null
@@ -40,8 +40,9 @@ internal class ScanWorker {
         try {
             if (current != null) {
                 while (true) {
-                    try { current.get(); break }
+                    try { discard(current.get()); break }
                     catch (_: InterruptedException) { interrupted = true }
+                    catch (_: java.util.concurrent.ExecutionException) { break }
                 }
             }
         } finally {

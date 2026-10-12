@@ -5,6 +5,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.security.DigestOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Physical evidence only. Never provides paths, manifests, ACKs or base tokens. */
 internal class PhysicalHashCache(private val directory: File) {
@@ -15,12 +16,13 @@ internal class PhysicalHashCache(private val directory: File) {
     private var entries = mutableMapOf<String, Entry>()
     private var file: File? = null
     private var dirty = false
+    private val retrySave = AtomicBoolean(false)
     private var lastSaveAttempt = System.nanoTime() / 1_000_000
 
     fun select(shareId: String, binding: String) {
         if (share == shareId && identity == binding) return
         share = shareId; identity = binding; entries.clear()
-        dirty = false; lastSaveAttempt = System.nanoTime() / 1_000_000
+        dirty = false; retrySave.set(false); lastSaveAttempt = System.nanoTime() / 1_000_000
         val name = MessageDigest.getInstance("SHA-256").digest(shareId.toByteArray())
             .joinToString("") { "%02x".format(it.toInt() and 255) }
         file = File(directory, "$name.hashes")
@@ -62,13 +64,45 @@ internal class PhysicalHashCache(private val directory: File) {
 
     /** Failed persistence is optional evidence; keep dirty memory and throttle retries. */
     fun saveIfDue(force: Boolean = false, nowMillis: Long = System.nanoTime() / 1_000_000): Exception? {
+        return try { prepareSaveIfDue(force, nowMillis)?.publish(); null }
+            catch (error: Exception) { error }
+    }
+
+    /** Preparation reads the producer's private map; only the owner publishes its receipt. */
+    fun prepareSaveIfDue(force: Boolean = false, nowMillis: Long = System.nanoTime() / 1_000_000): PreparedSave? {
+        if (retrySave.getAndSet(false)) dirty = true
         if (!dirty || (!force && nowMillis - lastSaveAttempt < 15_000)) return null
         lastSaveAttempt = nowMillis
-        return try { save(); null } catch (error: Exception) { error }
+        return prepareSave().also { dirty = false }
     }
 
     fun save() {
-        val target = file ?: return
+        prepareSave().publish()
+        dirty = false
+    }
+
+    internal class PreparedSave(private val temp: File, private val target: File,
+        private val retry: AtomicBoolean) {
+        private val settled = AtomicBoolean(false)
+        fun publish() {
+            check(settled.compareAndSet(false, true)) { "Cache receipt already consumed." }
+            try {
+                Files.move(temp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (error: Exception) {
+                retry.set(true)
+                throw error
+            } finally { temp.delete() }
+        }
+        fun discard(retryLater: Boolean = true) {
+            if (settled.compareAndSet(false, true)) {
+                if (retryLater) retry.set(true)
+                temp.delete()
+            }
+        }
+    }
+
+    private fun prepareSave(): PreparedSave {
+        val target = file ?: error("Physical cache not selected.")
         directory.mkdirs()
         val temp = File.createTempFile("hash-cache-", ".tmp", directory)
         try {
@@ -83,8 +117,7 @@ internal class PhysicalHashCache(private val directory: File) {
                 }
                 output.flush(); raw.write(digest.digest()); raw.fd.sync()
             }
-            Files.move(temp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-            dirty = false
-        } finally { temp.delete() }
+            return PreparedSave(temp, target, retrySave)
+        } catch (error: Exception) { temp.delete(); throw error }
     }
 }

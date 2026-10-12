@@ -18,7 +18,7 @@ class ScanResilienceTest {
         assertFalse(scanShouldAbort(false, true, false))
     }
     @Test fun fullScanCancellationJoinsWorkerAndAllowsNextShare() {
-        val worker = ScanWorker()
+        val worker = ScanWorker<String>()
         val started = CountDownLatch(1)
         val cancel = AtomicBoolean(false)
         val stopped = CountDownLatch(1)

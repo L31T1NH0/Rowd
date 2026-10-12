@@ -1,9 +1,9 @@
 # <img src="assets/icons/rowd-pc.png" alt="Rowd icon" width="40"> Rowd
 
 > [!WARNING]
-> **Unstable alpha (0.8.7).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
+> **Unstable alpha (0.8.8).** Bugs may interrupt sync or require manual recovery. Do not rely on Rowd as the only copy of important files. Start with disposable folders and keep an independent backup.
 
-Source builds are **0.8.7-alpha**, using sync protocol **V17**. Build the PC binary and Android APK from the same checkout. The downloads below refer to the previous 0.8.2 release.
+Source builds are **0.8.9-alpha**, using sync protocol **V17**. Build the PC binary and Android APK from the same checkout. The downloads below refer to the previous 0.8.2 release.
 
 Rowd syncs folders between one Linux PC and one Android phone on the same local network. You choose which folders connect and whether files travel both ways, to Android, or to the PC. The devices transfer files over TLS without a cloud account or relay.
 

@@ -51,6 +51,10 @@ pub struct Report {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShareMetrics {
+    pub snapshot_prefetch_started: u64,
+    pub snapshot_prefetch_consumed: u64,
+    pub get_overlap_started: u64,
+    pub get_overlap_completed: u64,
     pub activation_ms: u128,
     pub share_queue_wait_ms: u128,
     pub configure_ms: u128,
@@ -210,11 +214,10 @@ fn receive_blob(io: &mut impl Read, entry: &Entry, directory: Option<&Path>) -> 
     anyhow::ensure!(entry.size <= crate::model::MAX_FILE, "file too large");
     let (hash, size) =
         crate::copy_and_hash(io.take(entry.size), &mut temp).context(protocol::IncompleteFrame)?;
-    ensure!(
-        size == entry.size,
-        "truncated transfer: {size}/{}",
-        entry.size
-    );
+    if size != entry.size {
+        return Err(anyhow::anyhow!("truncated transfer: {size}/{}", entry.size)
+            .context(protocol::IncompleteFrame));
+    }
     VerifiedStaged::from_digest(temp, entry, &hash, size)
 }
 fn remote_snapshot(
@@ -375,6 +378,65 @@ struct PendingPut {
     staged: Snapshot,
 }
 
+struct SnapshotPrefetch {
+    scope: String,
+    share_id: String,
+    binding: String,
+    path: String,
+    entry: Entry,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<crate::storage::SnapshotResult>>,
+}
+
+impl SnapshotPrefetch {
+    fn consume(
+        mut self,
+        scope: &str,
+        share_id: &str,
+        path: &str,
+        entry: &Entry,
+        store: &mut impl Store,
+    ) -> Result<(Snapshot, u128)> {
+        ensure!(
+            self.scope == scope
+                && self.share_id == share_id
+                && self.path == path
+                && self.entry == *entry
+                && self.binding == store.scan_binding()?,
+            "stale snapshot preparation"
+        );
+        let result = self
+            .worker
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| anyhow::anyhow!("snapshot worker panicked"))?;
+        ensure!(
+            self.binding == store.scan_binding()?,
+            "stale snapshot preparation"
+        );
+        let elapsed_ms = result.elapsed_ms;
+        Ok((store.finish_snapshot_work(path, entry, result)?, elapsed_ms))
+    }
+}
+
+impl Drop for SnapshotPrefetch {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn prefetch_fits(files: usize, bytes: u64, current: u64, next: u64) -> bool {
+    files + 2 <= MAX_IN_FLIGHT_FILES
+        && current <= MAX_STAGED_BYTES
+        && next <= MAX_STAGED_BYTES
+        && bytes.saturating_add(current).saturating_add(next) <= MAX_STAGED_BYTES
+}
+
 struct StagedPut {
     sequence: u64,
     path: String,
@@ -454,6 +516,7 @@ fn install_remote_stages(
     Ok(())
 }
 
+#[derive(Clone)]
 struct PendingGet {
     path: String,
     entry: Entry,
@@ -466,18 +529,66 @@ struct IncomingPut {
     expected: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PutBatchScope {
+    id: String,
+    share_id: String,
+    binding: String,
+    scan_id: Option<String>,
+}
+
+struct ReceivedPut {
+    scope: PutBatchScope,
+    sequence: usize,
+    job: IncomingPut,
+    staged: Snapshot,
+}
+
+impl ReceivedPut {
+    fn validate(&self, scope: &PutBatchScope, sequence: usize, binding: &str) -> Result<()> {
+        ensure!(
+            self.scope == *scope,
+            "STALE_TARGET: received batch scope changed"
+        );
+        ensure!(
+            self.sequence == sequence,
+            "received batch result out of order"
+        );
+        ensure!(
+            scope.binding == binding,
+            "STALE_TARGET: received batch binding changed"
+        );
+        crate::model::validate_path(&self.job.path)?;
+        ensure!(
+            self.staged.entry() == &self.job.entry,
+            "received batch entry changed"
+        );
+        Ok(())
+    }
+}
+
 fn receive_put_batch(
     io: &mut (impl Read + Write + Send),
     store: &mut impl Store,
     share_id: &str,
+    scan_id: Option<&str>,
     first: IncomingPut,
 ) -> Result<Vec<String>> {
+    // Scoped threads join before this unique batch can end, so its identity also
+    // fences results from any previous round, reconnect or share configuration.
+    let batch = PutBatchScope {
+        id: crate::random_id()?,
+        share_id: share_id.into(),
+        binding: store.scan_binding()?,
+        scan_id: scan_id.map(str::to_owned),
+    };
     let staging_directory = store.staging_directory();
-    let (sender, receiver) = sync_channel::<(IncomingPut, Snapshot)>(1);
+    let (sender, receiver) = sync_channel::<ReceivedPut>(1);
     let mut installed = Vec::new();
     let result = std::thread::scope(|scope| -> Result<()> {
         let reader_io = &mut *io;
         let trace_context = trace::current_context();
+        let producer_scope = batch.clone();
         let reader = scope.spawn(move || -> Result<()> {
             let _trace_context = trace_context.enter();
             let mut next = first;
@@ -525,7 +636,12 @@ fn receive_put_batch(
                     None,
                 );
                 sender
-                    .send((next, staged))
+                    .send(ReceivedPut {
+                        scope: producer_scope.clone(),
+                        sequence: count - 1,
+                        job: next,
+                        staged,
+                    })
                     .map_err(|_| anyhow::anyhow!("install worker stopped"))?;
                 next = match protocol::receive_for(reader_io, share_id)? {
                     Message::Put {
@@ -544,7 +660,8 @@ fn receive_put_batch(
             Ok(())
         });
         let mut install_error = None;
-        for (job, staged) in receiver {
+        for (sequence, received) in receiver.into_iter().enumerate() {
+            let job = &received.job;
             let _transfer = trace::transfer_context(share_id, &job.path).enter();
             if install_error.is_some() {
                 continue;
@@ -559,7 +676,14 @@ fn receive_put_batch(
                 None,
             );
             let installing = Instant::now();
-            match store.install_received(&job.path, job.expected.as_deref(), &job.entry, staged) {
+            let validation = store
+                .scan_binding()
+                .and_then(|binding| received.validate(&batch, sequence, &binding));
+            let ReceivedPut { job, staged, .. } = received;
+            let install = validation.and_then(|()| {
+                store.install_received(&job.path, job.expected.as_deref(), &job.entry, staged)
+            });
+            match install {
                 Ok(()) => {
                     crate::trace_legacy_event!(
                         "sync",
@@ -670,6 +794,168 @@ fn drain_puts(
     Ok(())
 }
 
+fn receive_get_job(
+    io: &mut (impl Read + Write),
+    share_id: &str,
+    job: &PendingGet,
+    directory: Option<&Path>,
+    deferred: &mut bool,
+    report: &mut Report,
+    round_started: Instant,
+) -> Result<Option<Snapshot>> {
+    let _transfer = trace::transfer_context(share_id, &job.path).enter();
+    let waiting = Instant::now();
+    crate::trace_legacy_event!(
+        "sync",
+        "peer_wait_start",
+        Some(share_id),
+        Some(&job.path),
+        None,
+        None,
+        None,
+    );
+    let actual = match protocol::receive_for(io, share_id)? {
+        Message::Blob { entry } if !*deferred => entry,
+        Message::Blob { .. } => {
+            return Err(anyhow::anyhow!("unexpected Blob after Get deferral")
+                .context(protocol::IncompleteFrame));
+        }
+        Message::ScanDeferred => {
+            *deferred = true;
+            return Ok(None);
+        }
+        _ => anyhow::bail!("expected blob or Get deferral"),
+    };
+    crate::trace_legacy_event!(
+        "sync",
+        "peer_wait_end",
+        Some(share_id),
+        Some(&job.path),
+        None,
+        Some(waiting),
+        None,
+    );
+    if actual != job.entry {
+        return Err(anyhow::anyhow!("STALE_SOURCE").context(protocol::IncompleteFrame));
+    }
+    report.metrics.wait_peer_ms += waiting.elapsed().as_millis();
+    report
+        .metrics
+        .first_byte_ms
+        .get_or_insert_with(|| round_started.elapsed().as_millis());
+    let transferring = Instant::now();
+    crate::trace_legacy_event!(
+        "sync",
+        "blob_receive_start",
+        Some(share_id),
+        Some(&job.path),
+        Some(job.entry.size),
+        None,
+        None,
+    );
+    let snapshot = receive_blob(io, &job.entry, directory).map_err(|e| {
+        trace::record_error(
+            trace::Component::Transfer,
+            "TRANSFER_FAILED",
+            "transfer",
+            "receive_get_blob",
+            e,
+        )
+    })?;
+    crate::trace_legacy_event!(
+        "sync",
+        "blob_receive_end",
+        Some(share_id),
+        Some(&job.path),
+        Some(job.entry.size),
+        Some(transferring),
+        None,
+    );
+    report.metrics.transfer_ms += transferring.elapsed().as_millis();
+    Ok(Some(snapshot))
+}
+
+fn receive_get_window(
+    io: &mut (impl Read + Write),
+    share_id: &str,
+    pending: &mut Vec<PendingGet>,
+    directory: Option<&Path>,
+    report: &mut Report,
+    round_started: Instant,
+) -> Result<Option<Vec<(PendingGet, Snapshot)>>> {
+    let mut staged = Vec::with_capacity(pending.len());
+    let mut deferred = false;
+    for job in pending.drain(..) {
+        if let Some(snapshot) = receive_get_job(
+            io,
+            share_id,
+            &job,
+            directory,
+            &mut deferred,
+            report,
+            round_started,
+        )? {
+            staged.push((job, snapshot));
+        }
+    }
+    if deferred {
+        finish_deferred_gets(io, share_id)?;
+        return Ok(None);
+    }
+    Ok(Some(staged))
+}
+
+fn install_get_job(
+    store: &mut impl Store,
+    state: &mut State,
+    job: &PendingGet,
+    snapshot: Snapshot,
+    ack_batch: &mut crate::model::Manifest,
+    report: &mut Report,
+) -> Result<()> {
+    let _transfer = trace::transfer_context(&state.share_id, &job.path).enter();
+    let installing = Instant::now();
+    crate::trace_legacy_event!(
+        "sync",
+        "install_start",
+        Some(&state.share_id),
+        Some(&job.path),
+        Some(job.entry.size),
+        None,
+        None,
+    );
+    store
+        .install_received(&job.path, job.expected.as_deref(), &job.entry, snapshot)
+        .map_err(|e| {
+            trace::record_error(
+                trace::Component::Transfer,
+                "TRANSFER_FAILED",
+                "filesystem",
+                "install_received_file",
+                protocol::LocalOperation::attach(e, "install", Some(&job.path)),
+            )
+        })?;
+    crate::trace_legacy_event!(
+        "sync",
+        "install_end",
+        Some(&state.share_id),
+        Some(&job.path),
+        Some(job.entry.size),
+        Some(installing),
+        None,
+    );
+    report.metrics.install_ms += installing.elapsed().as_millis();
+    ack_batch.insert(job.path.clone(), job.entry.clone());
+    Ok(())
+}
+
+fn record_received_get(state: &mut State, job: &PendingGet, report: &mut Report) {
+    state.files.insert(job.path.clone(), job.entry.hash.clone());
+    report.metrics.bytes_transferred += job.entry.size;
+    report.metrics.control_messages += 2;
+    report.transferred += 1;
+}
+
 fn drain_gets(
     io: &mut (impl Read + Write),
     store: &mut impl Store,
@@ -680,127 +966,317 @@ fn drain_gets(
     report: &mut Report,
     round_started: Instant,
 ) -> Result<bool> {
-    let mut staged = Vec::with_capacity(pending.len());
-    let mut deferred = false;
-    for job in pending.drain(..) {
-        let _transfer = trace::transfer_context(&state.share_id, &job.path).enter();
-        let waiting = Instant::now();
-        crate::trace_legacy_event!(
-            "sync",
-            "peer_wait_start",
-            Some(&state.share_id),
-            Some(&job.path),
-            None,
-            None,
-            None,
-        );
-        let actual = match protocol::receive_for(io, &state.share_id)? {
-            Message::Blob { entry } if !deferred => entry,
-            Message::Blob { .. } => {
-                return Err(anyhow::anyhow!("unexpected Blob after Get deferral")
-                    .context(protocol::IncompleteFrame));
-            }
-            Message::ScanDeferred => {
-                deferred = true;
-                continue;
-            }
-            _ => anyhow::bail!("expected blob or Get deferral"),
-        };
-        crate::trace_legacy_event!(
-            "sync",
-            "peer_wait_end",
-            Some(&state.share_id),
-            Some(&job.path),
-            None,
-            Some(waiting),
-            None,
-        );
-        if actual != job.entry {
-            return Err(anyhow::anyhow!("STALE_SOURCE").context(protocol::IncompleteFrame));
-        }
-        report.metrics.wait_peer_ms += waiting.elapsed().as_millis();
-        report
-            .metrics
-            .first_byte_ms
-            .get_or_insert_with(|| round_started.elapsed().as_millis());
-        let transferring = Instant::now();
-        crate::trace_legacy_event!(
-            "sync",
-            "blob_receive_start",
-            Some(&state.share_id),
-            Some(&job.path),
-            Some(job.entry.size),
-            None,
-            None,
-        );
-        let snapshot =
-            receive_blob(io, &job.entry, store.staging_directory().as_deref()).map_err(|e| {
-                trace::record_error(
-                    trace::Component::Transfer,
-                    "TRANSFER_FAILED",
-                    "transfer",
-                    "receive_get_blob",
-                    e,
-                )
-            })?;
-        crate::trace_legacy_event!(
-            "sync",
-            "blob_receive_end",
-            Some(&state.share_id),
-            Some(&job.path),
-            Some(job.entry.size),
-            Some(transferring),
-            None,
-        );
-        report.metrics.transfer_ms += transferring.elapsed().as_millis();
-        staged.push((job, snapshot));
-    }
-    if deferred {
-        finish_deferred_gets(io, &state.share_id)?;
+    let Some(staged) = receive_get_window(
+        io,
+        &state.share_id,
+        pending,
+        store.staging_directory().as_deref(),
+        report,
+        round_started,
+    )?
+    else {
         return Ok(true);
-    }
+    };
     for (job, snapshot) in staged {
-        let _transfer = trace::transfer_context(&state.share_id, &job.path).enter();
-        let installing = Instant::now();
-        crate::trace_legacy_event!(
-            "sync",
-            "install_start",
-            Some(&state.share_id),
-            Some(&job.path),
-            Some(job.entry.size),
-            None,
-            None,
-        );
-        store
-            .install_received(&job.path, job.expected.as_deref(), &job.entry, snapshot)
-            .map_err(|e| {
-                trace::record_error(
-                    trace::Component::Transfer,
-                    "TRANSFER_FAILED",
-                    "filesystem",
-                    "install_received_file",
-                    protocol::LocalOperation::attach(e, "install", Some(&job.path)),
-                )
-            })?;
-        crate::trace_legacy_event!(
-            "sync",
-            "install_end",
-            Some(&state.share_id),
-            Some(&job.path),
-            Some(job.entry.size),
-            Some(installing),
-            None,
-        );
-        report.metrics.install_ms += installing.elapsed().as_millis();
-        ack_batch.insert(job.path.clone(), job.entry.clone());
+        install_get_job(store, state, &job, snapshot, ack_batch, report)?;
         if ack_batch.len() == protocol::MANIFEST_CHUNK_FILES {
             flush_ack_batch(io, &state.share_id, ack_batch, &mut report.metrics)?;
         }
-        state.files.insert(job.path.clone(), job.entry.hash);
-        report.metrics.bytes_transferred += job.entry.size;
-        report.metrics.control_messages += 2;
-        report.transferred += 1;
+        record_received_get(state, &job, report);
     }
+    Ok(false)
+}
+
+#[derive(Default)]
+struct GetCredits {
+    files: usize,
+    bytes: u64,
+    peak_files: usize,
+    peak_bytes: u64,
+    cancelled: bool,
+}
+
+struct GetBudget {
+    state: Mutex<GetCredits>,
+    wake: std::sync::Condvar,
+}
+
+impl GetBudget {
+    fn acquire(&self, bytes: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while !state.cancelled
+            && (state.files == MAX_IN_FLIGHT_FILES
+                || state.bytes.saturating_add(bytes) > MAX_STAGED_BYTES)
+        {
+            state = self.wake.wait(state).unwrap();
+        }
+        if state.cancelled {
+            return false;
+        }
+        state.files += 1;
+        state.bytes += bytes;
+        state.peak_files = state.peak_files.max(state.files);
+        state.peak_bytes = state.peak_bytes.max(state.bytes);
+        true
+    }
+    fn release(&self, bytes: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.files -= 1;
+        state.bytes -= bytes;
+        self.wake.notify_all();
+    }
+    fn cancel(&self) {
+        self.state.lock().unwrap().cancelled = true;
+        self.wake.notify_all();
+    }
+}
+
+struct CancelGetBudget<'a>(&'a GetBudget);
+impl Drop for CancelGetBudget<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GetWindowIdentity {
+    round: String,
+    share_id: String,
+    binding: String,
+    window: u64,
+}
+
+struct ReceivedGet {
+    identity: GetWindowIdentity,
+    sequence: u64,
+    job: PendingGet,
+    staged: Snapshot,
+}
+
+fn validate_get_results(
+    identity: &GetWindowIdentity,
+    received: &[ReceivedGet],
+    expected: &[PendingGet],
+) -> Result<()> {
+    ensure!(
+        received.len() == expected.len(),
+        "incomplete GET result window"
+    );
+    for (sequence, (result, expected)) in received.iter().zip(expected).enumerate() {
+        ensure!(
+            result.identity == *identity
+                && result.sequence == sequence as u64
+                && result.job.path == expected.path
+                && result.job.entry == expected.entry
+                && result.job.expected == expected.expected
+                && result.staged.entry() == &expected.entry,
+            "stale GET result identity, sequence or path"
+        );
+    }
+    Ok(())
+}
+
+struct GetPlan {
+    jobs: Vec<PendingGet>,
+    consumed_count: usize,
+}
+
+fn plan_get_window(
+    current: PendingGet,
+    work: &std::collections::VecDeque<String>,
+    pc: &crate::model::Manifest,
+    android: &crate::model::Manifest,
+    state: &State,
+    store: &impl Store,
+) -> Option<GetPlan> {
+    let mut bytes = current.entry.size;
+    if bytes > MAX_STAGED_BYTES || state.legacy_files.contains_key(&current.path) {
+        return None;
+    }
+    let mut jobs = vec![current];
+    let mut consumed_count = 0;
+    for path in work {
+        if jobs.len() == MAX_IN_FLIGHT_FILES {
+            break;
+        }
+        if store.excluded(path) {
+            consumed_count += 1;
+            continue;
+        }
+        // Migration may publish base or emit control before the natural window boundary.
+        if state.legacy_files.contains_key(path) {
+            return None;
+        }
+        if reconcile(
+            state.files.get(path).map(String::as_str),
+            pc.get(path).map(|e| e.hash.as_str()),
+            android.get(path).map(|e| e.hash.as_str()),
+        ) != Action::ToPc
+        {
+            break;
+        }
+        let entry = android.get(path)?;
+        if bytes.saturating_add(entry.size) > MAX_STAGED_BYTES {
+            break;
+        }
+        bytes += entry.size;
+        jobs.push(PendingGet {
+            path: path.clone(),
+            entry: entry.clone(),
+            expected: pc.get(path).map(|e| e.hash.clone()),
+        });
+        consumed_count += 1;
+    }
+    Some(GetPlan {
+        jobs,
+        consumed_count,
+    })
+}
+
+fn drain_get_pair(
+    io: &mut (impl Read + Write + Send),
+    store: &mut impl Store,
+    state: &mut State,
+    pending: &mut Vec<PendingGet>,
+    next: Vec<PendingGet>,
+    ack_batch: &mut crate::model::Manifest,
+    report: &mut Report,
+    round_started: Instant,
+    round_id: &str,
+) -> Result<bool> {
+    ensure!(
+        ack_batch.len() + pending.len() < protocol::MANIFEST_CHUNK_FILES,
+        "GET overlap crosses ACK barrier"
+    );
+    ensure!(
+        !pending.is_empty()
+            && next.len() <= MAX_IN_FLIGHT_FILES
+            && next.iter().map(|job| job.entry.size).sum::<u64>() <= MAX_STAGED_BYTES,
+        "invalid GET overlap admission"
+    );
+    let directory = store.staging_directory();
+    let Some(staged) = receive_get_window(
+        io,
+        &state.share_id,
+        pending,
+        directory.as_deref(),
+        report,
+        round_started,
+    )?
+    else {
+        return Ok(true);
+    };
+    let binding = store.scan_binding()?;
+    let identity = GetWindowIdentity {
+        round: round_id.into(),
+        share_id: state.share_id.clone(),
+        binding: binding.clone(),
+        window: report.metrics.get_overlap_started,
+    };
+    let expected_jobs = next.clone();
+    let count = staged.len();
+    let bytes = staged.iter().map(|(job, _)| job.entry.size).sum();
+    let budget = GetBudget {
+        state: Mutex::new(GetCredits {
+            files: count,
+            bytes,
+            peak_files: count,
+            peak_bytes: bytes,
+            cancelled: false,
+        }),
+        wake: std::sync::Condvar::new(),
+    };
+    report.metrics.get_overlap_started += 1;
+    let (install_result, received) = std::thread::scope(|scope| {
+        // Drop before scope's automatic joins, including when install panics.
+        let _cancel = CancelGetBudget(&budget);
+        let wire_identity = identity.clone();
+        let budget_ref = &budget;
+        let wire = &mut *io;
+        let worker_context = trace::current_context();
+        let worker = scope.spawn(move || {
+            let _trace = worker_context.enter();
+            let mut measured = Report::default();
+            let mut result = Vec::with_capacity(next.len());
+            let mut deferred = false;
+            let received: Result<Option<Vec<ReceivedGet>>> = (|| {
+                for (sequence, job) in next.into_iter().enumerate() {
+                    if !budget_ref.acquire(job.entry.size) { anyhow::bail!("GET admission cancelled"); }
+                    crate::trace_event!(trace::Level::Debug, trace::Component::Transfer, "GET_OVERLAP_RECEIVE", serde_json::json!({"share_id":wire_identity.share_id,"relative_path":job.path}));
+                    protocol::send_for(wire, &wire_identity.share_id, Message::Get { path: job.path.clone(), entry: job.entry.clone() }).map_err(|e| e.context(protocol::IncompleteFrame))?;
+                    if let Some(snapshot) = receive_get_job(wire, &wire_identity.share_id, &job, directory.as_deref(), &mut deferred, &mut measured, round_started)? {
+                        result.push(ReceivedGet { identity: wire_identity.clone(), sequence: sequence as u64, job, staged: snapshot });
+                    }
+                }
+                if deferred { finish_deferred_gets(wire, &wire_identity.share_id)?; Ok(None) } else { Ok(Some(result)) }
+            })();
+            (wire_identity, measured, received)
+        });
+        let installed: Result<()> = (|| {
+            for (job, snapshot) in staged {
+                let result = install_get_job(store, state, &job, snapshot, ack_batch, report);
+                if result.is_err() {
+                    budget.cancel();
+                }
+                budget.release(job.entry.size);
+                result?;
+                record_received_get(state, &job, report);
+            }
+            Ok(())
+        })();
+        if installed.is_err() {
+            budget.cancel();
+        }
+        (installed, worker.join())
+    });
+    let peak = budget.state.lock().unwrap();
+    report.metrics.peak_in_flight_files = report
+        .metrics
+        .peak_in_flight_files
+        .max(peak.peak_files as u64);
+    report.metrics.peak_staged_bytes = report.metrics.peak_staged_bytes.max(peak.peak_bytes);
+    drop(peak);
+    // Keep physical publication failure as cause, but never hide lost framing.
+    if let Err(error) = install_result {
+        let incomplete = match &received {
+            Err(_) => true,
+            Ok((_, _, Err(error))) => error.is::<protocol::IncompleteFrame>(),
+            _ => false,
+        };
+        return Err(if incomplete {
+            error.context(protocol::IncompleteFrame)
+        } else {
+            error
+        });
+    }
+    let (received_identity, measured, received) = received
+        .map_err(|_| anyhow::anyhow!("GET worker panicked").context(protocol::IncompleteFrame))?;
+    report.metrics.transfer_ms += measured.metrics.transfer_ms;
+    report.metrics.wait_peer_ms += measured.metrics.wait_peer_ms;
+    if report.metrics.first_byte_ms.is_none() {
+        report.metrics.first_byte_ms = measured.metrics.first_byte_ms;
+    }
+    let Some(received) = received? else {
+        return Ok(true);
+    };
+    ensure!(
+        received_identity == identity && store.scan_binding()? == binding,
+        "stale GET window result"
+    );
+    validate_get_results(&identity, &received, &expected_jobs)?;
+    for result in received {
+        let ReceivedGet {
+            job,
+            staged: snapshot,
+            ..
+        } = result;
+        install_get_job(store, state, &job, snapshot, ack_batch, report)?;
+        if ack_batch.len() == protocol::MANIFEST_CHUNK_FILES {
+            flush_ack_batch(io, &state.share_id, ack_batch, &mut report.metrics)?;
+        }
+        record_received_get(state, &job, report);
+    }
+    report.metrics.get_overlap_completed += 1;
     Ok(false)
 }
 
@@ -843,7 +1319,7 @@ fn flush_ack_batch(
 }
 
 pub fn coordinate(
-    io: &mut (impl Read + Write),
+    io: &mut (impl Read + Write + Send),
     store: &mut impl Store,
     state: &mut State,
     state_path: &Path,
@@ -858,7 +1334,7 @@ pub fn coordinate(
 }
 
 pub fn coordinate_mode(
-    io: &mut (impl Read + Write),
+    io: &mut (impl Read + Write + Send),
     store: &mut impl Store,
     state: &mut State,
     state_path: &Path,
@@ -868,7 +1344,7 @@ pub fn coordinate_mode(
 }
 
 pub fn coordinate_with_progress(
-    io: &mut (impl Read + Write),
+    io: &mut (impl Read + Write + Send),
     store: &mut impl Store,
     state: &mut State,
     state_path: &Path,
@@ -1019,7 +1495,7 @@ fn receive_scan_gate_with_clock(
 }
 
 pub fn coordinate_with_progress_and_audit_control(
-    io: &mut (impl Read + Write),
+    io: &mut (impl Read + Write + Send),
     store: &mut impl Store,
     state: &mut State,
     state_path: &Path,
@@ -1059,7 +1535,7 @@ pub fn coordinate_with_progress_and_audit_control(
 }
 
 fn coordinate_candidate(
-    io: &mut (impl Read + Write),
+    io: &mut (impl Read + Write + Send),
     store: &mut impl Store,
     state: &mut State,
     state_path: &Path,
@@ -1489,6 +1965,17 @@ fn coordinate_candidate(
     let mut ack_batch = crate::model::Manifest::new();
     let mut pending_puts = Vec::new();
     let mut pending_gets = Vec::new();
+    let prefetch_scope = if std::env::var("ROWD_PIPELINE_PREFETCH").as_deref() == Ok("1") {
+        Some(crate::random_id()?)
+    } else {
+        None
+    };
+    let get_overlap_scope = if std::env::var("ROWD_PIPELINE_GET_OVERLAP").as_deref() == Ok("1") {
+        Some(crate::random_id()?)
+    } else {
+        None
+    };
+    let mut snapshot_prefetch: Option<SnapshotPrefetch> = None;
     let mut staged_puts = Vec::new();
     let mut deferred_stage_bytes = 0u64;
     let mut put_bytes = 0u64;
@@ -1643,6 +2130,12 @@ fn coordinate_candidate(
             break;
         }
         let path = work.pop_front().unwrap();
+        if snapshot_prefetch
+            .as_ref()
+            .is_some_and(|prepared| prepared.path != path)
+        {
+            drop(snapshot_prefetch.take());
+        }
         if processed.insert(path.clone()) {
             index += 1;
         }
@@ -1846,7 +2339,23 @@ fn coordinate_candidate(
                     None,
                     None,
                 );
-                let temp = store.snapshot(&path, entry).map_err(|e| {
+                let prepared = snapshot_prefetch.take();
+                if prepared.is_some() {
+                    report.metrics.snapshot_prefetch_consumed += 1;
+                }
+                let (temp, snapshot_ms) = match prepared {
+                    Some(prepared) => prepared.consume(
+                        prefetch_scope.as_deref().unwrap(),
+                        &share_id,
+                        &path,
+                        entry,
+                        store,
+                    ),
+                    None => store
+                        .snapshot(&path, entry)
+                        .map(|snapshot| (snapshot, preparing.elapsed().as_millis())),
+                }
+                .map_err(|e| {
                     trace::record_error(
                         trace::Component::Filesystem,
                         "SNAPSHOT_FAILED",
@@ -1864,8 +2373,82 @@ fn coordinate_candidate(
                     Some(preparing),
                     None,
                 );
-                report.metrics.snapshot_ms += preparing.elapsed().as_millis();
+                report.metrics.snapshot_ms += snapshot_ms;
                 report.metrics.socket_idle_ms += preparing.elapsed().as_millis();
+                if let Some(scope) = prefetch_scope.as_ref().filter(|_| remap.is_none()) {
+                    if let Some(next_path) = work.front().filter(|next| {
+                        !store.excluded(next)
+                            && !state.legacy_files.contains_key(*next)
+                            && hash_stream.as_ref().is_none_or(|stream| {
+                                stream.ended || !stream.namespace.contains_key(*next)
+                            })
+                    }) {
+                        if let Some(next_entry) = pc.get(next_path).filter(|next_entry| {
+                            !matches!(mode, crate::config::SyncMode::ToPc)
+                                && reconcile(
+                                    state.files.get(next_path).map(String::as_str),
+                                    Some(&next_entry.hash),
+                                    android.get(next_path).map(|e| e.hash.as_str()),
+                                ) == Action::ToAndroid
+                                && hash_stream.as_ref().is_none_or(|stream| {
+                                    stream.ended
+                                        || prefetch_fits(
+                                            staged_puts.len(),
+                                            deferred_stage_bytes,
+                                            entry.size,
+                                            next_entry.size,
+                                        )
+                                })
+                                && prefetch_fits(
+                                    pending_puts.len(),
+                                    put_bytes,
+                                    entry.size,
+                                    next_entry.size,
+                                )
+                        }) {
+                            if let Ok(binding) = store.scan_binding() {
+                                if let Ok(Some(recipe)) =
+                                    store.prepare_snapshot_work(next_path, next_entry)
+                                {
+                                    let cancelled = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicBool::new(false),
+                                    );
+                                    let worker_cancelled = cancelled.clone();
+                                    let worker_share = share_id.clone();
+                                    let worker_path = next_path.clone();
+                                    if let Ok(worker) = std::thread::Builder::new()
+                                            .name("rowd-snapshot".into())
+                                            .spawn(move || {
+                                                crate::trace_event!(trace::Level::Debug, trace::Component::Filesystem, "SNAPSHOT_PREFETCH_START", serde_json::json!({"share_id":worker_share,"relative_path":worker_path}));
+                                                let result = recipe.run(worker_cancelled.clone());
+                                                crate::trace_event!(trace::Level::Debug, trace::Component::Filesystem, "SNAPSHOT_PREFETCH_END", serde_json::json!({"share_id":worker_share,"relative_path":worker_path,"duration_ms":result.elapsed_ms,"cancelled":worker_cancelled.load(std::sync::atomic::Ordering::Relaxed)}));
+                                                result
+                                            })
+                                        {
+                                            report.metrics.snapshot_prefetch_started += 1;
+                                            snapshot_prefetch = Some(SnapshotPrefetch {
+                                                scope: scope.clone(),
+                                                share_id: share_id.clone(),
+                                                binding,
+                                                path: next_path.clone(),
+                                                entry: next_entry.clone(),
+                                                cancelled,
+                                                worker: Some(worker),
+                                            });
+                                            report.metrics.peak_in_flight_files = report
+                                                .metrics
+                                                .peak_in_flight_files
+                                                .max((pending_puts.len() + 2) as u64);
+                                            report.metrics.peak_staged_bytes = report
+                                                .metrics
+                                                .peak_staged_bytes
+                                                .max(put_bytes + entry.size + next_entry.size);
+                                        }
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(current) = hash_stream.as_ref().filter(|s| !s.ended) {
                     let sequence = staged_puts.len() as u64;
                     let sending = Instant::now();
@@ -2010,6 +2593,56 @@ fn coordinate_candidate(
                 if pending_gets.len() == MAX_IN_FLIGHT_FILES
                     || get_bytes.saturating_add(entry.size) > MAX_STAGED_BYTES
                 {
+                    if let Some(scope) = get_overlap_scope.as_ref().filter(|_| {
+                        store.supports_get_overlap()
+                            && !pending_gets.is_empty()
+                            && hash_stream.as_ref().is_none_or(|stream| stream.ended)
+                            && requested_preempt.is_none()
+                            && remap.is_none()
+                            && ack_batch.len() + pending_gets.len() < protocol::MANIFEST_CHUNK_FILES
+                    }) {
+                        let current = PendingGet {
+                            path: path.clone(),
+                            entry: entry.clone(),
+                            expected: ph.map(str::to_owned),
+                        };
+                        let plan = plan_get_window(current, &work, &pc, &android, state, store);
+                        if let Some(plan) = plan {
+                            let progress_jobs: Vec<_> = plan
+                                .jobs
+                                .iter()
+                                .skip(1)
+                                .map(|job| job.path.clone())
+                                .collect();
+                            if drain_get_pair(
+                                io,
+                                store,
+                                state,
+                                &mut pending_gets,
+                                plan.jobs,
+                                &mut ack_batch,
+                                &mut report,
+                                started,
+                                scope,
+                            )? {
+                                return Ok(Report {
+                                    round_deferred: true,
+                                    ..report
+                                });
+                            }
+                            for _ in 0..plan.consumed_count {
+                                let consumed = work.pop_front().context("GET work plan changed")?;
+                                if processed.insert(consumed.clone()) {
+                                    index += 1;
+                                }
+                                if progress_jobs.contains(&consumed) {
+                                    progress(&consumed, index, total);
+                                }
+                            }
+                            get_bytes = 0;
+                            continue;
+                        }
+                    }
                     if drain_gets(
                         io,
                         store,
@@ -2993,6 +3626,7 @@ pub fn respond_share(
                         io,
                         store,
                         &share_id,
+                        completed_scan.as_ref().map(|(id, _)| id.as_str()),
                         IncomingPut {
                             path,
                             entry,
@@ -3101,7 +3735,208 @@ pub fn client_round(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_prefetch_rejects_scope_and_binding_and_removes_private_temp() {
+        for changed_binding in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("file"), b"original").unwrap();
+            let mut store = crate::storage::LocalStore::open(root.path()).unwrap();
+            let entry = store.scan().unwrap()["file"].clone();
+            let before = store.metrics();
+            let private_files = |store: &crate::storage::LocalStore| {
+                std::fs::read_dir(store.private())
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect::<BTreeSet<_>>()
+            };
+            let files_before = private_files(&store);
+            let binding = store.scan_binding().unwrap();
+            let recipe = store
+                .prepare_snapshot_work("file", &entry)
+                .unwrap()
+                .unwrap();
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_cancelled = cancelled.clone();
+            let prepared = SnapshotPrefetch {
+                scope: "round".into(),
+                share_id: "share".into(),
+                binding,
+                path: "file".into(),
+                entry: entry.clone(),
+                cancelled,
+                worker: Some(std::thread::spawn(move || recipe.run(worker_cancelled))),
+            };
+            if changed_binding {
+                std::fs::write(root.path().join(".rowdignore"), "other\n").unwrap();
+            }
+            let scope = if changed_binding {
+                "round"
+            } else {
+                "old-round"
+            };
+            let error = prepared
+                .consume(scope, "share", "file", &entry, &mut store)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("stale snapshot preparation"));
+            assert_eq!(private_files(&store), files_before);
+            assert_eq!(store.metrics().bytes_hashed, before.bytes_hashed);
+        }
+    }
+
+    #[test]
+    fn snapshot_prefetch_reserves_current_pending_and_next_together() {
+        assert!(prefetch_fits(
+            2,
+            2 * 1024 * 1024,
+            2 * 1024 * 1024,
+            4 * 1024 * 1024
+        ));
+        assert!(!prefetch_fits(3, 0, 1, 1));
+        assert!(!prefetch_fits(0, MAX_STAGED_BYTES, 1, 1));
+        assert!(!prefetch_fits(0, 0, 1, MAX_STAGED_BYTES + 1));
+        assert!(!prefetch_fits(0, u64::MAX, 1, 1));
+    }
+
     use super::*;
+    #[test]
+    fn received_put_identity_rejects_stale_scope_order_binding_and_entry() {
+        let entry = Entry {
+            hash: hash_reader(&b"data"[..]).unwrap().0,
+            size: 4,
+        };
+        let scope = PutBatchScope {
+            id: "batch-round-reconnect".into(),
+            share_id: "share".into(),
+            binding: "root-policy".into(),
+            scan_id: Some("scan".into()),
+        };
+        let received = ReceivedPut {
+            scope: scope.clone(),
+            sequence: 0,
+            job: IncomingPut {
+                path: "file".into(),
+                entry: entry.clone(),
+                expected: None,
+            },
+            staged: receive_blob(&mut &b"data"[..], &entry, None).unwrap(),
+        };
+        received.validate(&scope, 0, "root-policy").unwrap();
+        for dimension in 0..4 {
+            let mut stale = scope.clone();
+            match dimension {
+                0 => stale.id = "previous-round-or-reconnect".into(),
+                1 => stale.share_id = "another-share".into(),
+                2 => stale.binding = "remapped-policy".into(),
+                _ => stale.scan_id = Some("previous-scan".into()),
+            }
+            assert!(received.validate(&stale, 0, "root-policy").is_err());
+        }
+        assert!(received.validate(&scope, 1, "root-policy").is_err());
+        assert!(received.validate(&scope, 0, "changed-binding").is_err());
+        let path = received.staged.path().to_path_buf();
+        let mut changed = received;
+        changed.job.entry.size = 5;
+        assert!(changed.validate(&scope, 0, "root-policy").is_err());
+        drop(changed);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn put_batch_binding_failure_never_installs_and_consumption_failure_drains() {
+        use crate::{model::Manifest, storage::LocalStore};
+        struct BindingStore {
+            inner: LocalStore,
+            calls: usize,
+            initial_failure: bool,
+            installs: usize,
+        }
+        impl Store for BindingStore {
+            fn scan_binding(&mut self) -> Result<String> {
+                self.calls += 1;
+                if self.initial_failure {
+                    anyhow::bail!("binding unavailable")
+                }
+                Ok(if self.calls == 1 {
+                    "original"
+                } else {
+                    "changed"
+                }
+                .into())
+            }
+            fn scan(&mut self) -> Result<Manifest> {
+                self.inner.scan()
+            }
+            fn snapshot(&mut self, path: &str, entry: &Entry) -> Result<Snapshot> {
+                self.inner.snapshot(path, entry)
+            }
+            fn install(
+                &mut self,
+                path: &str,
+                expected: Option<&str>,
+                entry: &Entry,
+                staged: &Snapshot,
+            ) -> Result<()> {
+                self.installs += 1;
+                self.inner.install(path, expected, entry, staged)
+            }
+            fn staging_directory(&self) -> Option<PathBuf> {
+                self.inner.staging_directory()
+            }
+        }
+        let entry = Entry {
+            hash: hash_reader(&b"data"[..]).unwrap().0,
+            size: 4,
+        };
+        for initial_failure in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut store = BindingStore {
+                inner: LocalStore::open(root.path()).unwrap(),
+                calls: 0,
+                initial_failure,
+                installs: 0,
+            };
+            let (mut client, mut receiver) = pair();
+            client.write_all(b"data").unwrap();
+            protocol::send_for(&mut client, "share", Message::PutBatchEnd).unwrap();
+            client.write_all(b"sentinel").unwrap();
+            let error = receive_put_batch(
+                &mut receiver,
+                &mut store,
+                "share",
+                None,
+                IncomingPut {
+                    path: "file".into(),
+                    entry: entry.clone(),
+                    expected: None,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(store.installs, 0);
+            assert!(!root.path().join("file").exists());
+            if initial_failure {
+                assert!(error.to_string().contains("binding unavailable"));
+                let mut untouched_body = [0; 4];
+                receiver.read_exact(&mut untouched_body).unwrap();
+                assert_eq!(&untouched_body, b"data");
+                client
+                    .set_read_timeout(Some(Duration::from_millis(20)))
+                    .unwrap();
+                let mut control = [0];
+                let error = client.read(&mut control).unwrap_err();
+                assert!(matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ));
+            } else {
+                assert!(error.to_string().contains("received batch binding changed"));
+                let mut drained = [0; 8];
+                receiver.read_exact(&mut drained).unwrap();
+                assert_eq!(&drained, b"sentinel");
+            }
+        }
+    }
     #[cfg(unix)]
     fn pair() -> (
         std::os::unix::net::UnixStream,
@@ -4835,5 +5670,273 @@ mod scan_resilience_tests {
         });
         assert_eq!(remote.acknowledged, 27);
         assert_eq!(remote.snapshots, 9);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod get_overlap_tests {
+    use super::*;
+    use crate::model::Manifest;
+    use crate::storage::LocalStore;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc::{channel, Receiver};
+
+    struct Installing {
+        inner: LocalStore,
+        receiving: Receiver<()>,
+        entered: std::sync::mpsc::Sender<()>,
+        fail: bool,
+    }
+    impl Store for Installing {
+        fn scan(&mut self) -> Result<Manifest> {
+            self.inner.scan()
+        }
+        fn snapshot(&mut self, path: &str, entry: &Entry) -> Result<Snapshot> {
+            self.inner.snapshot(path, entry)
+        }
+        fn staging_directory(&self) -> Option<PathBuf> {
+            self.inner.staging_directory()
+        }
+        fn scan_binding(&mut self) -> Result<String> {
+            self.inner.scan_binding()
+        }
+        fn install(
+            &mut self,
+            path: &str,
+            expected: Option<&str>,
+            entry: &Entry,
+            staged: &Snapshot,
+        ) -> Result<()> {
+            if path == "n1" {
+                self.entered.send(()).unwrap();
+                self.receiving
+                    .recv_timeout(Duration::from_secs(5))
+                    .context("receive N+1 did not overlap install N")?;
+                if self.fail {
+                    anyhow::bail!("injected install error");
+                }
+            }
+            self.inner.install(path, expected, entry, staged)
+        }
+    }
+    fn jobs(prefix: &str, entry: &Entry) -> Vec<PendingGet> {
+        (0..4)
+            .map(|i| PendingGet {
+                path: format!("{prefix}{i}"),
+                entry: entry.clone(),
+                expected: None,
+            })
+            .collect()
+    }
+    fn blob(peer: &mut UnixStream, entry: &Entry) {
+        protocol::send_for(
+            peer,
+            "share",
+            Message::Blob {
+                entry: entry.clone(),
+            },
+        )
+        .unwrap();
+        peer.write_all(b"data").unwrap();
+    }
+    #[test]
+    fn get_pair_overlap_deferred_receive_and_install_failures_keep_window_atomicity() {
+        // 0 success; 1 final deferral; 2 receive error; 3 install error.
+        for scenario in 0..5 {
+            let root = tempfile::tempdir().unwrap();
+            let inner = LocalStore::open(root.path()).unwrap();
+            let mut state =
+                State::load(&inner.private().join("state.json"), "pair", "share").unwrap();
+            let (tx, rx) = channel();
+            let (entered_tx, entered_rx) = channel();
+            let mut store = Installing {
+                inner,
+                receiving: rx,
+                entered: entered_tx,
+                fail: scenario == 3 || scenario == 4,
+            };
+            let (hash, size) = crate::hash_reader(b"data".as_slice()).unwrap();
+            let entry = Entry { hash, size };
+            let (mut wire, mut peer) = UnixStream::pair().unwrap();
+            wire.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut pending = jobs("n", &entry);
+            let next = jobs("next", &entry);
+            let mut report = Report::default();
+            let mut ack = Manifest::new();
+            std::thread::scope(|scope| {
+                let remote_entry = entry.clone();
+                let remote = scope.spawn(move || {
+                    for _ in 0..4 { blob(&mut peer, &remote_entry); }
+                    for sequence in 0..if scenario == 2 || scenario == 3 || scenario == 4 { 1 } else { 4 } {
+                        assert!(matches!(protocol::receive_for(&mut peer, "share").unwrap(), Message::Get { .. }));
+                        if sequence == 0 { entered_rx.recv_timeout(Duration::from_secs(5)).expect("install N was not active"); tx.send(()).unwrap(); }
+                        if scenario == 1 && sequence == 3 {
+                            protocol::send_for(&mut peer, "share", Message::ScanDeferred).unwrap();
+                        } else if scenario == 4 {
+                            protocol::send_for(&mut peer, "share", Message::Blob { entry: remote_entry.clone() }).unwrap();
+                            peer.write_all(b"da").unwrap();
+                            peer.shutdown(std::net::Shutdown::Write).unwrap();
+                        } else if scenario == 2 {
+                            let changed = Entry { hash: "f".repeat(64), size: 4 };
+                            blob(&mut peer, &changed);
+                        } else { blob(&mut peer, &remote_entry); }
+                    }
+                    if scenario == 1 {
+                        assert!(matches!(protocol::receive_for(&mut peer, "share").unwrap(), Message::AuditPreempt { shares } if shares.is_empty()));
+                        protocol::send_for(&mut peer, "share", Message::ScanDeferred).unwrap();
+                    }
+                    peer
+                });
+                let outcome = drain_get_pair(
+                    &mut wire,
+                    &mut store,
+                    &mut state,
+                    &mut pending,
+                    next,
+                    &mut ack,
+                    &mut report,
+                    Instant::now(),
+                    "round",
+                );
+                let mut peer = remote.join().unwrap();
+                match scenario {
+                    0 => {
+                        assert!(!outcome.unwrap());
+                        assert_eq!(report.transferred, 8);
+                        assert_eq!(report.metrics.get_overlap_completed, 1);
+                    }
+                    1 => {
+                        assert!(outcome.unwrap());
+                        assert_eq!(report.transferred, 4);
+                    }
+                    2 => {
+                        assert!(outcome.err().unwrap().is::<protocol::IncompleteFrame>());
+                        assert_eq!(report.transferred, 4);
+                    }
+                    3 => {
+                        assert!(outcome
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("injected install error"));
+                        assert_eq!(report.transferred, 1);
+                    }
+                    4 => {
+                        let error = outcome.err().unwrap();
+                        assert!(error.is::<protocol::IncompleteFrame>());
+                        assert!(format!("{error:#}").contains("injected install error"));
+                        assert_eq!(report.transferred, 1);
+                    }
+                    _ => unreachable!(),
+                }
+                // No ACK/control is emitted during worker ownership or after deferral barrier.
+                peer.set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+                assert!(peer.read(&mut [0u8; 1]).is_err());
+            });
+            assert_eq!(report.metrics.get_overlap_started, 1);
+            assert!(report.metrics.peak_in_flight_files <= 4);
+            assert!(report.metrics.peak_staged_bytes <= MAX_STAGED_BYTES);
+            for i in 0..4 {
+                assert_eq!(root.path().join(format!("next{i}")).exists(), scenario == 0);
+            }
+        }
+    }
+    #[test]
+    fn get_credit_cancel_wakes_waiter_without_new_admission() {
+        let budget = GetBudget {
+            state: Mutex::new(GetCredits {
+                files: 4,
+                bytes: MAX_STAGED_BYTES,
+                ..Default::default()
+            }),
+            wake: std::sync::Condvar::new(),
+        };
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| budget.acquire(1));
+            budget.cancel();
+            assert!(!waiter.join().unwrap());
+        });
+        assert_eq!(budget.state.lock().unwrap().files, 4);
+    }
+
+    #[test]
+    fn get_plan_preserves_file_byte_and_control_boundaries_without_cloning_excludes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".rowdignore"), "skip/**\n").unwrap();
+        let store = LocalStore::open(root.path()).unwrap();
+        let mut state = State::load(&store.private().join("state.json"), "pair", "share").unwrap();
+        let entry = Entry {
+            hash: "a".repeat(64),
+            size: 2 * 1024 * 1024,
+        };
+        let current = PendingGet {
+            path: "next0".into(),
+            entry: entry.clone(),
+            expected: None,
+        };
+        let work: std::collections::VecDeque<_> = (0..100)
+            .map(|i| format!("skip/{i}"))
+            .chain((1..5).map(|i| format!("next{i}")))
+            .collect();
+        let pc = Manifest::new();
+        let mut android: Manifest = (0..5)
+            .map(|i| (format!("next{i}"), entry.clone()))
+            .collect();
+        let plan = plan_get_window(current.clone(), &work, &pc, &android, &state, &store).unwrap();
+        assert_eq!(plan.jobs.len(), 4);
+        assert_eq!(plan.consumed_count, 103);
+        assert_eq!(work.len(), 104);
+        state.legacy_files.insert("next2".into(), "legacy".into());
+        assert!(plan_get_window(current.clone(), &work, &pc, &android, &state, &store).is_none());
+        state.legacy_files.clear();
+        android.get_mut("next1").unwrap().size = 7 * 1024 * 1024;
+        let plan = plan_get_window(current, &work, &pc, &android, &state, &store).unwrap();
+        assert_eq!(plan.jobs.len(), 1);
+        assert_eq!(plan.consumed_count, 100);
+    }
+    #[test]
+    fn get_result_rejects_obsolete_identity_order_and_path_before_install() {
+        let (hash, size) = crate::hash_reader(b"data".as_slice()).unwrap();
+        let entry = Entry { hash, size };
+        let identity = GetWindowIdentity {
+            round: "round".into(),
+            share_id: "share".into(),
+            binding: "binding".into(),
+            window: 1,
+        };
+        let job = PendingGet {
+            path: "file".into(),
+            entry: entry.clone(),
+            expected: None,
+        };
+        let mut temp = NamedTempFile::new().unwrap();
+        temp.write_all(b"data").unwrap();
+        let staged = VerifiedStaged::from_digest(temp, &entry, &entry.hash, 4).unwrap();
+        let mut received = vec![ReceivedGet {
+            identity: identity.clone(),
+            sequence: 0,
+            job: job.clone(),
+            staged,
+        }];
+        assert!(validate_get_results(&identity, &received, &[job.clone()]).is_ok());
+        for field in 0..4 {
+            received[0].identity = identity.clone();
+            match field {
+                0 => received[0].identity.round = "old".into(),
+                1 => received[0].identity.share_id = "other".into(),
+                2 => received[0].identity.binding = "old-binding".into(),
+                3 => received[0].identity.window = 2,
+                _ => unreachable!(),
+            }
+            assert!(validate_get_results(&identity, &received, &[job.clone()]).is_err());
+        }
+        received[0].identity = identity.clone();
+        received[0].sequence = 1;
+        assert!(validate_get_results(&identity, &received, &[job.clone()]).is_err());
+        received[0].sequence = 0;
+        received[0].job.path = "other".into();
+        assert!(validate_get_results(&identity, &received, &[job]).is_err());
     }
 }

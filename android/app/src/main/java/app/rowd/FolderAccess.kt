@@ -95,13 +95,13 @@ class FolderAccess(private val context: Context) {
     private val scheduledFullScanShares = mutableSetOf<String>()
     private val scheduledDeepScanShares = mutableSetOf<String>()
     private val scanAbort = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val scanWorker = ScanWorker()
-    private val hashWorker = ScanStreamWorker { waiting ->
+    private val scanWorker = ScanWorker<PreparedScan> { it.discard() }
+    private val hashWorker = ScanStreamWorker<PreparedScan>(discard = { it.discard() }) { waiting ->
         PerformanceTrace.event(if (waiting) "PIPELINE_BACKPRESSURE_START" else "PIPELINE_BACKPRESSURE_END",
             active?.optString("share_id"), component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 100)
     }
     private data class NamespaceFile(val path: String, val uri: String, val modified: Long, val length: Long, val directory: Boolean)
-    private data class StreamNamespace(val share: String, val tree: String, val binding: String, val generation: Long,
+    private data class StreamNamespace(val identity: ScanIdentity, val share: String, val tree: String, val binding: String, val generation: Long,
         val files: List<NamespaceFile>, val dirty: Set<String>, val deep: Boolean, val directories: Map<String, String>, val directoryPaths: Map<String, String>,
         val flaggedFull: Boolean, val scheduledFull: Boolean, val scheduledDeep: Boolean) {
         val byPath by lazy { files.associateBy { it.path } }
@@ -111,24 +111,106 @@ class FolderAccess(private val context: Context) {
     // Snapshot resolution is owned by the networking thread, separate from the hash worker.
     private var snapshotLookup: Pair<StreamNamespace, ScanPathLookup>? = null
     private val hashStaged = mutableMapOf<String, Pair<File, ScanEntry>>()
+    private var hashStagedCount = 0
     private var hashStagedBinding = ""
     private var hashStagedBytes = 0L
     private var streamMetrics = JSONObject()
+    private val scanOwner = UUID.randomUUID().toString()
+    @Volatile private var scanEpoch = 0L
+    private var scanTaskIdentity: ScanIdentity? = null
+    private var scanTaskPath: String? = null
+    private var scanTaskRequiresGeneration = true
+    private var scanTaskCleanup: () -> Unit = {}
+    private var hashResultSequence = 0L
+    private data class CacheReceipt(val identity: ScanIdentity, val save: PhysicalHashCache.PreparedSave)
+    private val cacheReceipt = java.util.concurrent.atomic.AtomicReference<CacheReceipt?>()
+
+    private fun newScanIdentity(): ScanIdentity {
+        checkSelectedBinding()
+        scanAbort.set(false)
+        val share = active?.getString("share_id") ?: error("Nenhum Share selecionado.")
+        return ScanIdentity(scanOwner, ++scanEpoch, share, activeTree.toString(), bindingIdentity(), SyncService.changeGeneration(share))
+    }
+
+    private fun currentScanIdentity(identity: ScanIdentity): ScanIdentity = identity.copy(
+        owner = scanOwner, epoch = scanEpoch, share = active?.optString("share_id").orEmpty(), tree = activeTree.toString(),
+        binding = bindingIdentity(), generation = SyncService.changeGeneration(identity.share))
+
+    private fun consumeScan(result: PreparedScan, identity: ScanIdentity, sequence: Long = 0,
+        path: String? = null, requireGeneration: Boolean = true): String {
+        try {
+            return result.consume(identity, currentScanIdentity(identity), sequence, path, requireGeneration, scanAbort.get())
+        } finally { result.discard() }
+    }
+
+    private fun restoreNamespace(next: StreamNamespace) = synchronized(scanLock) {
+        dirtyPaths.getOrPut(next.share) { mutableSetOf() }.addAll(next.dirty)
+        restoreScanFlags(next.share, next.flaggedFull, next.scheduledFull, next.deep, next.scheduledDeep)
+    }
+
+    private data class ScanFlags(val dirty: Set<String>, val full: Boolean, val scheduledFull: Boolean,
+        val deep: Boolean, val scheduledDeep: Boolean)
+    private fun takeScanFlags(share: String): ScanFlags = synchronized(scanLock) {
+        ScanFlags(dirtyPaths.remove(share)?.toSet().orEmpty(), fullScanShares.remove(share),
+            scheduledFullScanShares.remove(share), deepScanShares.remove(share), scheduledDeepScanShares.remove(share))
+    }
+    private fun restoreFlags(identity: ScanIdentity, flags: ScanFlags) = synchronized(scanLock) {
+        dirtyPaths.getOrPut(identity.share) { mutableSetOf() }.addAll(flags.dirty)
+        restoreScanFlags(identity.share, flags.full, flags.scheduledFull, flags.deep, flags.scheduledDeep)
+    }
+    private data class ScanWork(val flags: ScanFlags, val previous: Map<String, ScanEntry>,
+        val focused: Boolean, val hadTrustedCache: Boolean) {
+        val audit get() = !focused || flags.full || flags.deep
+    }
+    private fun takeScanWork(identity: ScanIdentity): ScanWork {
+        val flags = takeScanFlags(identity.share)
+        return synchronized(scanLock) {
+            ScanWork(flags, if (flags.deep) emptyMap() else scanCache[identity.share].orEmpty().toMap(), focusedScan, identity.share in scanReady)
+        }
+    }
+
+    private fun preparePhysicalHashes(identity: ScanIdentity, force: Boolean = false) {
+        try {
+            physicalHashes.prepareSaveIfDue(force)?.let { save ->
+                cacheReceipt.getAndSet(CacheReceipt(identity, save))?.save?.discard(retryLater = false)
+            }
+        } catch (error: Exception) { traceFallback("HASH_CACHE_SAVE_FAILED", identity.share, null, "hash_cache_prepare", "memory_cache", error) }
+    }
+
+    private fun publishPhysicalHashes(allowCancelled: Boolean = false) {
+        val receipt = cacheReceipt.getAndSet(null) ?: return
+        try {
+            if ((!allowCancelled && scanAbort.get()) || !receipt.identity.matches(currentScanIdentity(receipt.identity), false)) {
+                receipt.save.discard()
+                return
+            }
+            receipt.save.publish()
+        } catch (error: Exception) {
+            receipt.save.discard()
+            traceFallback("HASH_CACHE_SAVE_FAILED", receipt.identity.share, null, "hash_cache_publish", "memory_cache", error)
+        }
+    }
     private fun addStreamMetric(name: String, amount: Long = 1) = synchronized(scanLock) {
         streamMetrics.put(name, streamMetrics.optLong(name) + amount)
     }
     fun scanStreamMetricsJson(): String = synchronized(scanLock) { streamMetrics.toString() }
-    private fun publishHashChunk(next: StreamNamespace, chunk: JSONObject, publish: (String) -> Unit) {
+    private fun publishHashChunk(next: StreamNamespace, chunk: JSONObject, stages: Map<String, Pair<File, ScanEntry>>,
+        sequence: Long, publish: (PreparedScan) -> Unit) {
         val payload = chunk.toString()
         PerformanceTrace.event("HASH_CHUNK", next.share, component = PerformanceTrace.Component.Scanner,
-            detail = JSONObject().put("entries", chunk.length()), sourceFile = "FolderAccess.kt", sourceLine = 123)
-        publish(payload)
+            detail = JSONObject().put("entries", chunk.length()), sourceFile = "FolderAccess.kt", sourceLine = 200)
+        publish(PreparedScan(next.identity, payload, sequence, publishResult = {
+            synchronized(scanLock) { hashStaged.putAll(stages) }
+        }, discardResult = { releasePreparedStages(stages) }))
     }
-    private data class PendingScan(val shareId: String, val tree: String, val binding: String,
+    private fun releasePreparedStages(stages: Map<String, Pair<File, ScanEntry>>) = synchronized(scanLock) {
+        stages.values.forEach { (file, entry) -> file.delete(); hashStagedBytes -= entry.length; hashStagedCount-- }
+    }
+    private data class PendingScan(val identity: ScanIdentity, val shareId: String, val tree: String, val binding: String,
         val cache: MutableMap<String, ScanEntry>, val uris: MutableMap<String, String>,
         val directories: Map<String, String>, val directoryPaths: Map<String, String>, val dirty: Set<String>,
         val flaggedFull: Boolean, val scheduledFull: Boolean,
-        val deepAudit: Boolean, val scheduledDeep: Boolean)
+        val deepAudit: Boolean, val scheduledDeep: Boolean, val validateSource: () -> Unit = {})
     private var pendingScan: PendingScan? = null
     private var focusedScan = false
     private var roundIsAudit = false
@@ -143,9 +225,15 @@ class FolderAccess(private val context: Context) {
     fun startScanJson(): String {
         active?.optString("share_id")?.let { traceMetadataDiff(it, emptySet(), "fallback") }
         check(!scanWorker.hasTask()) { "Scan SAF já em andamento." }
-        scanAbort.set(false)
         discardScanJson()
-        scanWorker.start { scanJson() }
+        scanAbort.set(false)
+        recoverPending()
+        val identity = newScanIdentity()
+        scanTaskIdentity = identity; scanTaskPath = null
+        val work = takeScanWork(identity)
+        scanTaskRequiresGeneration = work.audit
+        scanTaskCleanup = { restoreFlags(identity, work.flags) }
+        scanWorker.start { prepareScan(identity, work) }
         return "ok"
     }
 
@@ -153,17 +241,32 @@ class FolderAccess(private val context: Context) {
         check(!scanWorker.hasTask()) { "Scan SAF já em andamento." }
         discardScanJson()
         scanAbort.set(false)
+        val identity = newScanIdentity()
+        scanTaskIdentity = identity; scanTaskPath = null; scanTaskRequiresGeneration = false
+        val work = takeDeltaWork(identity)
+        scanTaskCleanup = { work?.let { synchronized(scanLock) { dirtyDirectories.getOrPut(identity.share) { mutableSetOf() }.addAll(it.prefixes) } } }
         scanWorker.start {
-            val dirty = deltaPathsJson()
-            if (dirty == "null") "null" else {
+            val discovery = prepareDeltaPaths(identity, work)
+            val dirty = discovery.payload
+            if (dirty == "null") discovery else {
                 val paths = linkedSetOf<String>()
                 for (array in listOf(JSONArray(pathsJson), JSONArray(dirty))) {
                     for (index in 0 until array.length()) paths.add(array.getString(index))
                 }
-                if (paths.size > 1024) "null" else {
+                if (paths.size > 1024) PreparedScan(identity, "null", validateResult = { discovery.validate() },
+                    publishResult = { discovery.publish() }, discardResult = { discovery.discard() }) else {
                     val requested = JSONArray(paths.toList())
-                    val result = scanPathsJson(requested.toString())
-                    if (result == "null") "null" else JSONObject(result).put("paths", requested).toString()
+                    val focused = prepareScanPaths(requested.toString(), identity, requested)
+                    PreparedScan(identity, focused.payload, validateResult = { discovery.validate(); focused.validate() },
+                        publishResult = {
+                            synchronized(scanLock) {
+                                checkSelectedBinding()
+                                if (identity.share in fullScanShares || identity.share in deepScanShares ||
+                                    scanCache[identity.share] !== work?.sourceCache) throw AuditDeferred()
+                                discovery.publish(); focused.publish()
+                            }
+                        },
+                        discardResult = { discovery.discard(); focused.discard() })
                 }
             }
         }
@@ -174,21 +277,25 @@ class FolderAccess(private val context: Context) {
         check(!scanWorker.hasTask()) { "Scan SAF já em andamento." }
         discardScanJson()
         scanAbort.set(false)
+        recoverPending()
+        val identity = newScanIdentity()
+        scanTaskIdentity = identity; scanTaskPath = null; scanTaskRequiresGeneration = true
+        val flags = takeScanFlags(identity.share)
+        scanTaskCleanup = { restoreFlags(identity, flags) }
         // A new round owns no previous source snapshots. Clean crash orphans.
         context.cacheDir.listFiles()?.filter { it.name.startsWith("rowd-hash-") || it.name.startsWith("rowd-send-") }
             ?.forEach { it.delete() }
-        scanWorker.start { namespaceJson() }
+        scanWorker.start { namespaceJson(identity, flags) }
         return "ok"
     }
 
     private fun checkStream(next: StreamNamespace) {
-        if (scanAbort.get() || active?.optString("share_id") != next.share || activeTree.toString() != next.tree ||
+        if (next.identity.epoch != scanEpoch || scanAbort.get() || active?.optString("share_id") != next.share || activeTree.toString() != next.tree ||
             bindingIdentity() != next.binding || SyncService.changeGeneration(next.share) != next.generation) throw AuditDeferred()
     }
 
-    private fun namespaceJson(): String {
+    private fun namespaceJson(identity: ScanIdentity, flags: ScanFlags): PreparedScan {
         val started = android.os.SystemClock.elapsedRealtime()
-        recoverPending()
         checkSelectedBinding()
         val share = active?.getString("share_id") ?: error("Nenhum Share selecionado.")
         val binding = bindingIdentity()
@@ -198,15 +305,8 @@ class FolderAccess(private val context: Context) {
         val files = mutableListOf<NamespaceFile>()
         val directories = mutableMapOf<String, String>()
         val paths = mutableMapOf<String, String>()
-        val next = synchronized(scanLock) {
-            val dirty = dirtyPaths.remove(share)?.toSet().orEmpty()
-            val full = fullScanShares.remove(share)
-            val scheduledFull = scheduledFullScanShares.remove(share)
-            val deep = deepScanShares.remove(share)
-            val scheduledDeep = scheduledDeepScanShares.remove(share)
-            StreamNamespace(share, tree, binding, generation, files, dirty, deep, directories, paths,
-                full, scheduledFull, scheduledDeep).also { streamNamespace = it }
-        }
+        val next = StreamNamespace(identity, share, tree, binding, generation, files, flags.dirty, flags.deep, directories, paths,
+            flags.full, flags.scheduledFull, flags.scheduledDeep)
         val uris = hashSetOf(root.uri.toString())
         var count = 0
         fun walk(directory: Uri, prefix: String) {
@@ -229,22 +329,24 @@ class FolderAccess(private val context: Context) {
             }
         }
         try {
-            PerformanceTrace.event("NAMESPACE_BEGIN", share, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 232)
+            PerformanceTrace.event("NAMESPACE_BEGIN", share, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 332)
             check(root.canRead() && root.canWrite()) { "Permissão SAF revogada." }
             walk(root.uri, "")
             checkStream(next)
             val entries = JSONObject()
             files.sortedBy { it.path }.forEach { entry -> entries.put(entry.path, JSONObject()
                 .put("size", entry.length).put("modified", entry.modified.coerceAtLeast(0)).put("directory", entry.directory)) }
-            synchronized(scanLock) { streamNamespace = next }
-            synchronized(scanLock) {
-                streamMetrics = JSONObject().put("namespace_ms", android.os.SystemClock.elapsedRealtime() - started)
-                    .put("hashes_reused", 0).put("files_staged_during_hash", 0).put("duplicate_reads_avoided", 0)
-                    .put("saf_source_lookup_fallback_count", 0)
-            }
-            PerformanceTrace.event("NAMESPACE_END", share, component = PerformanceTrace.Component.Scanner, detail = streamMetrics, sourceFile = "FolderAccess.kt", sourceLine = 245)
-            return entries.toString()
-        } catch (error: AuditDeferred) { return JSONObject().put("deferred", true).toString() }
+            val metrics = JSONObject().put("namespace_ms", android.os.SystemClock.elapsedRealtime() - started)
+                .put("hashes_reused", 0).put("files_staged_during_hash", 0).put("duplicate_reads_avoided", 0)
+                .put("saf_source_lookup_fallback_count", 0)
+            val ready = next.copy(files = files.toList(), directories = directories.toMap(), directoryPaths = paths.toMap())
+            PerformanceTrace.event("NAMESPACE_END", share, component = PerformanceTrace.Component.Scanner, detail = metrics, sourceFile = "FolderAccess.kt", sourceLine = 343)
+            return PreparedScan(identity, entries.toString(), publishResult = {
+                synchronized(scanLock) { streamNamespace = ready; streamMetrics = metrics }
+            }, discardResult = { restoreNamespace(next) })
+        } catch (error: Exception) {
+            return PreparedScan(identity, "", publishResult = { throw error }, discardResult = { restoreNamespace(next) })
+        }
     }
 
     /** No directory traversal: validate the exact document and its complete ancestry. */
@@ -281,7 +383,7 @@ class FolderAccess(private val context: Context) {
             }
             addStreamMetric("saf_source_lookup_fallback_count")
             PerformanceTrace.event("SAF_SOURCE_LOOKUP_FALLBACK", next.share, entry.path, component = PerformanceTrace.Component.SAF,
-                detail = JSONObject().put("reason", "provider_ancestry_unavailable"), sourceFile = "FolderAccess.kt", sourceLine = 283)
+                detail = JSONObject().put("reason", "provider_ancestry_unavailable"), sourceFile = "FolderAccess.kt", sourceLine = 385)
             val current = traced("saf_source_metadata", entry.path) { safDocumentMetadata(resolver, tree, uri, entry.path) { checkStream(next) } }
             check(!current.directory && !current.virtual && current.modified == entry.modified && current.length == entry.length) { "STALE_SOURCE: ${entry.path}" }
             checkStream(next)
@@ -306,11 +408,20 @@ class FolderAccess(private val context: Context) {
         checkStream(next)
         val hints = JSONArray(hintsJson).let { array -> (0 until array.length()).map { array.getString(it) }.toSet() }
         hashStagedBinding = next.binding
+        hashResultSequence = 0
         hashWorker.start { publish ->
             val started = android.os.SystemClock.elapsedRealtime()
             val cache = mutableMapOf<String, ScanEntry>()
             val uris = mutableMapOf<String, String>()
             var chunk = JSONObject()
+            var chunkStages = mutableMapOf<String, Pair<File, ScanEntry>>()
+            var sequence = 0L
+            fun flushChunk() {
+                if (chunk.length() == 0) return
+                val payload = chunk; val stages = chunkStages.toMap()
+                chunk = JSONObject(); chunkStages = mutableMapOf()
+                publishHashChunk(next, payload, stages, sequence++, publish)
+            }
             var hashed = 0; var reused = 0; var bytes = 0L; var stagedCount = 0
             physicalHashes.select(next.share, next.binding)
             val sourceLookup = ScanPathLookup(next.directoryPaths.getValue("")) { uri, prefix ->
@@ -322,8 +433,23 @@ class FolderAccess(private val context: Context) {
                 }
             }
             try {
-                PerformanceTrace.event("HASH_STREAM_BEGIN", next.share, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 325)
-                for (entry in next.files.filter { !it.directory }.sortedBy { it.path }) {
+                PerformanceTrace.event("HASH_STREAM_BEGIN", next.share, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 436)
+                val safWorkers = context.getSharedPreferences("rowd", Context.MODE_PRIVATE)
+                    .getInt("pipeline_saf_workers", 1).coerceIn(1, 2)
+                for (batch in next.files.filter { !it.directory }.sortedBy { it.path }.chunked(safWorkers)) {
+                    // Hinted hash+staging remains fused and serial; large files keep their own path.
+                    val ahead: Map<String, Pair<String, Long>> = if (safWorkers > 1 && batch.none { it.path in hints || it.length > 8L * 1024 * 1024 }) {
+                        val reads = batch.filter { entry -> next.deep || physicalHashes.lookup(entry.path, entry.uri, entry.modified, entry.length,
+                            if (entry.path in next.dirty) next.generation else null) == null }
+                            .map { entry -> entry to sourceDocument(next, entry, sourceLookup, validateExact = true) }
+                        SafReadWorkers.read(Uri.parse(next.tree).authority ?: next.tree, reads,
+                            { hashWorker.checkControl(); checkStream(next) }) { (entry, doc) ->
+                            val deadline = android.os.SystemClock.elapsedRealtime() + LOCAL_OP_TIMEOUT_MS
+                            val input = resolver.openInputStream(doc.uri) ?: error("STALE_SOURCE: ${entry.path}")
+                            entry.path to scanDigest(input) { hashWorker.checkControl(); checkStream(next); checkLocalDeadline(deadline) }
+                        }.toMap()
+                    } else emptyMap()
+                    for (entry in batch) {
                     hashWorker.checkControl(); checkStream(next)
                     val cached = if (!next.deep) physicalHashes.lookup(entry.path, entry.uri, entry.modified, entry.length,
                         if (entry.path in next.dirty) next.generation else null) else null
@@ -335,20 +461,20 @@ class FolderAccess(private val context: Context) {
                         while (staging == null) {
                             hashWorker.checkControl(); checkStream(next)
                             staging = synchronized(scanLock) {
-                                if (hashStaged.size < 4 && hashStagedBytes + entry.length <= 8L * 1024 * 1024) {
-                                    File.createTempFile("rowd-hash-", ".part", context.cacheDir).also { hashStagedBytes += entry.length }
+                                if (hashStagedCount < 4 && hashStagedBytes + entry.length <= 8L * 1024 * 1024) {
+                                    File.createTempFile("rowd-hash-", ".part", context.cacheDir).also { hashStagedBytes += entry.length; hashStagedCount++ }
                                 } else null
                             }
                             if (staging == null) {
-                                if (chunk.length() > 0) { publishHashChunk(next, chunk, publish); chunk = JSONObject() }
-                                if (!waiting) PerformanceTrace.event("PIPELINE_BACKPRESSURE_START", next.share, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 344)
+                                flushChunk()
+                                if (!waiting) PerformanceTrace.event("PIPELINE_BACKPRESSURE_START", next.share, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 470)
                                 waiting = true
                                 Thread.sleep(50)
                             }
                         }
                         if (waiting) {
                             addStreamMetric("queue_wait_ms", android.os.SystemClock.elapsedRealtime() - waitStarted)
-                            PerformanceTrace.event("PIPELINE_BACKPRESSURE_END", next.share, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 351)
+                            PerformanceTrace.event("PIPELINE_BACKPRESSURE_END", next.share, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 477)
                         }
                     }
                     val (hash, size) = try {
@@ -356,10 +482,12 @@ class FolderAccess(private val context: Context) {
                         else {
                             physicalHashes.invalidate(entry.path)
                             val deadline = android.os.SystemClock.elapsedRealtime() + LOCAL_OP_TIMEOUT_MS
-                            val input = resolver.openInputStream(doc.uri) ?: error("STALE_SOURCE: ${entry.path}")
-                            val output = staging?.let(::FileOutputStream)
-                            val result = try { scanDigest(input, output) { hashWorker.checkControl(); checkStream(next); checkLocalDeadline(deadline) } }
+                            val result = ahead[entry.path] ?: run {
+                                val input = resolver.openInputStream(doc.uri) ?: error("STALE_SOURCE: ${entry.path}")
+                                val output = staging?.let(::FileOutputStream)
+                                try { scanDigest(input, output) { hashWorker.checkControl(); checkStream(next); checkLocalDeadline(deadline) } }
                                 finally { output?.close() }
+                            }
                             sourceDocument(next, entry, sourceLookup)
                             check(result.second == entry.length) { "STALE_SOURCE: ${entry.path}, inconsistent provider length" }
                             physicalHashes.remember(entry.path, PhysicalHashCache.Entry(entry.uri, entry.modified, entry.length, result.first, result.second, next.generation))
@@ -368,22 +496,23 @@ class FolderAccess(private val context: Context) {
                         }
                     } catch (error: Exception) {
                         staging?.delete()
-                        if (staging != null) synchronized(scanLock) { hashStagedBytes -= entry.length }
+                        if (staging != null) synchronized(scanLock) { hashStagedBytes -= entry.length; hashStagedCount-- }
                         throw error
                     }
                     val scanned = ScanEntry(next.tree, entry.uri, entry.modified, entry.length, hash, size)
                     cache[entry.path] = scanned; uris[entry.uri] = entry.path
-                    staging?.let { file -> synchronized(scanLock) { hashStaged[entry.path] = file to scanned; stagedCount++ } }
+                    staging?.let { file -> chunkStages[entry.path] = file to scanned; stagedCount++ }
                     PerformanceTrace.event(if (staging != null) "HASH_STAGED" else if (cached != null) "HASH_REUSED" else "FILE_HASH_END",
                         next.share, entry.path, size, component = PerformanceTrace.Component.Scanner,
                         detail = JSONObject().put("metadata_validation", if (cached == null) "exact_document" else "directory_batch"),
-                        sourceFile = "FolderAccess.kt", sourceLine = 377)
+                        sourceFile = "FolderAccess.kt", sourceLine = 505)
                     chunk.put(entry.path, JSONObject().put("hash", hash).put("size", size))
                     if (hashed + reused == 1) synchronized(scanLock) {
                         streamMetrics.put("time_to_first_hash_ms", android.os.SystemClock.elapsedRealtime() - started)
                     }
-                    savePhysicalHashes(next.share)
-                    if (chunk.length() == 32) { publishHashChunk(next, chunk, publish); chunk = JSONObject() }
+                    preparePhysicalHashes(next.identity)
+                    if (chunk.length() == 32) flushChunk()
+                }
                 }
                 // Close structural evidence again. URI-based directory enumeration detects
                 // unobserved create/delete/rename; cached hashes never establish existence.
@@ -402,17 +531,18 @@ class FolderAccess(private val context: Context) {
                 traced("saf_scan_metadata_validation", null) { sourceLookup.validate(next.byPath.keys) }
                 checkStream(next)
                 physicalHashes.retainPaths(cache.keys)
-                synchronized(scanLock) {
-                    pendingScan = PendingScan(next.share, next.tree, next.binding, cache, uris, next.directories, next.directoryPaths,
-                        next.dirty, next.flaggedFull, next.scheduledFull, next.deep, next.scheduledDeep)
-                }
-                if (chunk.length() > 0) publishHashChunk(next, chunk, publish)
-                synchronized(scanLock) {
-                    streamMetrics.put("hashed", hashed).put("hashes_calculated", hashed).put("hashes_reused", reused).put("bytes_hashed", bytes)
-                        .put("files_staged_during_hash", stagedCount)
-                        .put("hash_stream_ms", android.os.SystemClock.elapsedRealtime() - started)
-                }
-            } finally { savePhysicalHashes(next.share, force = true) }
+                val candidate = PendingScan(next.identity, next.share, next.tree, next.binding, cache, uris, next.directories, next.directoryPaths,
+                    next.dirty, next.flaggedFull, next.scheduledFull, next.deep, next.scheduledDeep)
+                flushChunk()
+                val elapsed = android.os.SystemClock.elapsedRealtime() - started
+                PreparedScan(next.identity, "end", sequence, publishResult = {
+                    synchronized(scanLock) {
+                        pendingScan = candidate
+                        streamMetrics.put("hashed", hashed).put("hashes_calculated", hashed).put("hashes_reused", reused).put("bytes_hashed", bytes)
+                            .put("files_staged_during_hash", stagedCount).put("hash_stream_ms", elapsed)
+                    }
+                })
+            } finally { releasePreparedStages(chunkStages); preparePhysicalHashes(next.identity, force = true) }
         }
         return "ok"
     }
@@ -421,43 +551,62 @@ class FolderAccess(private val context: Context) {
         val paths = JSONArray(pathsJson)
         synchronized(scanLock) {
             for (index in 0 until paths.length()) hashStaged.remove(paths.getString(index))?.let { (file, entry) ->
-                file.delete(); hashStagedBytes -= entry.length
+                file.delete(); hashStagedBytes -= entry.length; hashStagedCount--
             }
         }
         return "ok"
     }
 
-    fun pollHashStreamJson(): String = hashWorker.poll()
+    fun pollHashStreamJson(): String {
+        publishPhysicalHashes()
+        val result = hashWorker.poll() ?: return ""
+        val next = synchronized(scanLock) { streamNamespace } ?: run { result.discard(); throw AuditDeferred() }
+        val payload = consumeScan(result, next.identity, hashResultSequence)
+        hashResultSequence++
+        return payload
+    }
     fun finishHashStreamJson(): String {
         hashWorker.finish()
+        publishPhysicalHashes()
         val metrics = synchronized(scanLock) {
             streamMetrics.put("queue_peak_chunks", hashWorker.peakChunks)
                 .put("queue_wait_ms", streamMetrics.optLong("queue_wait_ms") + hashWorker.waitMs)
             JSONObject(streamMetrics.toString())
         }
         PerformanceTrace.event("HASH_STREAM_END", active?.optString("share_id"), component = PerformanceTrace.Component.Scanner,
-            detail = metrics, sourceFile = "FolderAccess.kt", sourceLine = 438)
+            detail = metrics, sourceFile = "FolderAccess.kt", sourceLine = 576)
         return metrics.toString()
     }
 
     fun startLegacyHashJson(path: String, expectedHash: String, expectedSize: String): String {
         check(!scanWorker.hasTask()) { "Operação SAF já em andamento." }
         scanAbort.set(false)
+        val identity = newScanIdentity()
+        scanTaskIdentity = identity; scanTaskPath = path; scanTaskRequiresGeneration = false
+        scanTaskCleanup = {}
+        val prepared = takeHashStaged(path)
         scanWorker.start {
-            val staged = JSONObject(snapshot(path))
+            val staged = JSONObject(snapshotWithPrepared(path, prepared))
             val file = File(staged.getString("path"))
             try {
                 check(staged.getString("hash") == expectedHash && staged.getLong("size") == expectedSize.toLong()) { "STALE_SOURCE: $path" }
-                scanDigest(file.inputStream(), legacy = true) {
+                val hash = scanDigest(file.inputStream(), legacy = true) {
                     check(!scanAbort.get()) { "Sincronização cancelada." }
                     checkSelectedBinding()
                 }.first
+                PreparedScan(identity, hash, path = path)
             } finally { file.delete() }
         }
         return "ok"
     }
 
-    fun pollScanJson(): String = scanWorker.poll()
+    fun pollScanJson(): String {
+        publishPhysicalHashes()
+        val result = scanWorker.poll() ?: return ""
+        val identity = scanTaskIdentity ?: run { result.discard(); throw AuditDeferred() }
+        return consumeScan(result, identity, path = scanTaskPath, requireGeneration = scanTaskRequiresGeneration)
+            .also { scanTaskCleanup = {} }
+    }
 
     fun deferScanJson(): String {
         scanAbort.set(true)
@@ -466,10 +615,20 @@ class FolderAccess(private val context: Context) {
         return "ok"
     }
 
-    fun finishScanJson(): String { scanWorker.finish(); return "ok" }
+    fun finishScanJson(): String {
+        scanWorker.finish()
+        scanTaskCleanup(); scanTaskCleanup = {}
+        publishPhysicalHashes(allowCancelled = true)
+        return "ok"
+    }
 
-    fun commitScanJson(): String = synchronized(scanLock) {
-        val next = pendingScan ?: error("Nenhum scan SAF pronto para confirmar.")
+    fun commitScanJson(): String {
+        if (scanAbort.get()) throw AuditDeferred()
+        val next = synchronized(scanLock) { pendingScan } ?: error("Nenhum scan SAF pronto para confirmar.")
+        next.validateSource()
+        return synchronized(scanLock) {
+        if (scanAbort.get()) throw AuditDeferred()
+        if (pendingScan !== next || !next.identity.matches(currentScanIdentity(next.identity), scanTaskRequiresGeneration)) throw AuditDeferred()
         check(active?.optString("share_id") == next.shareId && activeTree.toString() == next.tree && bindingIdentity() == next.binding) {
             "Binding SAF mudou durante o scan."
         }
@@ -487,14 +646,20 @@ class FolderAccess(private val context: Context) {
         }
         pendingScan = null
         "ok"
+        }
     }
 
     fun discardScanJson(): String {
+        scanAbort.set(true)
+        scanWorker.requestCancel()
         hashWorker.cancel()
+        scanWorker.finish()
         hashWorker.finish()
+        scanTaskCleanup(); scanTaskCleanup = {}
+        publishPhysicalHashes(allowCancelled = true)
         return synchronized(scanLock) {
         hashStaged.values.forEach { it.first.delete() }
-        hashStaged.clear(); hashStagedBytes = 0; hashStagedBinding = ""
+        hashStaged.clear(); hashStagedBytes = 0; hashStagedCount = 0; hashStagedBinding = ""
         if (pendingScan == null) streamNamespace?.let { scan ->
             dirtyPaths.getOrPut(scan.share) { mutableSetOf() }.addAll(scan.dirty)
             restoreScanFlags(scan.share, scan.flaggedFull, scan.scheduledFull, scan.deep, scan.scheduledDeep)
@@ -506,6 +671,7 @@ class FolderAccess(private val context: Context) {
             restoreScanFlags(scan.shareId, scan.flaggedFull, scan.scheduledFull, scan.deepAudit, scan.scheduledDeep)
         }
         pendingScan = null
+        scanEpoch++
         "ok"
         }
     }
@@ -560,55 +726,61 @@ class FolderAccess(private val context: Context) {
                 deepScanShares.add(shareId)
             }
         }
-        PerformanceTrace.event(if (deep) "DEEP_AUDIT_START" else "AUDIT_SCHEDULED", shareId, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 563)
+        PerformanceTrace.event(if (deep) "DEEP_AUDIT_START" else "AUDIT_SCHEDULED", shareId, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 729)
     }
 
-    fun deltaPathsJson(): String {
-        val id = active?.getString("share_id") ?: return "null"
-        val tree = activeTree
-        val binding = bindingIdentity()
-        val generation = SyncService.changeGeneration(id)
-        fun checkControl() {
-            if (scanAbort.get() || active?.optString("share_id") != id || activeTree != tree ||
-                bindingIdentity() != binding || SyncService.changeGeneration(id) != generation) throw AuditDeferred()
-        }
-        fun unavailable(reason: String): String {
-            if (PerformanceTrace.enabled()) synchronized(scanLock) {
+    private data class DeltaWork(val sourceCache: MutableMap<String, ScanEntry>, val cached: Map<String, ScanEntry>,
+        val prefixes: List<String>, val dirty: Set<String>, val directories: Map<String, String>, val paths: Map<String, String>)
+
+    private fun takeDeltaWork(identity: ScanIdentity): DeltaWork? = synchronized(scanLock) {
+        val id = identity.share
+        fun unavailable(reason: String): DeltaWork? {
+            if (PerformanceTrace.enabled()) {
                 PerformanceTrace.event("delta_unavailable", id, component = PerformanceTrace.Component.Scanner,
                     detail = JSONObject().put("reason", reason).put("focused", focusedScan)
                         .put("fullScan", id in fullScanShares).put("deepScan", id in deepScanShares)
                         .put("scanReady", id in scanReady).put("cache_size", scanCache[id]?.size ?: 0)
                         .put("pendingUris_count", pendingUris[id]?.size ?: 0)
                         .put("dirtyDirectories_count", dirtyDirectories[id]?.size ?: 0)
-                        .put("dirtyPaths_count", dirtyPaths[id]?.size ?: 0), sourceFile = "FolderAccess.kt", sourceLine = 577)
+                        .put("dirtyPaths_count", dirtyPaths[id]?.size ?: 0), sourceFile = "FolderAccess.kt", sourceLine = 739)
             }
-            return "null"
+            return null
         }
-        val (sourceCache, cached, prefixes) = synchronized(scanLock) {
-            checkControl()
-            val cache = scanCache[id] ?: return unavailable("cache_missing")
-            if (!focusedScan) return unavailable("not_focused")
-            if (id in fullScanShares) return unavailable("full_scan_flagged")
-            if (id in deepScanShares) return unavailable("deep_scan_flagged")
-            if (id !in scanReady) return unavailable("scan_not_ready")
-            if (cache.values.any { it.tree != tree.toString() }) return unavailable("tree_mismatch")
-            val hinted = dirtyDirectories.remove(id).orEmpty().toMutableSet()
-            // Unknown URI batches require one metadata discovery, not URI × directory lookups.
-            if (!pendingUris.remove(id).isNullOrEmpty()) hinted.add("")
-            Triple(cache, cache.toMap(), metadataRoots(hinted))
-        }
-        if (prefixes.isEmpty()) return synchronized(scanLock) { JSONArray(dirtyPaths[id].orEmpty().toList()).toString() }
+        val cache = scanCache[id] ?: return@synchronized unavailable("cache_missing")
+        if (!focusedScan) return@synchronized unavailable("not_focused")
+        if (id in fullScanShares) return@synchronized unavailable("full_scan_flagged")
+        if (id in deepScanShares) return@synchronized unavailable("deep_scan_flagged")
+        if (id !in scanReady) return@synchronized unavailable("scan_not_ready")
+        if (cache.values.any { it.tree != identity.tree }) return@synchronized unavailable("tree_mismatch")
+        val hinted = dirtyDirectories.remove(id).orEmpty().toMutableSet()
+        if (!pendingUris.remove(id).isNullOrEmpty()) hinted.add("")
+        DeltaWork(cache, cache.toMap(), metadataRoots(hinted), dirtyPaths[id].orEmpty().toSet(),
+            directoryUris[id].orEmpty().toMap(), directoryPaths[id].orEmpty().toMap())
+    }
+
+    fun deltaPathsJson(): String {
+        val identity = newScanIdentity()
+        return consumeScan(prepareDeltaPaths(identity, takeDeltaWork(identity)), identity)
+    }
+
+    private fun prepareDeltaPaths(identity: ScanIdentity, work: DeltaWork?): PreparedScan {
+        if (work == null) return PreparedScan(identity, "null")
+        val id = identity.share
+        val tree = Uri.parse(identity.tree)
+        val directories = work.directories.toMutableMap()
+        val paths = work.paths.toMutableMap()
+        val prefixes = work.prefixes
+        if (prefixes.isEmpty()) return PreparedScan(identity, JSONArray(work.dirty.toList()).toString())
         val rules = ignoreRules()
         val deadline = android.os.SystemClock.elapsedRealtime() + LOCAL_OP_TIMEOUT_MS
-        fun control() { checkControl(); checkLocalDeadline(deadline) }
-        val diff = MetadataDiff(cached.mapValues { (_, entry) ->
-            DocumentMetadata(entry.uri, entry.modified, entry.length)
-        }, android.os.SystemClock.elapsedRealtime())
-        synchronized(scanLock) { metadataDiffs[id] = diff }
-        val (directories, paths) = synchronized(scanLock) {
-            directoryUris[id].orEmpty().toMutableMap() to directoryPaths[id].orEmpty().toMutableMap()
+        fun control() {
+            if (scanAbort.get() || !identity.matches(currentScanIdentity(identity), true)) throw AuditDeferred()
+            checkLocalDeadline(deadline)
         }
+        val diff = MetadataDiff(work.cached.mapValues { (_, entry) -> DocumentMetadata(entry.uri, entry.modified, entry.length) },
+            android.os.SystemClock.elapsedRealtime())
         val seenUris = mutableSetOf<String>()
+        fun restoreDiscovery() = synchronized(scanLock) { dirtyDirectories.getOrPut(id) { mutableSetOf() }.addAll(prefixes) }
         try {
             val lookup = ScanPathLookup(root.uri.toString()) { uri, prefix ->
                 safDirectoryMetadata(resolver, tree, Uri.parse(uri), prefix, ::control)
@@ -643,26 +815,30 @@ class FolderAccess(private val context: Context) {
                 if (directory != null) walk(directory, prefix)
                 diff.finish(prefix)
             }
-            synchronized(scanLock) {
-                control()
-                check(scanCache[id] === sourceCache && id !in fullScanShares && id !in deepScanShares) { "Cache de scan mudou." }
-                check(directories.size == paths.size && directories.all { (uri, path) -> paths[path] == uri }) { "Índice de diretórios SAF ambíguo." }
-                directoryUris[id] = directories; directoryPaths[id] = paths
-                dirtyPaths.getOrPut(id) { mutableSetOf() }.addAll(diff.changed)
-                if (dirtyPaths[id].orEmpty().size > 1024) {
-                    traceMetadataDiff(id, emptySet(), "fallback")
-                    return unavailable("too_many_dirty_paths")
+            control()
+            check(directories.size == paths.size && directories.all { (uri, path) -> paths[path] == uri }) { "Índice de diretórios SAF ambíguo." }
+            val dirty = synchronized(scanLock) { dirtyPaths[id].orEmpty().toSet() } + diff.changed
+            val payload = if (dirty.size > 1024) "null" else JSONArray(dirty.toList()).toString()
+            return PreparedScan(identity, payload, validateResult = {
+                synchronized(scanLock) {
+                    check(scanCache[id] === work.sourceCache && id !in fullScanShares && id !in deepScanShares) { "Cache de scan mudou." }
                 }
-                return JSONArray(dirtyPaths[id].orEmpty().toList()).toString()
-            }
-        } catch (error: AuditDeferred) {
-            synchronized(scanLock) { fullScanShares.add(id) }
-            throw error
+            }, publishResult = {
+                synchronized(scanLock) {
+                    directoryUris[id] = directories; directoryPaths[id] = paths
+                    dirtyPaths.getOrPut(id) { mutableSetOf() }.addAll(diff.changed)
+                    metadataDiffs[id] = diff
+                    if (payload == "null") traceMetadataDiff(id, emptySet(), "fallback")
+                }
+            }, discardResult = ::restoreDiscovery)
         } catch (error: Exception) {
-            traceMetadataDiff(id, emptySet(), "fallback")
             traceFallback("DELTA_SCAN_FAILED", id, null, "resolve_dirty_paths", "deep_scan", error)
-            synchronized(scanLock) { deepScanShares.add(id) }
-            return unavailable("resolution_error")
+            return PreparedScan(identity, "null", publishResult = {
+                synchronized(scanLock) {
+                    if (error is AuditDeferred) { fullScanShares.add(id); throw error }
+                    deepScanShares.add(id)
+                }
+            }, discardResult = ::restoreDiscovery)
         }
     }
 
@@ -673,25 +849,30 @@ class FolderAccess(private val context: Context) {
                 .put("entries_enumerated", diff.entriesEnumerated).put("metadata_changed", diff.changed.size)
                 .put("paths_hashed", diff.pathsHashed(hashed))
                 .put("duration_ms", android.os.SystemClock.elapsedRealtime() - diff.startedAt)
-                .put("strategy", "recursive_metadata_diff").put("result", result), sourceFile = "FolderAccess.kt", sourceLine = 671)
+                .put("strategy", "recursive_metadata_diff").put("result", result), sourceFile = "FolderAccess.kt", sourceLine = 847)
     }
 
     fun scanPathsJson(pathsJson: String): String {
-        val id = active?.getString("share_id") ?: return "null"
+        val identity = newScanIdentity()
+        return consumeScan(prepareScanPaths(pathsJson, identity), identity, requireGeneration = false)
+    }
+
+    private fun prepareScanPaths(pathsJson: String, identity: ScanIdentity, requestedJson: JSONArray? = null): PreparedScan {
+        val id = identity.share
         checkSelectedBinding()
         val tree = activeTree.toString()
         val binding = bindingIdentity()
         val hashedPaths = mutableSetOf<String>()
         try {
-            fun needDeepScan(): String {
+            fun needDeepScan(): PreparedScan = PreparedScan(identity, "null", publishResult = {
                 synchronized(scanLock) { deepScanShares.add(id) }
                 traceMetadataDiff(id, hashedPaths, "fallback")
-                return "null"
-            }
+            })
             val paths = JSONArray(pathsJson)
-            if (paths.length() > 1024) return "null"
+            if (paths.length() > 1024) return PreparedScan(identity, "null")
             val deadline = android.os.SystemClock.elapsedRealtime() + LOCAL_OP_TIMEOUT_MS
-            val cache = synchronized(scanLock) { if (id in scanReady) scanCache[id] else null } ?: return "null"
+            val cache = synchronized(scanLock) { if (id in scanReady) scanCache[id] else null } ?: return PreparedScan(identity, "null")
+            val cached = synchronized(scanLock) { cache.toMap() }
             val files = JSONObject()
             var enumerated = 0
             var bytesHashed = 0L
@@ -711,7 +892,7 @@ class FolderAccess(private val context: Context) {
             for (path in requested) {
                 parts(path)
                 checkBinding()
-                if (cache[path]?.tree != null && cache[path]?.tree != activeTree.toString()) return needDeepScan()
+                if (cached[path]?.tree != null && cached[path]?.tree != activeTree.toString()) return needDeepScan()
                 if (ignored(path, false, rules)) return needDeepScan()
                 val document = try { lookup.find(path) } catch (error: AuditDeferred) { throw error }
                     catch (error: Exception) {
@@ -751,27 +932,38 @@ class FolderAccess(private val context: Context) {
                 }
             synchronized(scanLock) {
                 checkBinding()
-                if (id in fullScanShares || id in deepScanShares || scanCache[id] !== cache) return "null"
-                val uris = uriPaths[id] ?: return "null"
+                if (id in fullScanShares || id in deepScanShares || scanCache[id] !== cache) return PreparedScan(identity, "null")
+                val uris = uriPaths[id] ?: return PreparedScan(identity, "null")
                 val seen = HashSet<String>()
                 for ((path, entry) in updates) {
                     val prior = uris[entry.uri]
-                    if (!seen.add(entry.uri) || (prior != null && prior != path && prior !in requested)) {
-                        deepScanShares.add(id)
-                        return "null"
-                    }
+                    if (!seen.add(entry.uri) || (prior != null && prior != path && prior !in requested)) return needDeepScan()
                 }
-                for (path in requested) {
-                    cache.remove(path)?.let { if (uris[it.uri] == path) uris.remove(it.uri) }
-                }
-                cache.putAll(updates)
-                for ((path, entry) in updates) uris[entry.uri] = path
             }
-            traceMetadataDiff(id, hashedPaths, "success")
-            return JSONObject().put("files", files).put("enumerated", enumerated)
-                .put("hashed", enumerated).put("bytes_hashed", bytesHashed).toString()
-        } finally {
-            traceMetadataDiff(id, hashedPaths, "fallback")
+            val payload = JSONObject().put("files", files).put("enumerated", enumerated)
+                .put("hashed", enumerated).put("bytes_hashed", bytesHashed)
+            requestedJson?.let { payload.put("paths", it) }
+            return PreparedScan(identity, payload.toString(), validateResult = {
+                lookup.validate(requested)
+                synchronized(scanLock) {
+                    checkBinding()
+                    if (id in fullScanShares || id in deepScanShares || scanCache[id] !== cache) throw AuditDeferred()
+                    check(uriPaths[id] != null) { "Índice URI ausente." }
+                }
+            }, publishResult = {
+                synchronized(scanLock) {
+                    val uris = uriPaths.getValue(id)
+                    for (path in requested) {
+                        cache.remove(path)?.let { if (uris[it.uri] == path) uris.remove(it.uri) }
+                    }
+                    cache.putAll(updates)
+                    for ((path, entry) in updates) uris[entry.uri] = path
+                }
+                traceMetadataDiff(id, hashedPaths, "success")
+            })
+        } catch (error: Exception) {
+            return PreparedScan(identity, "", validateResult = { throw error },
+                discardResult = { traceMetadataDiff(id, hashedPaths, "fallback") })
         }
     }
 
@@ -789,7 +981,7 @@ class FolderAccess(private val context: Context) {
             changedUri?.let { runCatching { DocumentsContract.getDocumentId(it) }.getOrNull() })
         PerformanceTrace.event("OBSERVER_CHANGE_CLASSIFIED", shareId, path, component = PerformanceTrace.Component.Watcher,
             detail = JSONObject().put("classification", hint.name.lowercase()).put("self_change", selfChange)
-                .put("strategy", if (hint == ObserverHint.PROVIDER_WIDE_URI || hint == ObserverHint.NULL_URI) "metadata_diff" else "focused"), sourceFile = "FolderAccess.kt", sourceLine = 790)
+                .put("strategy", if (hint == ObserverHint.PROVIDER_WIDE_URI || hint == ObserverHint.NULL_URI) "metadata_diff" else "focused"), sourceFile = "FolderAccess.kt", sourceLine = 982)
         when (hint) {
             ObserverHint.UNRELATED_URI -> return@synchronized null
             ObserverHint.KNOWN_FILE_URI -> dirtyPaths.getOrPut(shareId) { mutableSetOf() }.add(path!!)
@@ -1262,11 +1454,6 @@ class FolderAccess(private val context: Context) {
         return metadata.documentMetadata()
     }
 
-    private fun savePhysicalHashes(share: String, force: Boolean = false) {
-        physicalHashes.saveIfDue(force)?.let { error ->
-            traceFallback("HASH_CACHE_SAVE_FAILED", share, null, "hash_cache_save", "memory_cache", error)
-        }
-    }
 
     private fun digest(input: InputStream, copy: java.io.OutputStream? = null, deadline: Long? = null): Pair<String, Long> {
         return scanDigest(input, copy) {
@@ -1459,36 +1646,35 @@ class FolderAccess(private val context: Context) {
     }
 
     fun scanJson(): String {
+        recoverPending()
+        val identity = newScanIdentity()
+        scanTaskIdentity = identity; scanTaskPath = null
+        val work = takeScanWork(identity)
+        scanTaskRequiresGeneration = work.audit
+        return consumeScan(prepareScan(identity, work), identity, requireGeneration = work.audit)
+            .also { publishPhysicalHashes() }
+    }
+
+    private fun prepareScan(identity: ScanIdentity, work: ScanWork): PreparedScan {
         val started = android.os.SystemClock.elapsedRealtime()
         val deadline = android.os.SystemClock.elapsedRealtime() + LOCAL_OP_TIMEOUT_MS
         checkLocalDeadline(deadline)
-        recoverPending()
         checkLocalDeadline(deadline)
         val shareId = active?.getString("share_id") ?: error("Nenhum Share selecionado.")
         val changeGeneration = SyncService.changeGeneration(shareId)
         val tree = activeTree.toString()
         val binding = bindingIdentity()
         physicalHashes.select(shareId, binding)
-        var deepAudit = false
-        var flaggedFull = false
-        var scheduledFull = false
-        var scheduledDeep = false
-        var hadTrustedCache = false
-        var auditScan = false
-        val (previous, dirty, fullScan) = synchronized(scanLock) {
-            val flagged = fullScanShares.remove(shareId)
-            flaggedFull = flagged
-            scheduledFull = scheduledFullScanShares.remove(shareId)
-            val full = !focusedScan || flagged
-            val deep = deepScanShares.remove(shareId)
-            scheduledDeep = scheduledDeepScanShares.remove(shareId)
-            auditScan = !focusedScan || flagged || deep
-            deepAudit = deep
-            hadTrustedCache = shareId in scanReady
-            val changed = dirtyPaths.remove(shareId)?.toSet().orEmpty()
-            Triple(if (deep) emptyMap() else scanCache[shareId].orEmpty(), changed, full)
-        }
-        if (!focusedScan) PerformanceTrace.event("AUDIT_START", shareId, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1491)
+        val deepAudit = work.flags.deep
+        val flaggedFull = work.flags.full
+        val scheduledFull = work.flags.scheduledFull
+        val scheduledDeep = work.flags.scheduledDeep
+        val hadTrustedCache = work.hadTrustedCache
+        val auditScan = work.audit
+        val previous = work.previous
+        val dirty = work.flags.dirty
+        val fullScan = !work.focused || flaggedFull
+        if (!focusedScan) PerformanceTrace.event("AUDIT_START", shareId, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1677)
         val nextCache = HashMap<String, ScanEntry>()
         val nextUris = HashMap<String, String>()
         val nextDirectories = HashMap<String, String>()
@@ -1501,6 +1687,12 @@ class FolderAccess(private val context: Context) {
         var hashed = 0
         var bytesHashed = 0L
         var cacheHits = 0
+        var candidate: PendingScan? = null
+        var validateSource: () -> Unit = {}
+        fun restoreCandidate() = synchronized(scanLock) {
+            dirtyPaths.getOrPut(shareId) { mutableSetOf() }.addAll(dirty)
+            restoreScanFlags(shareId, flaggedFull, scheduledFull, deepAudit, scheduledDeep)
+        }
         fun checkScanControl() {
             check(!Thread.currentThread().isInterrupted) { "Sincronização cancelada." }
             if (scanShouldAbort(scanAbort.get(), auditScan, SyncService.changeGeneration(shareId) != changeGeneration) ||
@@ -1542,7 +1734,7 @@ class FolderAccess(private val context: Context) {
                     enumerated++
                     val uri = child.uri
                     val modified = child.modified
-                    PerformanceTrace.event("FILE_ENUMERATED", shareId, path, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1545)
+                    PerformanceTrace.event("FILE_ENUMERATED", shareId, path, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1737)
                     val length = child.length
                     val cached = if (!deepAudit) physicalHashes.lookup(path, uri, modified, length,
                         if (path in dirty) changeGeneration else null) else null
@@ -1552,10 +1744,10 @@ class FolderAccess(private val context: Context) {
                         cached!!.hash to cached.size
                     } else {
                         hashed++
-                        PerformanceTrace.event("FILE_HASH_START", shareId, path, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1555)
+                        PerformanceTrace.event("FILE_HASH_START", shareId, path, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1747)
                         hashForScan(DocumentFile.fromSingleUri(context, Uri.parse(uri)) ?: error("Sem acesso: $path"), path, modified, length)
                     }
-                    PerformanceTrace.event(if (reuse) "FILE_HASH_REUSED" else "FILE_HASH_END", shareId, path, size, component = PerformanceTrace.Component.Scanner, detail = JSONObject().put("reason", if (reuse) "provider_metadata_matches" else "cache_missing_or_metadata_changed"), sourceFile = "FolderAccess.kt", sourceLine = 1558)
+                    PerformanceTrace.event(if (reuse) "FILE_HASH_REUSED" else "FILE_HASH_END", shareId, path, size, component = PerformanceTrace.Component.Scanner, detail = JSONObject().put("reason", if (reuse) "provider_metadata_matches" else "cache_missing_or_metadata_changed"), sourceFile = "FolderAccess.kt", sourceLine = 1750)
                     PerformanceTrace.firstSeen(shareId, path, modified, observedVia(shareId), hash)
                     if (!reuse) bytesHashed += size
                     nextCache[path] = ScanEntry(tree, uri, modified, length, hash, size)
@@ -1583,7 +1775,7 @@ class FolderAccess(private val context: Context) {
                     }
                     enumerated++
                     val document = try { focusedLookup.find(path) } catch (error: AuditDeferred) { throw error } catch (error: IllegalStateException) {
-                        PerformanceTrace.event("DELTA_UNAVAILABLE", shareId, path, component = PerformanceTrace.Component.Scanner, level = "warn", detail = JSONObject().put("reason", "focused_lookup_failed").put("error", PerformanceTrace.error(error, "filesystem", "focused_lookup", false)), sourceFile = "FolderAccess.kt", sourceLine = 1586)
+                        PerformanceTrace.event("DELTA_UNAVAILABLE", shareId, path, component = PerformanceTrace.Component.Scanner, level = "warn", detail = JSONObject().put("reason", "focused_lookup_failed").put("error", PerformanceTrace.error(error, "filesystem", "focused_lookup", false)), sourceFile = "FolderAccess.kt", sourceLine = 1778)
                         usedFocused = false
                         break
                     }
@@ -1591,12 +1783,12 @@ class FolderAccess(private val context: Context) {
                         nextCache.remove(path)
                         continue
                     }
-                    PerformanceTrace.event("FILE_HASH_START", shareId, path, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1594)
+                    PerformanceTrace.event("FILE_HASH_START", shareId, path, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1786)
                     check(!document.directory && !document.virtual) { "Tipo de documento não suportado: $path" }
                     val modified = document.modified
                     val length = document.length
                     val (hash, size) = hashForScan(DocumentFile.fromSingleUri(context, Uri.parse(document.uri)) ?: error("Sem acesso: $path"), path, modified, length)
-                    PerformanceTrace.event("FILE_HASH_END", shareId, path, size, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1599)
+                    PerformanceTrace.event("FILE_HASH_END", shareId, path, size, component = PerformanceTrace.Component.Scanner, sourceFile = "FolderAccess.kt", sourceLine = 1791)
                     PerformanceTrace.firstSeen(shareId, path, document.modified, observedVia(shareId), hash)
                     hashed++
                     bytesHashed += size
@@ -1606,6 +1798,7 @@ class FolderAccess(private val context: Context) {
             }
             if (usedFocused) {
                 focusedLookup.validate(dirty)
+                validateSource = { focusedLookup.validate(dirty) }
                 count = nextCache.size
                 check(count <= 100_000) { "Limite de 100 mil arquivos excedido." }
                 cacheHits = count - hashed
@@ -1618,7 +1811,7 @@ class FolderAccess(private val context: Context) {
                     nextDirectoryPaths.putAll(directoryPaths[shareId].orEmpty())
                 }
             } else {
-                PerformanceTrace.event("FULL_SCAN_FALLBACK", shareId, component = PerformanceTrace.Component.Scanner, detail = JSONObject().put("reason", if (fullScan) "full_scan_requested" else "focused_scan_unavailable").put("had_trusted_cache", hadTrustedCache).put("flagged_full", flaggedFull), sourceFile = "FolderAccess.kt", sourceLine = 1621)
+                PerformanceTrace.event("FULL_SCAN_FALLBACK", shareId, component = PerformanceTrace.Component.Scanner, detail = JSONObject().put("reason", if (fullScan) "full_scan_requested" else "focused_scan_unavailable").put("had_trusted_cache", hadTrustedCache).put("flagged_full", flaggedFull), sourceFile = "FolderAccess.kt", sourceLine = 1814)
                 nextCache.clear()
                 enumerated = 0
                 hashed = 0
@@ -1632,26 +1825,26 @@ class FolderAccess(private val context: Context) {
                     "Índice de diretórios SAF ambíguo."
                 }
                 physicalHashes.retainPaths(nextCache.keys)
-                pendingScan = PendingScan(shareId, tree, binding, nextCache, nextUris, nextDirectories, nextDirectoryPaths,
-                    dirty, flaggedFull, scheduledFull, deepAudit, scheduledDeep)
+                candidate = PendingScan(identity, shareId, tree, binding, nextCache, nextUris, nextDirectories, nextDirectoryPaths,
+                    dirty, flaggedFull, scheduledFull, deepAudit, scheduledDeep, validateSource)
             }
         } catch (error: Exception) {
-            synchronized(scanLock) {
-                dirtyPaths.getOrPut(shareId) { mutableSetOf() }.addAll(dirty)
-                if (error is AuditDeferred) {
-                    restoreScanFlags(shareId, flaggedFull, scheduledFull, deepAudit, scheduledDeep)
-                } else deepScanShares.add(shareId)
-            }
-            if (error is AuditDeferred) return JSONObject().put("deferred", true).toString()
-            throw error
+            return PreparedScan(identity, if (error is AuditDeferred) JSONObject().put("deferred", true).toString() else "",
+                publishResult = {
+                    if (error !is AuditDeferred) {
+                        synchronized(scanLock) { deepScanShares.add(shareId) }
+                        throw error
+                    }
+                    restoreCandidate()
+                }, discardResult = ::restoreCandidate)
         } finally {
-            // Completed physical hashes survive discard/reconnect; protocol state stays staged.
-            savePhysicalHashes(shareId, force = true)
+            // Publish checkpoints on the coordinator; completed evidence survives discard.
+            preparePhysicalHashes(identity, force = true)
         }
-        PerformanceTrace.event(if (deepAudit) "DEEP_AUDIT_END" else if (usedFocused) "DELTA_SCAN_END" else "AUDIT_END", shareId, component = PerformanceTrace.Component.Scanner, detail = JSONObject().put("enumerated", enumerated).put("hashed", hashed).put("cache_hits", cacheHits), sourceFile = "FolderAccess.kt", sourceLine = 1651)
+        PerformanceTrace.event(if (deepAudit) "DEEP_AUDIT_END" else if (usedFocused) "DELTA_SCAN_END" else "AUDIT_END", shareId, component = PerformanceTrace.Component.Scanner, detail = JSONObject().put("enumerated", enumerated).put("hashed", hashed).put("cache_hits", cacheHits), sourceFile = "FolderAccess.kt", sourceLine = 1844)
         val auditMode = if (deepAudit || !hadTrustedCache) "deep" else if (usedFocused) "focused" else "namespace"
         android.util.Log.i("Rowd", "SAF scan: mode=$auditMode files=$count enumerated=$enumerated hashed=$hashed cache_hits=$cacheHits ms=${android.os.SystemClock.elapsedRealtime() - started}")
-        return JSONObject()
+        val payload = JSONObject()
             .put("files", manifest)
             .put("enumerated", enumerated)
             .put("hashed", hashed)
@@ -1659,6 +1852,10 @@ class FolderAccess(private val context: Context) {
             .put("full", !usedFocused)
             .put("audit_mode", auditMode)
             .toString()
+        return PreparedScan(identity, payload, validateResult = validateSource, publishResult = {
+            synchronized(scanLock) { pendingScan = candidate }
+        },
+            discardResult = ::restoreCandidate)
     }
 
     private fun cachedSource(path: String, shareId: String): DocumentFile? {
@@ -1690,18 +1887,25 @@ class FolderAccess(private val context: Context) {
         return source
     }
 
-    fun snapshot(path: String): String {
+    private fun takeHashStaged(path: String): Pair<File, ScanEntry>? = synchronized(scanLock) {
+        hashStaged.remove(path)?.also { hashStagedBytes -= it.second.length; hashStagedCount-- }
+    }
+
+    fun snapshot(path: String): String = snapshotWithPrepared(path, takeHashStaged(path))
+
+    private fun snapshotWithPrepared(path: String, prepared: Pair<File, ScanEntry>?): String = try {
+        snapshotPreparedBody(path, prepared)
+    } catch (error: Exception) { prepared?.first?.delete(); throw error }
+
+    private fun snapshotPreparedBody(path: String, prepared: Pair<File, ScanEntry>?): String {
         checkSelectedBinding()
         val started = android.os.SystemClock.elapsedRealtime()
         val traceStarted = PerformanceTrace.now()
         val share = active?.optString("share_id")
-        PerformanceTrace.event("snapshot_start", share, path, sourceFile = "FolderAccess.kt", sourceLine = 1698)
+        PerformanceTrace.event("snapshot_start", share, path, sourceFile = "FolderAccess.kt", sourceLine = 1905)
         val deadline = android.os.SystemClock.elapsedRealtime() + LOCAL_OP_TIMEOUT_MS
         checkLocalDeadline(deadline)
         check(!ignored(path,false,ignoreRules())) { "Caminho ignorado: $path" }
-        val prepared = synchronized(scanLock) {
-            hashStaged.remove(path)?.also { hashStagedBytes -= it.second.length }
-        }
         if (prepared != null) {
             try {
                 check(bindingIdentity() == hashStagedBinding) { "STALE_SOURCE: $path" }
@@ -1710,7 +1914,7 @@ class FolderAccess(private val context: Context) {
                 check(doc.uri.toString() == entry.uri && doc.lastModified() == entry.modified && doc.length() == entry.length) { "STALE_SOURCE: $path" }
                 addStreamMetric("duplicate_reads_avoided")
                 PerformanceTrace.event("SNAPSHOT_END", share, path, entry.size, traceStarted,
-                    detail = JSONObject().put("prepared_during_hash", true), sourceFile = "FolderAccess.kt", sourceLine = 1712)
+                    detail = JSONObject().put("prepared_during_hash", true), sourceFile = "FolderAccess.kt", sourceLine = 1916)
                 return JSONObject().put("path", prepared.first.absolutePath).put("hash", entry.hash).put("size", entry.size).toString()
             } catch (error: Exception) { prepared.first.delete(); throw error }
         }
@@ -1726,7 +1930,7 @@ class FolderAccess(private val context: Context) {
             }
             checkSelectedBinding()
             check(source.lastModified() == modified && source.length() == length && size == length) { "STALE_SOURCE: $path" }
-            PerformanceTrace.event("snapshot_end", share, path, size, traceStarted, detail = JSONObject().put("prepared_during_hash", false), sourceFile = "FolderAccess.kt", sourceLine = 1729)
+            PerformanceTrace.event("snapshot_end", share, path, size, traceStarted, detail = JSONObject().put("prepared_during_hash", false), sourceFile = "FolderAccess.kt", sourceLine = 1933)
             android.util.Log.i("RowdLatency", "snapshot_ms=${android.os.SystemClock.elapsedRealtime() - started} bytes=$size")
             return JSONObject().put("path", staged.absolutePath).put("hash", hash).put("size", size).toString()
         } catch (e: Exception) { staged.delete(); throw e }
@@ -1734,11 +1938,11 @@ class FolderAccess(private val context: Context) {
 
     fun install(path: String, expectedHash: String, newHash: String, sourcePath: String): String {
         checkSelectedBinding("STALE_TARGET")
-        check(synchronized(scanLock) { streamNamespace == null }) { "Instalação SAF durante scan ativo." }
+        check(!scanWorker.hasTask() && !hashWorker.hasTask() && synchronized(scanLock) { streamNamespace == null }) { "Instalação SAF durante scan ativo." }
         val started = android.os.SystemClock.elapsedRealtime()
         val traceStarted = PerformanceTrace.now()
         val share = active?.optString("share_id")
-        PerformanceTrace.event("install_start", share, path, sourceFile = "FolderAccess.kt", sourceLine = 1741)
+        PerformanceTrace.event("install_start", share, path, sourceFile = "FolderAccess.kt", sourceLine = 1945)
         check(!ignored(path,false,ignoreRules())) { "Caminho ignorado: $path" }
         parts(path)
         active?.optString("share_id")?.takeIf(String::isNotEmpty)?.let { id ->
@@ -1761,7 +1965,7 @@ class FolderAccess(private val context: Context) {
             check(digest(source.inputStream()).first == newHash) { "BLAKE3 não confere." }
             android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} replay=true")
             PerformanceTrace.remoteInstalled(shareId, path, newHash)
-            PerformanceTrace.event("install_end", share, path, start = traceStarted, sourceFile = "FolderAccess.kt", sourceLine = 1764)
+            PerformanceTrace.event("install_end", share, path, start = traceStarted, sourceFile = "FolderAccess.kt", sourceLine = 1968)
             return "ok"
         }
         check(actual == expectedHash) { "STALE_TARGET: $path" }
@@ -1802,7 +2006,7 @@ class FolderAccess(private val context: Context) {
             journal.put("finished", true)
             traced("journal_persist", path) { persist(journalFile, journal) }
             PerformanceTrace.remoteInstalled(shareId, path, newHash)
-            PerformanceTrace.event("install_end", share, path, start = traceStarted, sourceFile = "FolderAccess.kt", sourceLine = 1805)
+            PerformanceTrace.event("install_end", share, path, start = traceStarted, sourceFile = "FolderAccess.kt", sourceLine = 2009)
             android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} replay=true")
             return "ok"
         }
@@ -1867,7 +2071,7 @@ class FolderAccess(private val context: Context) {
             }
         }
         PerformanceTrace.remoteInstalled(shareId, path, newHash)
-        PerformanceTrace.event("install_end", share, path, start = traceStarted, sourceFile = "FolderAccess.kt", sourceLine = 1870)
+        PerformanceTrace.event("install_end", share, path, start = traceStarted, sourceFile = "FolderAccess.kt", sourceLine = 2074)
         android.util.Log.i("RowdLatency", "install_ms=${android.os.SystemClock.elapsedRealtime() - started} prepare_ms=$preparedMs")
         return "ok"
     }
