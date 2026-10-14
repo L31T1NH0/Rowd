@@ -689,12 +689,27 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn default_home() -> PathBuf {
-    std::env::var_os("ROWD_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share/rowd")
-        })
+    if let Some(home) = std::env::var_os("ROWD_HOME") {
+        return PathBuf::from(home);
+    }
+    #[cfg(windows)]
+    {
+        // GUI startup rejects a missing per-user directory instead of writing beside the exe.
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|home| PathBuf::from(home).join("AppData/Local"))
+            })
+            .unwrap_or_default();
+        base.join("Rowd")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share/rowd")
+    }
 }
+
 fn invitation(cfg: &DeviceConfig) -> Invitation {
     Invitation {
         version: INVITATION_VERSION,
@@ -1401,6 +1416,8 @@ fn collect_state(
                 .strip_prefix(base)?
                 .to_string_lossy()
                 .into_owned();
+            #[cfg(windows)]
+            let relative = relative.replace('\\', "/");
             let bytes = fs::read(entry.path())?;
             ensure!(bytes.len() <= 16 * 1024 * 1024, "state file too large");
             output.insert(relative, hex::encode(bytes));
@@ -3133,6 +3150,8 @@ fn serve(
                                 }
                                 if let Ok(relative) = path.strip_prefix(&share.root) {
                                     let relative = relative.to_string_lossy().to_string();
+                                    #[cfg(windows)]
+                                    let relative = relative.replace('\\', "/");
                                     let _share = trace::current_context()
                                         .file(&share.share_id, &relative)
                                         .with("share_name", share.name.clone())

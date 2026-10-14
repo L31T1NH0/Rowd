@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+gui = ["dep:slint", "dep:slint-build", "dep:rfd", "dep:ksni", "dep:notify-rust", "dep:windows-sys"]
+
+[[bin]]
+name = "rowd-app"
+path = "src/main.rs"
+required-features = ["gui"]
+
 [dependencies]
 rowd-core = { path = "../rowd-core" }
 anyhow.workspace = true
@@ -20,6 +28,18 @@ base64 = "0.22"
 fs2 = "0.4"
 if-addrs = "0.13"
 tempfile = "3"
+slint = { version = "~1.14", optional = true, default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "accessibility"] }
+rfd = { version = "0.17", optional = true, default-features = false, features = ["xdg-portal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", optional = true, features = ["blocking"] }
+notify-rust = { version = "4", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi"] }
+
+[build-dependencies]
+slint-build = { version = "~1.14", optional = true }
 
 [dev-dependencies]
 rowd-core = { path = "../rowd-core", features = ["dev-tools"] }

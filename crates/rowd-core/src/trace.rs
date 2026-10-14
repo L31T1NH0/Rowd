@@ -446,6 +446,8 @@ fn writer_failed(guard: &mut Option<Session>, error: &anyhow::Error) {
     *guard = None;
 }
 fn private(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

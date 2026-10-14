@@ -1,0 +1,549 @@
+import { ComboBox, LineEdit, ScrollView, Switch, Palette } from "std-widgets.slint";
+import { ActionButton, Theme, Heading, Body, Caption, Rule, StatusLabel, NavItem, ShareItem, PathDisplay } from "components.slint";
+import "fonts/Onest-Regular.ttf";
+import "fonts/Onest-SemiBold.ttf";
+import "fonts/Onest-Bold.ttf";
+import "fonts/InstrumentSans-Bold.ttf";
+
+export struct ShareRow {
+    id: string,
+    attention: bool,
+    name: string,
+    pc-path: string,
+    phone-path: string,
+    direction: string,
+    status: string,
+    summary: string,
+    paused: bool,
+}
+
+export struct RequestRow { id: string, name: string, direction: string }
+export struct RecoveryRow { share-id: string, id: string, name: string, path: string, detail: string, available: bool, finished: bool }
+export struct PeerRow { id: string, name: string }
+
+export component AppWindow inherits Window {
+    title: "Rowd";
+    icon: @image-url("../../../assets/icons/rowd-pc.png");
+    preferred-width: 1140px;
+    preferred-height: 790px;
+    min-width: 880px;
+    min-height: 650px;
+    background: Theme.canvas;
+    default-font-size: 14px;
+    default-font-family: "Onest";
+    init => { Palette.color-scheme = ColorScheme.light; }
+
+    in property <[ShareRow]> shares;
+    in property <string> app-version;
+    out property <image> app-icon: @image-url("../../../assets/icons/rowd-pc.png");
+    in property <[RequestRow]> requests;
+    in property <[RecoveryRow]> recoveries;
+    in property <[PeerRow]> peers;
+    in property <[string]> request-names;
+    in property <[string]> recovery-names;
+    in property <[string]> peer-names;
+    in-out property <int> request-index;
+    in-out property <int> recovery-index;
+    in-out property <int> peer-index;
+    in property <bool> paired;
+    in property <bool> server-running;
+    in property <bool> tray-available;
+    in property <bool> autostart-supported;
+    in property <string> server-error;
+    in property <string> home-path;
+    in property <string> device-name: "Celular";
+    in property <string> address;
+    in property <string> fingerprint;
+    in-out property <bool> busy;
+    in-out property <bool> native-dialog;
+    in-out property <bool> pairing-active;
+    in-out property <string> pair-code;
+    in-out property <string> pair-name;
+    in-out property <string> pair-error;
+    in-out property <bool> confirm-open;
+    in-out property <string> confirm-title;
+    in-out property <string> confirm-body;
+    private property <bool> controls-enabled: root.server-running && !root.busy && !root.form-open && !root.pairing-open && !root.confirm-open;
+    private property <RecoveryRow> recovery: root.recoveries[root.recovery-index];
+    private property <RequestRow> request: root.requests[root.request-index];
+    in-out property <int> page: 0;
+    in-out property <int> selected-index: 0;
+    in-out property <bool> all-paused: false;
+    in-out property <bool> syncing: false;
+    in-out property <bool> connected: false;
+    in-out property <bool> recovery-pending: false;
+    in-out property <bool> request-pending: false;
+    in-out property <bool> pairing-open: false;
+    in-out property <string> notice;
+    in-out property <bool> form-open: false;
+    in-out property <bool> editing: false;
+    in-out property <bool> from-request: false;
+    in-out property <string> form-name;
+    in-out property <string> form-path;
+    in-out property <int> form-direction: 0;
+    in-out property <string> form-error;
+    in-out property <bool> close-to-tray: true;
+    in-out property <bool> launch-on-login: false;
+    in-out property <bool> notify-errors: true;
+    private property <ShareRow> selected: root.shares[root.selected-index];
+    callback add-share();
+    callback accept-request();
+    callback edit-share();
+    callback save-share();
+    callback toggle-share();
+    callback sync-share();
+    callback toggle-all();
+    callback reject-request();
+    callback remove-share();
+    callback choose-folder();
+    callback start-pairing();
+    callback stop-pairing();
+    callback offer-peer();
+    callback decide-pairing(bool);
+    callback check-connection();
+    callback unlink-device();
+    callback restore-recovery();
+    callback keep-recovery();
+    callback export-recovery();
+    callback preferences-changed();
+    callback export-diagnostic();
+    callback retry-server();
+    callback confirm-action(bool);
+
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            height: 36px;
+            background: #d5e1dc;
+            HorizontalLayout {
+                padding-left: 22px;
+                padding-right: 22px;
+                spacing: 16px;
+                Text { text: root.busy ? "Processando…" : root.server-running ? "Rowd ativo" : "Rowd indisponível"; color: Theme.ink; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                Text { text: root.server-error != "" ? root.server-error : root.server-running ? "Sincronização pela rede local." : "Preparando seu perfil…"; overflow: elide; color: Theme.muted; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
+                Text { text: root.app-version; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+            }
+        }
+        HorizontalLayout {
+            spacing: 0px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            padding-right: 8px;
+            Rectangle {
+                width: 200px;
+                background: Theme.canvas;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 5px;
+                    HorizontalLayout {
+                        height: 70px;
+                        spacing: 10px;
+                        VerticalLayout { width: 36px; alignment: center; Image { source: @image-url("../../../assets/icons/rowd-pc.png"); width: 36px; height: 40px; image-fit: contain; } }
+                        Text { text: "rowd"; color: Theme.ink; font-family: "Instrument Sans"; font-size: 29px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
+                    }
+                    NavItem { enabled: !root.form-open && !root.pairing-open && !root.confirm-open; text: "Pastas"; icon: @image-url("icons/folder.svg"); selected: root.page == 0; activated => { root.page = 0; root.notice = ""; } }
+                    NavItem { enabled: !root.form-open && !root.pairing-open && !root.confirm-open; text: "Dispositivo"; icon: @image-url("icons/phone.svg"); selected: root.page == 1; activated => { root.page = 1; root.notice = ""; } }
+                    NavItem { enabled: !root.form-open && !root.pairing-open && !root.confirm-open; text: "Recuperação"; icon: @image-url("icons/recovery.svg"); badge: root.recoveries.length > 0 ? root.recoveries.length : ""; selected: root.page == 2; activated => { root.page = 2; root.notice = ""; } }
+                    NavItem { enabled: !root.form-open && !root.pairing-open && !root.confirm-open; text: "Configurações"; icon: @image-url("icons/settings.svg"); selected: root.page == 3; activated => { root.page = 3; root.notice = ""; } }
+                    Rectangle { vertical-stretch: 1; }
+                    Rule {}
+                    VerticalLayout {
+                        padding-top: 15px;
+                        padding-bottom: 10px;
+                        spacing: 7px;
+                        HorizontalLayout {
+                            spacing: 9px;
+                            Rectangle { width: 7px; height: 7px; border-radius: 4px; background: root.connected ? Theme.healthy : Theme.warning; }
+                            Text { text: root.connected ? root.device-name + " conectado" : root.paired ? "Celular desconectado" : "Sem celular vinculado"; color: Theme.ink; font-size: 12px; horizontal-stretch: 1; overflow: elide; }
+                        }
+                        Caption { text: "Seus arquivos, entre\nseus dispositivos."; }
+                    }
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                background: Theme.content;
+                border-radius: 14px;
+                border-width: 1px;
+                border-color: Theme.line;
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 18px;
+                    HorizontalLayout {
+                        height: 62px;
+                        spacing: 16px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 6px;
+                            Heading { text: root.page == 0 ? "Suas pastas" : root.page == 1 ? "Seu dispositivo" : root.page == 2 ? "Recuperação" : "Configurações"; }
+                            Caption { text: root.page == 0 ? "Escolha o que vai de um dispositivo para o outro." : root.page == 1 ? "Um vínculo direto entre este PC e seu celular." : root.page == 2 ? "Versões preservadas para você decidir com calma." : "Deixe o Rowd funcionar do seu jeito."; }
+                        }
+                        if root.page == 0: ActionButton { enabled: root.controls-enabled; text: "Adicionar pasta"; primary: true; clicked => { root.add-share(); } }
+                    }
+                    if root.notice != "": Rectangle {
+                        min-height: 42px;
+                        background: Theme.selected;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding: 12px;
+                            Body { text: root.notice; color: Theme.accent; horizontal-stretch: 1; }
+                            ActionButton { enabled: root.controls-enabled; text: "Fechar"; clicked => { root.notice = ""; } }
+                        }
+                    }
+
+                    if root.page == 0: VerticalLayout {
+                        spacing: 16px;
+                        if root.request-pending: Rectangle {
+                            background: #dceee7;
+                            border-radius: 6px;
+                            min-height: 70px;
+                            HorizontalLayout {
+                                padding: 14px;
+                                spacing: 12px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 4px;
+                                    Body { text: root.device-name + " quer vincular uma pasta"; font-weight: 600; }
+                                    Caption { text: root.request.name + " · " + root.request.direction; }
+                                }
+                                if root.requests.length > 1: ComboBox { model: root.request-names; current-index <=> root.request-index; enabled: root.controls-enabled; }
+                                ActionButton { text: "Vincular"; primary: true; enabled: root.controls-enabled; clicked => { root.accept-request(); } }
+                                ActionButton { text: "Recusar"; enabled: root.controls-enabled; clicked => { root.reject-request(); } }
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 35px;
+                            spacing: 12px;
+                            StatusLabel { text: root.all-paused ? "Sincronização pausada" : root.connected ? "Sincronização ativa" : "Aguardando o celular"; warning: root.all-paused || !root.connected; }
+                            Rectangle { horizontal-stretch: 1; }
+                            ActionButton { text: root.all-paused ? "Retomar tudo" : "Pausar tudo"; enabled: root.controls-enabled && root.shares.length > 0; clicked => { root.toggle-all(); } }
+                        }
+                        Rectangle {
+                            background: Theme.surface;
+                            border-width: 1px;
+                            border-color: Theme.line;
+                            border-radius: 8px;
+                            vertical-stretch: 1;
+                            if root.shares.length == 0: VerticalLayout {
+                                padding: 50px;
+                                spacing: 14px;
+                                Rectangle { vertical-stretch: 1; }
+                                Image { source: @image-url("icons/folder.svg"); width: 42px; height: 42px; colorize: Theme.accent; }
+                                Heading { text: "Sua primeira pasta"; }
+                                Body { text: "Conecte uma pasta do PC a uma pasta do celular.\nVocê escolhe em qual direção os arquivos seguem."; }
+                                HorizontalLayout { ActionButton { enabled: root.controls-enabled; text: "Adicionar pasta"; primary: true; clicked => { root.add-share(); } } Rectangle { horizontal-stretch: 1; } }
+                                Rectangle { vertical-stretch: 1; }
+                            }
+                            if root.shares.length > 0: HorizontalLayout {
+                                spacing: 0px;
+                                VerticalLayout {
+                                    width: 260px;
+                                    padding: 12px;
+                                    spacing: 10px;
+                                    Caption { text: root.shares.length + " PASTAS"; font-weight: 600; height: 25px; }
+                                    ScrollView {
+                                        VerticalLayout {
+                                            spacing: 5px;
+                                            for share[index] in root.shares: ShareItem {
+                                                enabled: root.controls-enabled;
+                                                name: share.name;
+                                                direction: share.direction;
+                                                status: root.all-paused ? "Pausada" : share.status;
+                                                paused: share.paused || root.all-paused || share.attention;
+                                                selected: root.selected-index == index;
+                                                activated => { root.selected-index = index; root.notice = ""; }
+                                            }
+                                            Rectangle { vertical-stretch: 1; }
+                                        }
+                                    }
+                                }
+                                Rectangle { width: 1px; background: Theme.line; }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 0px;
+                                    ScrollView {
+                                        horizontal-stretch: 1;
+                                        VerticalLayout {
+                                            padding: 16px;
+                                            spacing: 10px;
+                                            HorizontalLayout {
+                                                Body { text: root.selected.name; font-size: 21px; font-weight: 700; horizontal-stretch: 1; }
+                                                ActionButton { enabled: root.controls-enabled; text: "Editar"; clicked => { root.edit-share(); } }
+                                            }
+                                            HorizontalLayout {
+                                                spacing: 10px;
+                                                StatusLabel { text: root.all-paused || root.selected.paused ? "Pausada" : root.selected.status; warning: root.all-paused || root.selected.paused || root.selected.attention; }
+                                                Caption { text: root.selected.summary; horizontal-stretch: 1; }
+                                            }
+                                            PathDisplay { min-height: 70px; label: "NESTE PC"; path: root.selected.pc-path; icon: @image-url("icons/computer.svg"); }
+                                            PathDisplay { min-height: 70px; label: "NO CELULAR"; path: root.selected.phone-path; icon: @image-url("icons/phone.svg"); }
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Image { source: @image-url("icons/link.svg"); width: 18px; height: 18px; colorize: Theme.accent; }
+                                                Body { text: root.selected.direction; color: Theme.accent; horizontal-stretch: 1; }
+                                            }
+                                            Rule {}
+                                            Body { text: "Como esta pasta funciona"; font-weight: 600; }
+                                            Caption { text: "Edições simultâneas preservam as duas versões. Exclusões não são propagadas: um arquivo apagado pode voltar do outro dispositivo."; }
+
+                                            Rectangle { vertical-stretch: 1; }
+                                        }
+                                    }
+                                    Rule {}
+                                    HorizontalLayout {
+                                        padding: 16px;
+                                        spacing: 10px;
+                                        ActionButton { text: root.syncing ? "Sincronizando…" : "Sincronizar agora"; primary: true; enabled: root.controls-enabled && !root.syncing && !root.all-paused && !root.selected.paused && root.connected; clicked => { root.sync-share(); } }
+                                        ActionButton { enabled: root.controls-enabled; text: root.selected.paused ? "Retomar" : "Pausar"; clicked => { root.toggle-share(); } }
+                                        ActionButton { enabled: root.controls-enabled; text: "Remover"; clicked => { root.remove-share(); } }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+                            }
+                        }
+                        Caption { text: "Transferências pela rede local. Sem conta, sem servidor intermediário."; }
+                    }
+
+                    if root.page == 1: ScrollView {
+                        VerticalLayout {
+                            spacing: 22px;
+                            Rectangle {
+                                background: Theme.surface;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: Theme.line;
+                                VerticalLayout {
+                                    padding: 26px;
+                                    spacing: 20px;
+                                    HorizontalLayout {
+                                        spacing: 18px;
+                                        Image { source: @image-url("icons/phone.svg"); width: 42px; height: 48px; colorize: Theme.accent; }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            Body { text: root.paired ? root.device-name : "Conecte seu celular"; font-size: 22px; font-weight: 700; }
+                                            Caption { text: root.connected ? "Conexão autenticada · TLS" : root.paired ? "Vinculado · aguardando conexão" : "Abra o Rowd no Android para começar."; }
+                                        }
+                                        if root.connected: StatusLabel { text: "Conectado"; }
+                                    }
+                                    Rule {}
+                                    VerticalLayout {
+                                        spacing: 18px;
+                                        HorizontalLayout { Caption { text: "Endereço deste PC"; width: 130px; } Body { text: root.address; horizontal-stretch: 1; } }
+                                        HorizontalLayout { Caption { text: "Identidade do PC"; width: 130px; } Caption { text: root.fingerprint; horizontal-stretch: 1; } }
+                                        if root.paired: HorizontalLayout {
+                                            spacing: 10px;
+                                            ActionButton { enabled: root.controls-enabled; text: "Verificar conexão"; clicked => { root.check-connection(); } }
+                                            ActionButton { enabled: root.controls-enabled; text: "Desvincular celular"; clicked => { root.unlink-device(); } }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                        if !root.paired: VerticalLayout {
+                                            spacing: 12px;
+                                            Body { text: "Mantenha o PC e o celular na mesma rede. No Android, escolha Encontrar na rede."; }
+                                            HorizontalLayout {
+                                                spacing: 10px;
+                                                ActionButton { enabled: root.controls-enabled; text: root.pairing-active ? "Buscar novamente" : "Encontrar na rede"; primary: true; clicked => { root.start-pairing(); } }
+                                                if root.pairing-active: ActionButton { enabled: root.controls-enabled; text: "Cancelar busca"; clicked => { root.stop-pairing(); } }
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
+                                            if root.peers.length > 0 && root.pairing-active: HorizontalLayout {
+                                                spacing: 10px;
+                                                ComboBox { model: root.peer-names; current-index <=> root.peer-index; enabled: root.controls-enabled; horizontal-stretch: 1; }
+                                                ActionButton { enabled: root.controls-enabled; text: "Enviar convite"; clicked => { root.offer-peer(); } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Body { text: "Uma conexão só sua"; font-weight: 600; }
+                            Caption { text: "O Rowd conecta um PC a um celular por vez. O vínculo identifica os dispositivos antes de permitir a transferência dos arquivos."; }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                    }
+
+                    if root.page == 2: ScrollView {
+                        VerticalLayout {
+                            spacing: 22px;
+                            if root.recovery-pending: Rectangle {
+                                background: Theme.surface;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: Theme.line;
+                                VerticalLayout {
+                                    padding: 26px;
+                                    spacing: 17px;
+                                    HorizontalLayout {
+                                        Body { text: root.recovery.path; font-size: 20px; font-weight: 600; horizontal-stretch: 1; }
+                                        StatusLabel { text: root.recovery.finished ? "Resolvida" : "Preservada"; warning: true; }
+                                    }
+                                    Caption { text: root.recovery.name; }
+                                    ComboBox { model: root.recovery-names; current-index <=> root.recovery-index; enabled: root.controls-enabled; }
+                                    Rule {}
+                                    Body { text: "Registro de recuperação"; font-weight: 600; }
+                                    Caption { text: "Compare o conteúdo antes de escolher qual versão usar. A cópia de recuperação continua disponível após a restauração."; }
+                                    PathDisplay { label: "VERSÃO PRESERVADA"; path: root.recovery.detail; icon: @image-url("icons/recovery.svg"); }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        ActionButton { enabled: root.controls-enabled && root.recovery.available; text: "Restaurar versão"; primary: true; clicked => { root.restore-recovery(); } }
+                                        ActionButton { enabled: root.controls-enabled && root.recovery.available; text: "Exportar cópia"; clicked => { root.export-recovery(); } }
+                                        ActionButton { enabled: root.controls-enabled && !root.recovery.finished; text: "Manter atual"; clicked => { root.keep-recovery(); } }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+                            }
+                            if !root.recovery-pending: VerticalLayout {
+                                padding-top: 55px;
+                                spacing: 16px;
+                                Image { source: @image-url("icons/check.svg"); width: 40px; height: 40px; colorize: Theme.healthy; }
+                                Heading { text: "Tudo resolvido por aqui"; }
+                                Body { text: "Quando uma versão precisar da sua atenção,\nvocê poderá encontrá-la nesta tela."; }
+                            }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                    }
+
+                    if root.page == 3: ScrollView {
+                        VerticalLayout {
+                            padding-right: 20px;
+                            spacing: 20px;
+                            Body { text: "No seu desktop"; font-size: 18px; font-weight: 600; }
+                            HorizontalLayout {
+                                VerticalLayout { horizontal-stretch: 1; Body { text: "Continuar ao fechar a janela"; } Caption { text: "Manter a sincronização e o ícone na bandeja."; } }
+                                Switch { enabled: root.controls-enabled && root.tray-available; checked <=> root.close-to-tray; toggled => { root.preferences-changed(); } }
+                            }
+                            Rule {}
+                            HorizontalLayout {
+                                VerticalLayout { horizontal-stretch: 1; Body { text: "Iniciar ao entrar no computador"; } Caption { text: "Deixar suas pastas prontas para sincronizar."; } }
+                                Switch { enabled: root.controls-enabled && root.autostart-supported; checked <=> root.launch-on-login; toggled => { root.preferences-changed(); } }
+                            }
+                            Rule {}
+                            HorizontalLayout {
+                                VerticalLayout { horizontal-stretch: 1; Body { text: "Avisar quando algo precisar de atenção"; } Caption { text: "Notificações de falhas e conflitos."; } }
+                                Switch { enabled: root.controls-enabled; checked <=> root.notify-errors; toggled => { root.preferences-changed(); } }
+                            }
+                            Caption { text: root.tray-available ? "Preferências salvas neste perfil." : "Bandeja indisponível neste desktop. Fechar a janela encerra o Rowd."; }
+                            Rule {}
+                            Body { text: "Seu perfil"; font-size: 18px; font-weight: 600; }
+                            Caption { text: root.home-path; }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                ActionButton { enabled: !root.busy && !root.form-open && !root.pairing-open && !root.confirm-open; text: "Exportar diagnóstico"; clicked => { root.export-diagnostic(); } }
+                                if !root.server-running && root.server-error != "": ActionButton { enabled: !root.busy && !root.form-open && !root.pairing-open && !root.confirm-open; text: "Tentar novamente"; clicked => { root.retry-server(); } }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            Rule {}
+                            Body { text: "Rowd"; font-weight: 600; }
+                            Caption { text: "Seus arquivos, entre seus dispositivos.\nInterface construída com Slint · slint.dev"; }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    if root.form-open: Rectangle {
+        background: #182c3066;
+        FocusScope {
+            capture-key-pressed(event) => {
+                if event.text == Key.Escape && !root.busy { root.form-open = false; return accept; }
+                return reject;
+            }
+            TouchArea { clicked => { /* Keep the form open until an explicit choice. */ } }
+            Rectangle {
+                width: 530px;
+                height: 550px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: Theme.surface;
+                border-radius: 10px;
+                VerticalLayout {
+                    padding: 28px;
+                    spacing: 14px;
+                    Heading { text: root.editing ? "Editar pasta" : "Adicionar pasta"; }
+                    Caption { text: "Defina a pasta e a direção dos arquivos."; }
+                    Body { text: "Nome"; font-weight: 600; }
+                    LineEdit { enabled: !root.busy && !root.from-request; text <=> root.form-name; placeholder-text: "Ex.: Fotos do celular"; init => { self.focus(); } }
+                    Body { text: "Caminho no PC"; font-weight: 600; }
+                    HorizontalLayout { spacing: 8px; LineEdit { enabled: !root.busy; text <=> root.form-path; placeholder-text: "Caminho completo da pasta"; horizontal-stretch: 1; } ActionButton { enabled: !root.busy; text: "Escolher…"; clicked => { root.choose-folder(); } } }
+                    Body { text: "Direção"; font-weight: 600; }
+                    ComboBox { enabled: !root.busy && !root.from-request; model: ["Nos dois sentidos", "Do PC para o celular", "Do celular para o PC"]; current-index <=> root.form-direction; }
+                    Caption { text: root.from-request ? "O nome e a direção vêm do pedido do celular." : "A pasta do celular será escolhida no Rowd para Android."; }
+                    if root.form-error != "": Body { text: root.form-error; color: #a12d2d; }
+                    Rectangle { vertical-stretch: 1; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle { horizontal-stretch: 1; }
+                        ActionButton { enabled: !root.busy; text: "Cancelar"; clicked => { root.form-open = false; } }
+                        ActionButton { enabled: !root.busy; text: root.editing ? "Salvar alterações" : "Adicionar pasta"; primary: true; clicked => { root.save-share(); } }
+                    }
+                }
+            }
+        }
+
+    }
+
+    if root.pairing-open: Rectangle {
+        background: #182c3066;
+        FocusScope {
+            capture-key-pressed(event) => {
+                if event.text == Key.Escape && !root.busy { root.decide-pairing(false); return accept; }
+                return reject;
+            }
+            TouchArea {}
+            Rectangle {
+                width: 500px;
+                height: 400px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: Theme.surface;
+                border-radius: 10px;
+                VerticalLayout {
+                    padding: 28px;
+                    spacing: 18px;
+                    Heading { text: "Confirme o vínculo"; }
+                    Body { text: "Confira se este mesmo código aparece no celular."; }
+                    Text { text: root.pair-code; color: Theme.accent; font-size: 38px; font-weight: 700; horizontal-alignment: center; height: 70px; vertical-alignment: center; }
+                    Caption { text: root.pair-name; horizontal-alignment: center; }
+                    if root.pair-error != "": Body { text: root.pair-error; color: #a12d2d; }
+                    Rectangle { vertical-stretch: 1; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle { horizontal-stretch: 1; }
+                        ActionButton { enabled: !root.busy; text: "Recusar"; clicked => { root.decide-pairing(false); } }
+                        ActionButton { enabled: !root.busy; text: "Os códigos coincidem"; primary: true; init => { self.focus(); } clicked => { root.decide-pairing(true); } }
+                    }
+                }
+            }
+        }
+    }
+    if root.confirm-open: Rectangle {
+        background: #182c3066;
+        FocusScope {
+            capture-key-pressed(event) => {
+                if event.text == Key.Escape && !root.busy { root.confirm-action(false); return accept; }
+                return reject;
+            }
+            TouchArea {}
+            Rectangle {
+                width: 520px; height: 300px;
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                background: Theme.surface; border-radius: 10px;
+                VerticalLayout {
+                    padding: 28px; spacing: 16px;
+                    Heading { text: root.confirm-title; }
+                    Body { text: root.confirm-body; }
+                    Rectangle { vertical-stretch: 1; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle { horizontal-stretch: 1; }
+                        ActionButton { enabled: !root.busy; text: "Cancelar"; clicked => { root.confirm-action(false); } }
+                        ActionButton { enabled: !root.busy; text: "Confirmar"; primary: true; clicked => { root.confirm-action(true); } }
+                    }
+                }
+            }
+        }
+    }
+
+}

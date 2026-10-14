@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 rowd_repo="$(cd "$(dirname "$0")" && pwd)"
-exec "${CARGO:-$HOME/.cargo/bin/cargo}" run --quiet --manifest-path "$rowd_repo/Cargo.toml" -p rowd -- "$@"
+rowd_binary="$rowd_repo/target/debug/rowd"
+if [[ ! -x "$rowd_binary" ]]; then
+    echo "Compilando Rowd para Linux..." >&2
+    "${CARGO:-$HOME/.cargo/bin/cargo}" build --manifest-path "$rowd_repo/Cargo.toml" -p rowd
+fi
+exec "$rowd_binary" "$@"

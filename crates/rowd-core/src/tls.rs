@@ -26,6 +26,8 @@ pub fn accept(
     socket: TcpStream,
     config: Arc<ServerConfig>,
 ) -> Result<StreamOwned<ServerConnection, TcpStream>> {
+    // Winsock inherits nonblocking mode from the listener; this TLS transport is synchronous.
+    socket.set_nonblocking(false)?;
     set_timeout(&socket)?;
     Ok(StreamOwned::new(ServerConnection::new(config)?, socket))
 }

@@ -1,0 +1,201 @@
+import { Button } from "std-widgets.slint";
+
+export component ActionButton inherits VerticalLayout {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked <=> control.clicked;
+    horizontal-stretch: 0;
+    max-width: control.min-width;
+    alignment: center;
+    forward-focus: control;
+    control := Button {
+        text: root.text;
+        primary: root.primary;
+        enabled: root.enabled;
+        min-height: 34px;
+        max-height: 34px;
+        horizontal-stretch: 0;
+    }
+}
+
+export global Theme {
+    out property <color> canvas: #e2ebe8;
+    out property <color> content: #f7faf9;
+    out property <color> surface: #ffffff;
+    out property <color> ink: #12282a;
+    out property <color> muted: #435a5d;
+    out property <color> line: #b6c8c2;
+    out property <color> accent: #0b6667;
+    out property <color> selected: #c9e5df;
+    out property <color> healthy: #1f6542;
+    out property <color> warning: #81500e;
+}
+
+export component Heading inherits Text {
+    color: Theme.ink;
+    font-size: 24px;
+    font-weight: 700;
+}
+
+export component Body inherits Text {
+    color: Theme.ink;
+    font-size: 14px;
+    wrap: word-wrap;
+    vertical-alignment: center;
+}
+
+export component Caption inherits Text {
+    color: Theme.muted;
+    font-size: 12px;
+    wrap: word-wrap;
+    vertical-alignment: center;
+}
+
+export component Rule inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
+}
+
+export component StatusLabel inherits Rectangle {
+    in property <string> text;
+    in property <bool> warning;
+    height: 27px;
+    width: label.preferred-width + 22px;
+    border-radius: 4px;
+    background: root.warning ? #fcf0da : #e9f4ee;
+    label := Text {
+        x: 11px;
+        height: parent.height;
+        text: root.text;
+        vertical-alignment: center;
+        color: root.warning ? Theme.warning : Theme.healthy;
+        font-size: 12px;
+        font-weight: 600;
+    }
+}
+
+export component NavItem inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> selected;
+    in property <string> badge;
+    private property <bool> keyboard-focus: false;
+    callback activated();
+    height: 44px;
+    border-radius: 6px;
+    background: root.selected ? Theme.selected : area.has-hover ? #d4e3df : transparent;
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+    accessible-label: root.text;
+    accessible-description: root.selected ? "Seção atual" : "Abrir seção";
+    accessible-action-default => { if root.enabled { root.activated(); } }
+    forward-focus: focus;
+    Image {
+        source: root.icon;
+        x: 13px;
+        y: (root.height - self.height) / 2;
+        width: 20px;
+        height: 20px;
+        colorize: root.selected ? Theme.accent : Theme.muted;
+    }
+    Text {
+        text: root.text;
+        x: 43px;
+        y: (root.height - self.height) / 2 + 1px;
+        width: root.width - self.x - (root.badge == "" ? 12px : 32px);
+        height: 20px;
+        color: root.selected ? Theme.accent : Theme.ink;
+        font-size: 14px;
+        font-weight: 600;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    if root.badge != "": Text {
+        text: root.badge;
+        x: root.width - 22px;
+        y: (root.height - self.height) / 2 + 1px;
+        width: 14px;
+        height: 20px;
+        color: Theme.warning;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+    if focus.has-focus && root.keyboard-focus: Rectangle {
+        x: 13px;
+        y: root.height - 6px;
+        width: root.width - 26px;
+        height: 1px;
+        background: Theme.accent;
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        focus-gained(reason) => { root.keyboard-focus = reason == FocusReason.tab-navigation; }
+        focus-lost(reason) => { root.keyboard-focus = false; }
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" { root.activated(); return accept; }
+            return reject;
+        }
+        area := TouchArea { enabled: root.enabled; clicked => { root.keyboard-focus = false; focus.focus(); root.activated(); } }
+    }
+}
+
+export component ShareItem inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <string> name;
+    in property <string> direction;
+    in property <string> status;
+    in property <bool> selected;
+    in property <bool> paused;
+    callback activated();
+    height: 90px;
+    border-radius: 6px;
+    background: root.selected ? Theme.selected : area.has-hover ? #edf4f1 : transparent;
+    border-width: focus.has-focus ? 2px : 0px;
+    border-color: Theme.accent;
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+    accessible-label: root.name + ", " + root.direction + ", " + root.status;
+    accessible-action-default => { if root.enabled { root.activated(); } }
+    forward-focus: focus;
+    VerticalLayout {
+        padding: 14px;
+        spacing: 5px;
+        HorizontalLayout {
+            spacing: 10px;
+            Image { source: @image-url("icons/folder.svg"); width: 20px; height: 20px; colorize: root.selected ? Theme.accent : Theme.muted; }
+            Text { text: root.name; color: Theme.ink; font-size: 14px; font-weight: 600; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+        }
+        Caption { text: root.direction; }
+        Text { text: root.status; color: root.paused ? Theme.warning : Theme.healthy; font-size: 12px; overflow: elide; }
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" { root.activated(); return accept; }
+            return reject;
+        }
+        area := TouchArea { enabled: root.enabled; clicked => { focus.focus(); root.activated(); } }
+    }
+}
+
+export component PathDisplay inherits Rectangle {
+    in property <string> label;
+    in property <string> path;
+    in property <image> icon;
+    min-height: 83px;
+    background: #edf3f0;
+    border-radius: 6px;
+    HorizontalLayout {
+        padding: 16px;
+        spacing: 14px;
+        VerticalLayout { width: 23px; alignment: center; Image { source: root.icon; width: 23px; height: 23px; colorize: Theme.muted; } }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 6px;
+            Caption { text: root.label; }
+            Body { text: root.path; font-weight: 600; }
+        }
+    }
+}

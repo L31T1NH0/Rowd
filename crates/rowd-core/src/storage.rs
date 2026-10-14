@@ -33,10 +33,11 @@ impl VerifiedStaged {
         );
         let metadata = file.as_file().metadata()?;
         ensure!(metadata.len() == size, "staged size changed");
+        let evidence = file_fingerprint(file.as_file())?;
         Ok(Self {
             file,
             entry: expected.clone(),
-            metadata: fingerprint(&metadata),
+            metadata: evidence,
         })
     }
 
@@ -53,8 +54,8 @@ impl VerifiedStaged {
         ensure!(
             metadata.is_file()
                 && metadata.len() == self.entry.size
-                && fingerprint(&metadata) == self.metadata
-                && fingerprint(&self.file.as_file().metadata()?) == self.metadata,
+                && path_fingerprint(self.path())? == self.metadata
+                && file_fingerprint(self.file.as_file())? == self.metadata,
             "staged file changed after verification"
         );
         Ok(())
@@ -111,7 +112,7 @@ impl SnapshotWork {
             ensure!(
                 hash == expected.hash
                     && size == expected.size
-                    && fingerprint(&source.file.metadata()?) == evidence,
+                    && file_fingerprint(&source.file)? == evidence,
                 "STALE_SOURCE"
             );
             VerifiedStaged::from_digest(temp, &expected, &hash, size)
@@ -322,6 +323,8 @@ fn read_root_policy(root: &Path) -> Result<String> {
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
     Ok(())
@@ -414,9 +417,90 @@ fn fingerprint(meta: &fs::Metadata) -> Vec<u64> {
         meta.ctime_nsec() as u64,
     ]
 }
-#[cfg(not(unix))]
-fn fingerprint(_meta: &fs::Metadata) -> Vec<u64> {
-    vec![]
+fn file_fingerprint(file: &File) -> Result<Vec<u64>> {
+    #[cfg(windows)]
+    {
+        windows_fingerprint(file)
+    }
+    #[cfg(unix)]
+    {
+        Ok(fingerprint(&file.metadata()?))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Ok(Vec::new())
+    }
+}
+
+fn path_fingerprint(path: &Path) -> Result<Vec<u64>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        };
+        // Inspect the named object without following a reparse point or locking editors out.
+        let file = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        windows_fingerprint(&file)
+    }
+    #[cfg(unix)]
+    {
+        Ok(fingerprint(&fs::symlink_metadata(path)?))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(windows)]
+fn windows_fingerprint(file: &File) -> Result<Vec<u64>> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_ID_INFO,
+    };
+    let mut identity = FILE_ID_INFO::default();
+    let mut basic = FILE_BASIC_INFO::default();
+    // Both buffers are initialized, correctly sized, and the file owns a live handle.
+    unsafe {
+        if GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut identity as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        ) == 0
+            || GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let id = identity.FileId.Identifier;
+    Ok(vec![
+        identity.VolumeSerialNumber,
+        u64::from_le_bytes(id[..8].try_into().unwrap()),
+        u64::from_le_bytes(id[8..].try_into().unwrap()),
+        file.metadata()?.len(),
+        basic.LastWriteTime as u64,
+        basic.ChangeTime as u64,
+        basic.FileAttributes as u64,
+    ])
+}
+
+fn root_identity(path: &Path) -> Result<Vec<u64>> {
+    Ok(path_fingerprint(path)?
+        .into_iter()
+        .take(if cfg!(windows) { 3 } else { 2 })
+        .collect())
 }
 
 fn enumerate_namespace(
@@ -543,15 +627,7 @@ pub fn prepare_scan(
     let root = root.canonicalize()?;
     let policy = read_root_policy(&root)?;
     crate::ignore::Ignore::validate(&policy)?;
-    let binding = format!(
-        "{}|{:?}|{}",
-        root.display(),
-        fingerprint(&fs::symlink_metadata(&root)?)
-            .into_iter()
-            .take(2)
-            .collect::<Vec<_>>(),
-        policy
-    );
+    let binding = format!("{}|{:?}|{}", root.display(), root_identity(&root)?, policy);
     let namespace =
         enumerate_namespace_limited(&root, &crate::ignore::Ignore::parse(&policy), 4096)?;
     ensure!(
@@ -612,7 +688,7 @@ pub fn prepare_scan(
                             metadata.is_file() && !metadata.file_type().is_symlink(),
                             "STALE_SOURCE: {path}"
                         );
-                        let before = fingerprint(&metadata);
+                        let before = path_fingerprint(&target)?;
                         if let Some(cached) = cache
                             .get(path)
                             .filter(|c| !before.is_empty() && c.metadata == before)
@@ -631,15 +707,9 @@ pub fn prepare_scan(
                             }
                         }
                         let file = File::open(&target)?;
-                        ensure!(
-                            fingerprint(&file.metadata()?) == before,
-                            "STALE_SOURCE: {path}"
-                        );
+                        ensure!(file_fingerprint(&file)? == before, "STALE_SOURCE: {path}");
                         let (hash, size) = hash_reader(CancelRead(file, cancelled))?;
-                        ensure!(
-                            fingerprint(&fs::symlink_metadata(&target)?) == before,
-                            "STALE_SOURCE: {path}"
-                        );
+                        ensure!(path_fingerprint(&target)? == before, "STALE_SOURCE: {path}");
                         Ok((
                             path.clone(),
                             CachedEntry {
@@ -759,7 +829,7 @@ impl LocalStore {
         );
         for (path, cached, _) in &prepared.files {
             ensure!(
-                fingerprint(&fs::metadata(self.checked_path(path, false)?)?) == cached.metadata,
+                path_fingerprint(&self.checked_path(path, false)?)? == cached.metadata,
                 "STALE_SOURCE: {path}"
             );
         }
@@ -784,7 +854,7 @@ impl LocalStore {
             for (path, original) in batch {
                 let source = self.checked_path(path, false)?;
                 let metadata = fs::metadata(&source)?;
-                let before = fingerprint(&metadata);
+                let before = path_fingerprint(&source)?;
                 ensure!(before == *original, "STALE_SOURCE: {path}");
                 if let Some(cached) = self
                     .cache
@@ -807,15 +877,9 @@ impl LocalStore {
                 let _cpu = crate::resources::acquire_hash();
                 let _permit = crate::resources::acquire(&source)?;
                 let file = File::open(&source)?;
-                ensure!(
-                    fingerprint(&file.metadata()?) == before,
-                    "STALE_SOURCE: {path}"
-                );
+                ensure!(file_fingerprint(&file)? == before, "STALE_SOURCE: {path}");
                 let (hash, size) = hash_reader(file)?;
-                ensure!(
-                    fingerprint(&fs::metadata(&source)?) == before,
-                    "STALE_SOURCE: {path}"
-                );
+                ensure!(path_fingerprint(&source)? == before, "STALE_SOURCE: {path}");
                 Ok((
                     path,
                     metadata,
@@ -843,8 +907,7 @@ impl LocalStore {
             };
             for (path, metadata, cached) in hashed {
                 ensure!(
-                    fingerprint(&fs::metadata(self.checked_path(&path, false)?)?)
-                        == cached.metadata,
+                    path_fingerprint(&self.checked_path(&path, false)?)? == cached.metadata,
                     "STALE_SOURCE: {path}"
                 );
                 crate::trace::observed_file(&path, "audit_scan", &metadata, &cached.entry.hash);
@@ -1301,7 +1364,7 @@ impl LocalStore {
         metadata: Vec<u64>,
     ) -> Result<()> {
         ensure!(
-            metadata == fingerprint(&fs::metadata(target)?),
+            metadata == path_fingerprint(target)?,
             "STALE_TARGET: installed file edited: {path}"
         );
         if self.stream_original.is_some() {
@@ -1325,10 +1388,10 @@ impl LocalStore {
         validate_path(path)?;
         let internal = crate::internal_writes::register(&self.root.join(path), &self.root, entry);
         let target = self.checked_path(path, true)?;
-        let target_before = fs::symlink_metadata(&target).ok().map(|m| fingerprint(&m));
+        let target_before = path_fingerprint(&target).ok();
         let current = self.current(path)?;
         ensure!(
-            target_before == fs::symlink_metadata(&target).ok().map(|m| fingerprint(&m)),
+            target_before == path_fingerprint(&target).ok(),
             "STALE_TARGET: changed during validation: {path}"
         );
         // A repeated operation after a lost acknowledgment is harmless.
@@ -1371,10 +1434,10 @@ impl LocalStore {
             }
         }
         // No clobber: if an editor recreated the path, preserve it and the displaced version.
-        let before_publish = fingerprint(&temp.as_file().metadata()?);
+        let before_publish = file_fingerprint(temp.as_file())?;
         ensure!(
             before_publish == verified_metadata
-                && fingerprint(&fs::symlink_metadata(temp.path())?) == verified_metadata
+                && path_fingerprint(temp.path())? == verified_metadata
                 && temp.as_file().metadata()?.len() == entry.size,
             "staged file changed before publication"
         );
@@ -1385,7 +1448,7 @@ impl LocalStore {
                 return Err(anyhow::anyhow!("STALE_TARGET: {path}: {e}"));
             }
         };
-        let installed = fingerprint(&published.metadata()?);
+        let installed = file_fingerprint(&published)?;
         // Publication can change ctime; inode, size and mtime must still describe the verified bytes.
         ensure!(
             before_publish.get(..5) == installed.get(..5),
@@ -1407,7 +1470,7 @@ impl LocalStore {
     }
     fn validate_installed(&self, path: &str, entry: &Entry) -> Result<()> {
         let target = self.checked_path(path, false)?;
-        let before = fingerprint(&fs::metadata(&target)?);
+        let before = path_fingerprint(&target)?;
         if !before.is_empty() && self.stream_installed_fingerprints.get(path) == Some(&before) {
             return Ok(());
         }
@@ -1417,9 +1480,7 @@ impl LocalStore {
         metrics.bytes_hashed += size;
         self.metrics.set(metrics);
         ensure!(
-            entry.hash == hash
-                && entry.size == size
-                && before == fingerprint(&fs::metadata(&target)?),
+            entry.hash == hash && entry.size == size && before == path_fingerprint(&target)?,
             "STALE_TARGET: installed file edited during stream: {path}"
         );
         Ok(())
@@ -1455,7 +1516,7 @@ impl Store for LocalStore {
             }
             let target = self.checked_path(path, false)?;
             let before = match fs::symlink_metadata(&target) {
-                Ok(meta) if meta.file_type().is_file() => fingerprint(&meta),
+                Ok(meta) if meta.file_type().is_file() => path_fingerprint(&target)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     self.cache.remove(path);
                     continue;
@@ -1466,7 +1527,7 @@ impl Store for LocalStore {
             let _permit = crate::resources::acquire(&target)?;
             let (hash, size) = hash_reader(File::open(&target)?)?;
             let metadata = fs::metadata(&target)?;
-            let after = fingerprint(&metadata);
+            let after = path_fingerprint(&target)?;
             ensure!(before == after, "STALE_SOURCE: {path}");
             crate::trace::observed_file(path, "focused_scan", &metadata, &hash);
             let entry = Entry { hash, size };
@@ -1515,10 +1576,7 @@ impl Store for LocalStore {
             root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
             "Share root changed"
         );
-        let identity = fingerprint(&root_metadata)
-            .into_iter()
-            .take(2)
-            .collect::<Vec<_>>();
+        let identity = root_identity(&self.root)?;
         Ok(format!("{}|{identity:?}|{}", self.root.display(), policy))
     }
     fn stream_namespace(
@@ -1537,12 +1595,7 @@ impl Store for LocalStore {
             result
                 .iter()
                 .filter(|(_, e)| !e.directory)
-                .map(|(p, _)| {
-                    Ok((
-                        p.clone(),
-                        fingerprint(&fs::metadata(self.checked_path(p, false)?)?),
-                    ))
-                })
+                .map(|(p, _)| Ok((p.clone(), path_fingerprint(&self.checked_path(p, false)?)?)))
                 .collect::<Result<_>>()?,
         );
         self.stream_fingerprints = self
@@ -1603,7 +1656,7 @@ impl Store for LocalStore {
                 self.validate_installed(path, entry)?;
             } else {
                 ensure!(
-                    *old == fingerprint(&fs::metadata(&target)?),
+                    *old == path_fingerprint(&target)?,
                     "STALE_SOURCE: file changed during stream: {path}"
                 );
             }
@@ -1702,7 +1755,7 @@ impl Store for LocalStore {
                         "FILE_ENUMERATED",
                         serde_json::json!({"relative_path":rel})
                     );
-                    let before = fingerprint(&metadata);
+                    let before = path_fingerprint(&path)?;
                     if let Some(cached) = cache
                         .get(&rel)
                         .filter(|c| !before.is_empty() && c.metadata == before)
@@ -1742,7 +1795,7 @@ impl Store for LocalStore {
                     counts.files_hashed += 1;
                     counts.bytes_hashed += size;
                     metrics.set(counts);
-                    let after = fingerprint(&fs::metadata(&path)?);
+                    let after = path_fingerprint(&path)?;
                     ensure!(before == after, "STALE_SOURCE: {rel}");
                     crate::trace::observed_file(&rel, "audit_scan", &metadata, &hash);
                     let entry = Entry { hash, size };
@@ -1807,11 +1860,11 @@ impl Store for LocalStore {
                 match File::open(&target) {
                     Ok(file) => {
                         let metadata = fs::metadata(&target)?;
-                        let before = fingerprint(&metadata);
+                        let before = file_fingerprint(&file)?;
                         let _cpu = crate::resources::acquire_hash();
                         let _permit = crate::resources::acquire(&target)?;
                         let (hash, size) = hash_reader(file)?;
-                        let after = fingerprint(&fs::metadata(&target)?);
+                        let after = path_fingerprint(&target)?;
                         ensure!(before == after, "STALE_SOURCE: {path}");
                         crate::trace::observed_file(path, "focused_scan", &metadata, &hash);
                         let mut counts = self.metrics.get();
@@ -1848,7 +1901,7 @@ impl Store for LocalStore {
                     .map(|(path, _)| {
                         Ok((
                             path.clone(),
-                            fingerprint(&fs::metadata(self.checked_path(path, false)?)?),
+                            path_fingerprint(&self.checked_path(path, false)?)?,
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1921,7 +1974,7 @@ impl Store for LocalStore {
     ) -> Result<Option<SnapshotWork>> {
         ensure!(!self.excluded(path), "ignored path: {path}");
         let source = File::open(self.checked_path(path, false)?)?;
-        let evidence = fingerprint(&source.metadata()?);
+        let evidence = file_fingerprint(&source)?;
         Ok(Some(SnapshotWork {
             source,
             temp: NamedTempFile::new_in(&self.private)?,
@@ -1945,7 +1998,7 @@ impl Store for LocalStore {
         }
         let source_unchanged = self
             .checked_path(path, false)
-            .and_then(|source| Ok(fingerprint(&fs::metadata(source)?) == prepared.evidence))
+            .and_then(|source| Ok(path_fingerprint(&source)? == prepared.evidence))
             .unwrap_or(false);
         if !source_unchanged
             || prepared
@@ -2010,7 +2063,7 @@ impl Store for LocalStore {
             "staged content changed"
         );
         staged.validate()?;
-        let metadata = fingerprint(&temp.as_file().metadata()?);
+        let metadata = file_fingerprint(temp.as_file())?;
         self.install_file(path, expected, entry, temp, metadata)
     }
 }
